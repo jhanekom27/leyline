@@ -3,14 +3,14 @@
 //!
 //! Gossip (net.rs) is live-broadcast only, so a peer that was offline (or
 //! joins a channel fresh) never receives messages sent before it was
-//! listening -- see concept.md's "Persistence & offline history" section.
-//! This module builds the content-addressed side of the fix it proposes:
-//! every known `ChatMessage` is stored as its own blob, and a per-channel
-//! `HashSeq` manifest lists them in a canonical order, so its hash can stand
-//! in for "the sender's current view of this channel's history". net.rs
+//! listening -- see concept.md's "Persistence & history backfill" section.
+//! This module is the content-addressed half of the fix: every known
+//! `ChatMessage` is stored as its own blob, and a per-channel `HashSeq`
+//! manifest lists them in a canonical order, so its hash can stand in for
+//! "the sender's current view of this channel's history". net.rs
 //! broadcasts that hash (see `crate::message::HistoryAnnounce`) whenever a
 //! channel gains a gossip neighbor, and uses `fetch` here to pull anything a
-//! peer is missing. Landing target: build-order step 6 (stretch).
+//! peer is missing.
 
 use std::collections::HashMap;
 use std::path::Path;

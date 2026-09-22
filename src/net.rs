@@ -406,7 +406,7 @@ impl Net {
             && existing != from_ticket
         {
             return Some(format!(
-                "that ticket is for a different room also named #{name} -- pick a new local name to join it"
+                "that ticket is for a different channel also named #{name} -- pick a new local name to join it"
             ));
         }
         if existing_secret.is_some() {

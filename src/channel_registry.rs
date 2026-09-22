@@ -1,10 +1,9 @@
 //! Persisted record of joined channels and the peer addresses we've seen
 //! for each, so a restart can rejoin every channel it was in before and
 //! actually reconnect to peers -- not just restore "general" and rely on
-//! a fresh invite ticket. This is the piece concept.md's "Persistence &
-//! offline history" section named but never built: "Store learned peer
-//! addresses per channel locally so reconnecting later doesn't require
-//! re-pasting tickets."
+//! a fresh invite ticket. This also persists each channel's `RoomSecret`
+//! (see `crate::ticket`) alongside its name and peers -- see concept.md's
+//! "Identity & channels" and "Room privacy" sections.
 //!
 //! Not to be confused with `app::Channel`, which is in-memory UI state
 //! (transcript, presence) for the channels joined in the *current*

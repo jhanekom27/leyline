@@ -39,7 +39,7 @@ pub enum GossipPayload {
 /// Broadcast to direct neighbors whenever a channel gains one (see net.rs's
 /// handling of `iroh_gossip`'s `NeighborUp`): advertises the sender's current
 /// history root hash for that channel, so a peer missing messages can fetch
-/// them via `iroh-blobs` -- concept.md's "Persistence & offline history"
+/// them via `iroh-blobs` -- concept.md's "Persistence & history backfill"
 /// section describes this as asking a peer "for their log's latest hash and
 /// pull the delta". See backfill.rs for how the root hash is built and used.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

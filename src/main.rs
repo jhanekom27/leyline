@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await
     .context("failed to start networking")?;
-    println!("invite tickets (share via --join <ticket> or the in-app /join <ticket> command):");
+    println!("invite tickets (paste into another instance's message box with /join <ticket>):");
     for name in &joined_channels {
         let ticket = net.ticket_for(name);
         info!(channel = %name, %ticket, "ready");
@@ -253,8 +253,8 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
             Some(net_event) = net_rx.recv() => {
                 // Peek (without consuming) for a channel gaining a gossip
                 // neighbor, so we can also announce our history root to it
-                // -- see backfill.rs and concept.md's "Persistence and
-                // offline history" section. `app.handle_net_event` below
+                // -- see backfill.rs and concept.md's "Persistence &
+                // history backfill" section. `app.handle_net_event` below
                 // still separately updates presence for this same event.
                 if let NetEvent::PeerJoined(channel, _) = &net_event
                     && let Some(root) = backfill.current_root(channel)

@@ -1,9 +1,9 @@
 //! Local message log persistence.
 //!
-//! Persists received `ChatMessage`s so scrollback survives restarts, since
-//! gossip is live-broadcast only and offers no backfill -- see concept.md's
-//! "Persistence & offline history" section. Landing target: build-order step
-//! 5.
+//! Persists every sent/received `ChatMessage` locally so scrollback
+//! survives restarts -- gossip itself is live-broadcast only and offers no
+//! history of its own. See concept.md's "Persistence & history backfill"
+//! section, and backfill.rs for how peers that missed messages catch up.
 
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -47,7 +47,7 @@ impl MessageStore {
     /// mid-write) is logged and the messages recorded before it are still
     /// returned, rather than failing outright -- this log is a best-effort
     /// local cache, not the source of truth (concept.md's "Persistence &
-    /// offline history" section), so availability wins over strictness
+    /// history backfill" section), so availability wins over strictness
     /// here. Only a genuine I/O error (e.g. permission denied) is returned
     /// as `Err`.
     pub fn load(&self, channel: &str) -> anyhow::Result<Vec<ChatMessage>> {
