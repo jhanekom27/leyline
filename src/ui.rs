@@ -74,7 +74,20 @@ fn render_peers(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
-    let input = Paragraph::new(format!("> {}", app.input))
-        .block(Block::bordered().title("message (Enter to send, Esc to quit)"));
-    frame.render_widget(input, area);
+    const PROMPT: &str = "> ";
+    let block = Block::bordered().title("message (Enter to send, Esc to quit)");
+    let inner = block.inner(area);
+    let text_width = (inner.width as usize).saturating_sub(PROMPT.len()).max(1);
+
+    // Horizontal-scroll the input so the cursor always stays in view.
+    let chars: Vec<char> = app.input.chars().collect();
+    let visible_start = app.cursor.saturating_sub(text_width.saturating_sub(1));
+    let visible_end = (visible_start + text_width).min(chars.len());
+    let visible: String = chars[visible_start..visible_end].iter().collect();
+
+    let paragraph = Paragraph::new(format!("{PROMPT}{visible}")).block(block);
+    frame.render_widget(paragraph, area);
+
+    let cursor_col = inner.x + (PROMPT.len() + (app.cursor - visible_start)) as u16;
+    frame.set_cursor_position((cursor_col, inner.y));
 }

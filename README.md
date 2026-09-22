@@ -28,9 +28,15 @@ cargo run
 
 | Key | Action |
 | --- | --- |
-| Type | Compose a message in the input box |
+| Type | Insert a character at the cursor |
+| `Left` / `Right` | Move the cursor one character |
+| `Home` / `Ctrl+A` | Jump to the start of the line |
+| `End` / `Ctrl+E` | Jump to the end of the line |
+| `Backspace` / `Delete` | Delete the character before / at the cursor |
+| `Ctrl+U` | Delete from the start of the line to the cursor |
+| `Ctrl+K` | Delete from the cursor to the end of the line |
+| `Ctrl+W` | Delete the word before the cursor |
 | `Enter` | Send the composed message |
-| `Backspace` | Edit the composed message |
 | `Up` / `Down` | Scroll the message history |
 | `Esc` / `Ctrl+C` | Quit |
 

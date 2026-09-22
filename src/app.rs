@@ -26,6 +26,7 @@ pub struct AppState {
     pub messages: VecDeque<ChatMessage>,
     pub peers: Vec<String>,
     pub input: String,
+    pub cursor: usize,
     pub scroll: usize,
     pub should_quit: bool,
 }
@@ -43,6 +44,7 @@ impl AppState {
             messages,
             peers: vec!["alice".to_string(), "bob".to_string()],
             input: String::new(),
+            cursor: 0,
             scroll: 0,
             should_quit: false,
         }
@@ -50,18 +52,25 @@ impl AppState {
 
     /// Pure key handling: no I/O, no network. Safe to call on every keypress.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => self.should_quit = true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true;
-            }
+            KeyCode::Char('c') if ctrl => self.should_quit = true,
+            KeyCode::Char('a') if ctrl => self.move_home(),
+            KeyCode::Char('e') if ctrl => self.move_end(),
+            KeyCode::Char('u') if ctrl => self.delete_to_start(),
+            KeyCode::Char('k') if ctrl => self.delete_to_end(),
+            KeyCode::Char('w') if ctrl => self.delete_word_backward(),
             KeyCode::Enter => self.submit_input(),
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
+            KeyCode::Backspace => self.delete_backward(),
+            KeyCode::Delete => self.delete_forward(),
+            KeyCode::Home => self.move_home(),
+            KeyCode::End => self.move_end(),
+            KeyCode::Left => self.move_left(),
+            KeyCode::Right => self.move_right(),
             KeyCode::Up => self.scroll = self.scroll.saturating_add(1),
             KeyCode::Down => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Char(c) => self.insert_char(c),
             _ => {}
         }
     }
@@ -71,8 +80,101 @@ impl AppState {
             return;
         }
         let text = std::mem::take(&mut self.input);
+        self.cursor = 0;
         self.push_message(fake_message(SELF_SENDER, &text));
         self.scroll = 0;
+    }
+
+    fn char_count(&self) -> usize {
+        self.input.chars().count()
+    }
+
+    /// Byte offset in `self.input` corresponding to a character index.
+    ///
+    /// Needed because `String` indexing/mutation is byte-based, but the
+    /// cursor is tracked as a character index so editing works correctly
+    /// with multi-byte UTF-8 input.
+    fn byte_index(&self, char_idx: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.input.len())
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.char_count());
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.char_count();
+    }
+
+    fn insert_char(&mut self, c: char) {
+        let idx = self.byte_index(self.cursor);
+        self.input.insert(idx, c);
+        self.cursor += 1;
+    }
+
+    /// Backspace: deletes the character before the cursor.
+    fn delete_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end = self.byte_index(self.cursor);
+        let start = self.byte_index(self.cursor - 1);
+        self.input.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+
+    /// Delete: deletes the character at the cursor.
+    fn delete_forward(&mut self) {
+        if self.cursor >= self.char_count() {
+            return;
+        }
+        let start = self.byte_index(self.cursor);
+        let end = self.byte_index(self.cursor + 1);
+        self.input.replace_range(start..end, "");
+    }
+
+    /// Ctrl+U: deletes from the start of the line to the cursor.
+    fn delete_to_start(&mut self) {
+        let end = self.byte_index(self.cursor);
+        self.input.replace_range(0..end, "");
+        self.cursor = 0;
+    }
+
+    /// Ctrl+K: deletes from the cursor to the end of the line.
+    fn delete_to_end(&mut self) {
+        let start = self.byte_index(self.cursor);
+        self.input.truncate(start);
+    }
+
+    /// Ctrl+W: deletes the word immediately before the cursor.
+    fn delete_word_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut idx = self.cursor;
+        while idx > 0 && chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        while idx > 0 && !chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        let start = self.byte_index(idx);
+        let end = self.byte_index(self.cursor);
+        self.input.replace_range(start..end, "");
+        self.cursor = idx;
     }
 
     fn push_message(&mut self, message: ChatMessage) {
@@ -194,5 +296,104 @@ mod tests {
         assert_eq!(display_name(&SELF_SENDER), "you");
         assert_eq!(display_name(&ALICE_SENDER), "alice");
         assert_eq!(display_name(&BOB_SENDER), "bob");
+    }
+
+    #[test]
+    fn left_right_move_cursor_without_editing() {
+        let mut app = AppState::new();
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Char('i')));
+        assert_eq!(app.cursor, 2);
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.cursor, 1);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.cursor, 2);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.cursor, 2);
+        assert_eq!(app.input, "hi");
+    }
+
+    #[test]
+    fn insert_in_the_middle_of_input() {
+        let mut app = AppState::new();
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Char('X')));
+        assert_eq!(app.input, "hXi");
+        assert_eq!(app.cursor, 2);
+    }
+
+    #[test]
+    fn home_and_end_jump_cursor() {
+        let mut app = AppState::new();
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Home));
+        assert_eq!(app.cursor, 0);
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.cursor, 2);
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_e_jump_cursor() {
+        let mut app = AppState::new();
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.cursor, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(app.cursor, 2);
+    }
+
+    #[test]
+    fn delete_key_removes_char_at_cursor() {
+        let mut app = AppState::new();
+        for c in ['h', 'i', '!'] {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Home));
+        app.handle_key(key(KeyCode::Delete));
+        assert_eq!(app.input, "i!");
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn ctrl_u_deletes_to_start() {
+        let mut app = AppState::new();
+        for c in ['h', 'i', '!'] {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "!");
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn ctrl_k_deletes_to_end() {
+        let mut app = AppState::new();
+        for c in ['h', 'i', '!'] {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Home));
+        app.handle_key(key(KeyCode::Right));
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "h");
+        assert_eq!(app.cursor, 1);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_word_backward() {
+        let mut app = AppState::new();
+        for c in "hello world".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "hello ");
+        assert_eq!(app.cursor, 6);
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "");
+        assert_eq!(app.cursor, 0);
     }
 }
