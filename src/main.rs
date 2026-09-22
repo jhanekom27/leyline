@@ -15,19 +15,27 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio::time::interval;
+use tracing::info;
 
 use app::AppState;
 use net::{Net, NetEvent};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_logging()?;
+    let dirs = project_dirs()?;
+    init_logging(&dirs)?;
 
-    let bootstrap = parse_connect_args()?;
+    let secret_key = identity::load_or_generate(&dirs.config_dir().join("identity"))
+        .context("failed to load or generate identity")?;
+    let join_ticket = parse_join_arg()?;
+
     let (net_tx, net_rx) = mpsc::channel(64);
-    let net = Net::start(bootstrap, net_tx)
+    let net = Net::start(secret_key, join_ticket, net_tx)
         .await
         .context("failed to start networking")?;
+    info!(ticket = %net.ticket, "ready");
+    println!("your invite ticket (share it with others via --join <ticket>):");
+    println!("{}", net.ticket);
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, net, net_rx).await;
@@ -35,31 +43,34 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-/// Parses repeated `--connect <endpoint-id>` flags into a list of ids to
-/// dial on startup. This is a minimal stand-in for the invite ticket system
-/// (build-order step 3): copy the id shown in a running instance's header
-/// into a second instance's `--connect` flag to have them join the same
-/// default channel.
-fn parse_connect_args() -> anyhow::Result<Vec<String>> {
+/// Parses an optional `--join <ticket>` flag used to bootstrap into the
+/// default channel via another instance's invite ticket (build-order step
+/// 3). Omit it to start alone, e.g. as the first peer others join.
+fn parse_join_arg() -> anyhow::Result<Option<String>> {
     let mut args = std::env::args().skip(1);
-    let mut bootstrap = Vec::new();
+    let mut ticket = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--connect" => {
-                let id = args.next().context("--connect requires an endpoint id")?;
-                bootstrap.push(id);
+            "--join" => {
+                anyhow::ensure!(ticket.is_none(), "--join can only be specified once");
+                ticket = Some(args.next().context("--join requires a ticket")?);
             }
             other => anyhow::bail!("unknown argument: {other}"),
         }
     }
-    Ok(bootstrap)
+    Ok(ticket)
+}
+
+/// Resolves this app's OS-specific project directories, shared by logging
+/// and identity persistence.
+fn project_dirs() -> anyhow::Result<directories::ProjectDirs> {
+    directories::ProjectDirs::from("dev", "leyline", "leyline")
+        .ok_or_else(|| anyhow::anyhow!("could not determine a project directory"))
 }
 
 /// Logs go to a file under the OS data dir instead of stdout, since stdout
 /// is the alternate-screen TUI once the terminal is initialized.
-fn init_logging() -> anyhow::Result<()> {
-    let dirs = directories::ProjectDirs::from("dev", "leyline", "leyline")
-        .ok_or_else(|| anyhow::anyhow!("could not determine a data directory for logs"))?;
+fn init_logging(dirs: &directories::ProjectDirs) -> anyhow::Result<()> {
     std::fs::create_dir_all(dirs.data_dir())?;
     let log_file = OpenOptions::new()
         .create(true)

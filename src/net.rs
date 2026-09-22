@@ -9,25 +9,31 @@ use std::time::Duration;
 
 use anyhow::Context;
 use futures::StreamExt;
-use iroh::{Endpoint, EndpointId, SecretKey, endpoint::presets, protocol::Router};
+use iroh::{
+    Endpoint, EndpointId, SecretKey, address_lookup::memory::MemoryLookup, endpoint::presets,
+    protocol::Router,
+};
 use iroh_gossip::{
     api::{Event as GossipEvent, GossipReceiver, GossipSender},
     net::{GOSSIP_ALPN, Gossip},
     proto::TopicId,
 };
+use iroh_tickets::Ticket;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::message::ChatMessage;
+use crate::ticket::ChannelTicket;
 
-/// How many times to retry joining the `--connect` bootstrap peers, and how
-/// long to wait between attempts.
+/// How many times to retry joining the ticket's bootstrap peer, and how long
+/// to wait between attempts.
 ///
-/// A freshly-started peer takes a few seconds to get a home relay and
-/// publish its address to discovery -- if `--connect <id>` is used before
-/// that finishes, the one dial iroh-gossip makes for it can fail, and
-/// nothing retries it automatically. Re-issuing the join a few times covers
-/// that startup race.
+/// The ticket carries the bootstrap peer's address hints directly, so the
+/// first join attempt shouldn't need discovery at all -- but the peer could
+/// still be transiently unreachable (e.g. offline, or its address changed
+/// since the ticket was created), and iroh-gossip does not retry a
+/// bootstrap peer on its own if the first dial fails. Re-issuing the join a
+/// few times covers that.
 const JOIN_RETRY_ATTEMPTS: u32 = 5;
 const JOIN_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
@@ -60,55 +66,85 @@ pub struct Net {
     /// Our own endpoint id, as raw bytes so callers don't need to depend on
     /// iroh types.
     pub our_id: [u8; 32],
+    /// This instance's invite ticket (default channel topic + our address),
+    /// pre-encoded to its base32 string form for `main.rs` to print.
+    pub ticket: String,
 }
 
 impl Net {
-    /// Binds an endpoint, joins the default gossip topic (dialing
-    /// `bootstrap_ids` if given), and spawns a task forwarding gossip
-    /// events to `events_tx`. Joining peers happens in the background, so
-    /// this never blocks on the network being reachable.
+    /// Binds an endpoint using `secret_key`, joins the default gossip topic
+    /// (dialing the bootstrap peer from `join_ticket` if given), and spawns
+    /// a task forwarding gossip events to `events_tx`. Joining a bootstrap
+    /// peer happens in the background, so this never blocks on it being
+    /// reachable.
     pub async fn start(
-        bootstrap_ids: Vec<String>,
+        secret_key: SecretKey,
+        join_ticket: Option<String>,
         events_tx: mpsc::Sender<NetEvent>,
     ) -> anyhow::Result<Self> {
-        let bootstrap = bootstrap_ids
-            .iter()
-            .map(|id| {
-                id.parse::<EndpointId>()
-                    .with_context(|| format!("invalid --connect endpoint id: {id:?}"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let bootstrap_count = bootstrap.len();
+        let bootstrap = join_ticket
+            .map(|raw| ChannelTicket::decode_string(&raw))
+            .transpose()
+            .context("invalid --join ticket")?;
+        if let Some(ticket) = &bootstrap {
+            anyhow::ensure!(
+                ticket.topic == default_topic(),
+                "that ticket is for a different channel; multi-channel support isn't available yet"
+            );
+        }
+        let bootstrap_addr = bootstrap.map(|ticket| ticket.addr);
+
+        // Pre-seed the endpoint's address book with the ticket's address
+        // hints, so the bootstrap peer is immediately dialable instead of
+        // waiting on the (still separately configured) pkarr/DNS discovery
+        // in `presets::N0` to resolve it.
+        let memory_lookup = MemoryLookup::new();
+        if let Some(addr) = &bootstrap_addr {
+            memory_lookup.add_endpoint_info(addr.clone());
+        }
 
         let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(SecretKey::generate())
+            .secret_key(secret_key)
+            .address_lookup(memory_lookup)
             .bind()
             .await
             .context("failed to bind iroh endpoint")?;
         let id = endpoint.id();
         info!(%id, "endpoint bound");
 
+        // Wait for a home relay so the `endpoint.addr()` used for our own
+        // ticket below has a usable relay hint, not just a bare id.
+        endpoint.online().await;
+
         let gossip = Gossip::builder().spawn(endpoint.clone());
-        let router = Router::builder(endpoint)
+        let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
             .spawn();
 
+        let bootstrap_ids: Vec<EndpointId> = bootstrap_addr.iter().map(|addr| addr.id).collect();
         let (sender, receiver) = gossip
-            .subscribe(default_topic(), bootstrap.clone())
+            .subscribe(default_topic(), bootstrap_ids.clone())
             .await
             .context("failed to subscribe to gossip topic")?
             .split();
-        debug!(bootstrap = bootstrap_count, "joined default topic");
+        debug!(bootstrap = bootstrap_ids.len(), "joined default topic");
 
-        if !bootstrap.is_empty() {
-            tokio::spawn(retry_join(sender.clone(), bootstrap));
+        if !bootstrap_ids.is_empty() {
+            tokio::spawn(retry_join(sender.clone(), bootstrap_ids));
         }
         tokio::spawn(forward_events(receiver, events_tx));
+
+        let ticket = ChannelTicket {
+            topic: default_topic(),
+            addr: endpoint.addr(),
+        }
+        .encode_string();
 
         Ok(Self {
             router,
             sender,
             our_id: *id.as_bytes(),
+            ticket,
         })
     }
 

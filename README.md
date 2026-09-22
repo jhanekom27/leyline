@@ -6,17 +6,17 @@ and messages travel directly between peers using
 [iroh](https://github.com/n0-computer/iroh) + iroh-gossip, all inside a
 [ratatui](https://ratatui.rs) TUI.
 
-## Status: real gossip networking, temporary bootstrapping
+## Status: invite tickets and persistent identity
 
-`leyline` now wires up real `iroh` + `iroh-gossip` networking: two instances
-can join the same default "#general" channel and exchange messages. A few
-things are still deliberately minimal until later roadmap steps land:
+`leyline` wires up real `iroh` + `iroh-gossip` networking with a persisted
+identity and invite tickets: two instances can join the same default
+"#general" channel and exchange messages. A few things are still
+deliberately minimal until later roadmap steps land:
 
-- **Identity is ephemeral** -- a new keypair is generated every run, so your
-  endpoint id changes each time (persistence is step 3).
-- **Bootstrapping peers is manual** -- there's no invite ticket system yet,
-  so a second instance connects with a `--connect <endpoint-id>` flag
-  instead of pasting a ticket (see [Build & run](#build--run)).
+- **Identity persists across runs** -- your keypair is generated once and
+  saved to disk, so your endpoint id stays the same every time you start
+  `leyline` (see [Build & run](#build--run) for how this affects local
+  multi-instance testing).
 - **One channel** -- everyone joins the same hard-coded "#general" topic;
   multi-channel support is a later step.
 
@@ -33,17 +33,41 @@ cargo build --release
 cargo run
 ```
 
-Your endpoint id is shown in the TUI header (`you: <hex id>`). To have a
-second instance join the same channel and talk to the first, copy that id
-into a `--connect` flag in another terminal:
+On startup, `leyline` prints an invite ticket to your terminal (before the
+TUI takes over) and shows your endpoint id in the TUI header (`you: <hex
+id>`). To have a second instance join the same channel and talk to the
+first, copy that printed ticket into a `--join` flag in another terminal:
 
 ```sh
-cargo run -- --connect <hex id from the first instance>
+cargo run -- --join <ticket printed by the first instance>
 ```
 
-`--connect` can be repeated to dial multiple peers on startup. Connecting
-relies on iroh's default discovery/relay services, so all instances need
-outbound internet access.
+The ticket bundles the channel's topic and the sharer's address (including
+relay/direct-address hints), so `--join` alone is enough to connect --
+no separate directory service needed. Connecting still relies on iroh's
+default relay servers for NAT traversal, so all instances need outbound
+internet access.
+
+Your identity now persists in your OS config directory, keyed by your `$HOME`.
+Running two instances under the *same* `$HOME` on one machine loads the
+*same* identity for both -- and iroh rejects a peer connecting to itself --
+so for local multi-instance testing, give each instance its own fake home,
+e.g.:
+
+```sh
+HOME=/tmp/leyline-a cargo run
+HOME=/tmp/leyline-b cargo run -- --join <ticket from the first instance>
+```
+
+Each fake `$HOME` also redirects Cargo's own cache, so the first build under
+a new one re-fetches and rebuilds every dependency. To avoid that, capture
+your real cargo home first and pass it through explicitly:
+
+```sh
+REAL_CARGO_HOME="$HOME/.cargo"
+HOME=/tmp/leyline-a CARGO_HOME="$REAL_CARGO_HOME" cargo run
+HOME=/tmp/leyline-b CARGO_HOME="$REAL_CARGO_HOME" cargo run -- --join <ticket from the first instance>
+```
 
 ## Keybindings
 
@@ -67,8 +91,8 @@ Rough build order (see `concept.md` for the full design doc):
 
 - [x] 1. `ratatui` chat UI against fake/local messages -- validate layout and keybindings
 - [x] 2. wire up `iroh` + `iroh-gossip` so two local instances can talk over one gossip topic
-- [ ] 3. **Up next:** Invite ticket generation/parsing, identity persistence
-- [ ] 4. Multi-channel support (one gossip task per joined topic), presence sidebar
+- [x] 3. Invite ticket generation/parsing, identity persistence
+- [ ] 4. **Up next:** Multi-channel support (one gossip task per joined topic), presence sidebar
 - [ ] 5. Local message persistence + reload on start
 - [ ] 6. (Stretch) `iroh-blobs`-based history backfill for offline peers
 
