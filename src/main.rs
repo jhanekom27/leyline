@@ -49,8 +49,11 @@ async fn main() -> anyhow::Result<()> {
         .channel_names()
         .into_iter()
         .map(|name| {
+            let secret = registry
+                .secret_for(&name)
+                .expect("a recorded channel always has a room secret");
             let addrs = registry.bootstrap_for(&name);
-            (name, addrs)
+            (name, secret, addrs)
         })
         .collect();
 
@@ -169,8 +172,13 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
         // Ensures a brand-new channel ("general" on a first run, or a
         // `--join` ticket's channel) lands in the registry, so it's
         // rejoined automatically next time -- see channel_registry.rs.
-        // A no-op for channels the registry already knew about.
-        if let Err(err) = registry.record_channel(name) {
+        // A no-op for channels the registry already knew about. The
+        // secret comes from `Net`, which already resolved (or generated)
+        // the right one for each joined channel in `Net::start`.
+        let secret = net
+            .secret_for(name)
+            .expect("just-joined channel must have a recorded secret");
+        if let Err(err) = registry.record_channel(name, secret) {
             warn!(channel = %name, "failed to persist joined channel: {err}");
         }
         match store.load(name) {
@@ -260,10 +268,13 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                 // future restart. Channels joined at startup are already
                 // in the registry (see the loop above), so this only
                 // matters for new ones joined during this session.
-                if let NetEvent::Joined(name) = &net_event
-                    && let Err(err) = registry.record_channel(name)
-                {
-                    warn!(channel = %name, "failed to persist joined channel: {err}");
+                if let NetEvent::Joined(name) = &net_event {
+                    let secret = net
+                        .secret_for(name)
+                        .expect("just-joined channel must have a recorded secret");
+                    if let Err(err) = registry.record_channel(name, secret) {
+                        warn!(channel = %name, "failed to persist joined channel: {err}");
+                    }
                 }
 
                 match net_event {

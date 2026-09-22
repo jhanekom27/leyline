@@ -22,8 +22,9 @@ const LEN_PREFIX_BYTES: usize = 4;
 /// Each channel's file lives under `dir`, named by a blake3 hash of the
 /// channel name rather than the name itself, so an arbitrary user-typed
 /// channel name (from `/join <name>`) can never produce a path-traversal
-/// or otherwise invalid filename -- the same trick `net::topic_for_name`
-/// uses to turn a channel name into a safe `TopicId`.
+/// or otherwise invalid filename -- the same kind of trick
+/// `net::topic_for_secret` uses to turn arbitrary bytes into a safe,
+/// fixed-size identifier.
 ///
 /// Stateless and open-per-call by design: message send/receive happens at
 /// human/network speed, not a hot loop, so there's no need to cache file

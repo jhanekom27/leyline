@@ -20,6 +20,8 @@ use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::ticket::RoomSecret;
+
 /// Cap on how many distinct peer addresses we remember per channel, most-
 /// recently-seen first. Kept small on purpose: gossip's mesh (hyparview)
 /// only needs one still-reachable bootstrap peer to rebuild the rest, so
@@ -27,11 +29,14 @@ use tracing::warn;
 /// offline by the time of the next restart.
 const MAX_PEERS_PER_CHANNEL: usize = 8;
 
-/// One channel's persisted state: its name, and known peer addresses,
-/// most-recently-seen first.
+/// One channel's persisted state: its name, its room secret (see
+/// `crate::ticket::RoomSecret` -- this is what actually determines its
+/// gossip topic, not the name), and known peer addresses, most-recently-
+/// seen first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChannelRecord {
     name: String,
+    secret: RoomSecret,
     peers: Vec<EndpointAddr>,
 }
 
@@ -72,6 +77,14 @@ impl ChannelRegistry {
         self.channels.iter().map(|c| c.name.clone()).collect()
     }
 
+    /// The room secret recorded for `channel`, if it's known.
+    pub fn secret_for(&self, channel: &str) -> Option<RoomSecret> {
+        self.channels
+            .iter()
+            .find(|c| c.name == channel)
+            .map(|c| c.secret)
+    }
+
     /// Known peer addresses for `channel`, most-recently-seen first. Empty
     /// if the channel isn't known, or is known but has no recorded peers
     /// yet (e.g. a channel created by name that no one has joined yet).
@@ -83,15 +96,19 @@ impl ChannelRegistry {
             .unwrap_or_default()
     }
 
-    /// Ensures `channel` has a registry entry, creating one with no known
-    /// peers yet if it's new. A no-op (including no write to disk) if
-    /// already recorded.
-    pub fn record_channel(&mut self, channel: &str) -> anyhow::Result<()> {
+    /// Ensures `channel` has a registry entry recording `secret`, creating
+    /// one with no known peers yet if it's new. A no-op (including no
+    /// write to disk) if already recorded -- `secret` is only used the
+    /// first time, since `Net` always resolves the same already-known
+    /// secret for a channel it's rejoining (see `Net::start`), so there's
+    /// never a conflicting one to reconcile here.
+    pub fn record_channel(&mut self, channel: &str, secret: RoomSecret) -> anyhow::Result<()> {
         if self.channels.iter().any(|c| c.name == channel) {
             return Ok(());
         }
         self.channels.push(ChannelRecord {
             name: channel.to_string(),
+            secret,
             peers: Vec::new(),
         });
         self.save()
@@ -100,18 +117,19 @@ impl ChannelRegistry {
     /// Records `addr` as a currently-reachable peer for `channel`: moves
     /// it to the front if already known (deduped by node id, so a
     /// re-sighting doesn't create a duplicate), then evicts the oldest
-    /// entry once over `MAX_PEERS_PER_CHANNEL`. Creates `channel`'s entry
-    /// if it doesn't already exist.
+    /// entry once over `MAX_PEERS_PER_CHANNEL`.
+    ///
+    /// A no-op (logged) if `channel` has no registry entry yet -- unlike
+    /// `record_channel`, this has no `RoomSecret` to create one with, and
+    /// in practice `record_channel` always runs for a channel before this
+    /// is ever called for it (see main.rs).
     pub fn record_peer(&mut self, channel: &str, addr: EndpointAddr) -> anyhow::Result<()> {
-        let index = match self.channels.iter().position(|c| c.name == channel) {
-            Some(index) => index,
-            None => {
-                self.channels.push(ChannelRecord {
-                    name: channel.to_string(),
-                    peers: Vec::new(),
-                });
-                self.channels.len() - 1
-            }
+        let Some(index) = self.channels.iter().position(|c| c.name == channel) else {
+            warn!(
+                channel,
+                "learned a peer address for a not-yet-recorded channel; dropping"
+            );
+            return Ok(());
         };
         let peers = &mut self.channels[index].peers;
         peers.retain(|known| known.id != addr.id);
@@ -182,7 +200,9 @@ mod tests {
     fn record_channel_then_lists_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = registry_at(&dir);
-        registry.record_channel("general").unwrap();
+        registry
+            .record_channel("general", RoomSecret::generate())
+            .unwrap();
         assert_eq!(registry.channel_names(), vec!["general".to_string()]);
     }
 
@@ -190,18 +210,50 @@ mod tests {
     fn record_channel_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = registry_at(&dir);
-        registry.record_channel("general").unwrap();
-        registry.record_channel("general").unwrap();
+        registry
+            .record_channel("general", RoomSecret::generate())
+            .unwrap();
+        registry
+            .record_channel("general", RoomSecret::generate())
+            .unwrap();
         assert_eq!(registry.channel_names(), vec!["general".to_string()]);
+    }
+
+    #[test]
+    fn record_channel_keeps_the_first_secret_when_called_again() {
+        // The registry is the durable source of truth for a channel's
+        // secret -- a later, unrelated `record_channel` call (e.g. a
+        // future `Net::start` resolving it the normal way) must never
+        // silently replace it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = registry_at(&dir);
+        let first = RoomSecret::generate();
+        registry.record_channel("general", first).unwrap();
+        registry
+            .record_channel("general", RoomSecret::generate())
+            .unwrap();
+        assert_eq!(registry.secret_for("general"), Some(first));
     }
 
     #[test]
     fn record_peer_then_bootstrap_for_returns_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = registry_at(&dir);
+        registry
+            .record_channel("general", RoomSecret::generate())
+            .unwrap();
         let addr = sample_addr();
         registry.record_peer("general", addr.clone()).unwrap();
         assert_eq!(registry.bootstrap_for("general"), vec![addr]);
+    }
+
+    #[test]
+    fn record_peer_on_an_unrecorded_channel_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = registry_at(&dir);
+        registry.record_peer("nonexistent", sample_addr()).unwrap();
+        assert!(registry.bootstrap_for("nonexistent").is_empty());
+        assert!(registry.channel_names().is_empty());
     }
 
     #[test]
@@ -211,9 +263,18 @@ mod tests {
     }
 
     #[test]
+    fn secret_for_an_unknown_channel_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(registry_at(&dir).secret_for("nonexistent"), None);
+    }
+
+    #[test]
     fn record_peer_moves_an_already_known_peer_to_the_front_instead_of_duplicating() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = registry_at(&dir);
+        registry
+            .record_channel("general", RoomSecret::generate())
+            .unwrap();
         let a = sample_addr();
         let b = sample_addr();
         registry.record_peer("general", a.clone()).unwrap();
@@ -230,6 +291,9 @@ mod tests {
     fn record_peer_evicts_the_oldest_beyond_the_cap() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = registry_at(&dir);
+        registry
+            .record_channel("general", RoomSecret::generate())
+            .unwrap();
         let addrs: Vec<EndpointAddr> = (0..MAX_PEERS_PER_CHANNEL + 3)
             .map(|_| sample_addr())
             .collect();
@@ -250,8 +314,13 @@ mod tests {
     fn channels_are_isolated() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = registry_at(&dir);
+        registry
+            .record_channel("general", RoomSecret::generate())
+            .unwrap();
         registry.record_peer("general", sample_addr()).unwrap();
-        registry.record_channel("random").unwrap();
+        registry
+            .record_channel("random", RoomSecret::generate())
+            .unwrap();
 
         assert_eq!(registry.bootstrap_for("general").len(), 1);
         assert!(registry.bootstrap_for("random").is_empty());
@@ -266,13 +335,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("channels");
         let addr = sample_addr();
+        let secret = RoomSecret::generate();
 
         let mut registry = ChannelRegistry::load(path.clone()).unwrap();
-        registry.record_channel("general").unwrap();
+        registry.record_channel("general", secret).unwrap();
         registry.record_peer("general", addr.clone()).unwrap();
 
         let reloaded = ChannelRegistry::load(path).unwrap();
         assert_eq!(reloaded.channel_names(), vec!["general".to_string()]);
         assert_eq!(reloaded.bootstrap_for("general"), vec![addr]);
+        assert_eq!(reloaded.secret_for("general"), Some(secret));
     }
 }

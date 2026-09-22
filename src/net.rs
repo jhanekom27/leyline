@@ -27,7 +27,7 @@ use tracing::{debug, info, warn};
 
 use crate::backfill::BackfillStore;
 use crate::message::{ChatMessage, GossipPayload, HistoryAnnounce};
-use crate::ticket::ChannelTicket;
+use crate::ticket::{ChannelTicket, RoomSecret};
 
 /// The channel every instance joins on startup.
 const DEFAULT_CHANNEL: &str = "general";
@@ -73,26 +73,33 @@ pub enum NetEvent {
     HistoryFetched(String, Vec<ChatMessage>),
 }
 
-/// A channel's gossip topic is a deterministic hash of its human-readable
-/// name, so friends can agree on a channel out of band without a directory
-/// service -- see concept.md's "Identity & channels" section. Channel
-/// identity is threaded through the rest of the app as this plain name;
-/// only `net.rs` needs to know about `TopicId`.
-fn topic_for_name(name: &str) -> TopicId {
-    blake3::hash(format!("leyline:{name}").as_bytes()).into()
+/// A channel's gossip topic is derived from its private `RoomSecret`, not
+/// its human-readable name -- see `RoomSecret`'s doc comment for why: this
+/// is what makes a room unguessable from its name alone, and lets two
+/// different rooms share a display name without ever colliding. The
+/// `"leyline-room:"` prefix just keeps this hash in its own namespace, in
+/// case the secret is ever reused to derive something else later (e.g. a
+/// message encryption key).
+fn topic_for_secret(secret: &RoomSecret) -> TopicId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"leyline-room:");
+    hasher.update(secret.as_bytes());
+    hasher.finalize().into()
 }
 
 /// Interprets a `/join` argument as either a bare channel name or an
 /// invite ticket.
 ///
 /// If `arg` doesn't even have the ticket prefix, it's treated as a plain
-/// channel name. If it *does* have the prefix but still fails to decode --
-/// e.g. because it was truncated when copied out of a narrow terminal --
-/// that's reported as an error instead of silently joining a bogus channel
-/// named after the mangled string.
-fn parse_join_arg(arg: &str) -> Result<(String, Option<EndpointAddr>), String> {
+/// channel name with no room secret yet -- see `Net::join`, which
+/// generates a fresh one for a name it's never seen before. If it *does*
+/// have the prefix but still fails to decode -- e.g. because it was
+/// truncated when copied out of a narrow terminal -- that's reported as an
+/// error instead of silently joining a bogus channel named after the
+/// mangled string.
+fn parse_join_arg(arg: &str) -> Result<(String, Option<(RoomSecret, EndpointAddr)>), String> {
     match ChannelTicket::decode_string(arg) {
-        Ok(ticket) => Ok((ticket.name, Some(ticket.addr))),
+        Ok(ticket) => Ok((ticket.name, Some((ticket.secret, ticket.addr)))),
         Err(ParseError::Kind { .. }) => Ok((arg.trim().to_string(), None)),
         Err(err) => Err(format!(
             "that looks like an invite ticket but it won't decode (maybe it got truncated when copied?): {err}"
@@ -113,6 +120,15 @@ fn is_self(addr: &EndpointAddr, our_id: [u8; 32]) -> bool {
     *addr.id.as_bytes() == our_id
 }
 
+/// A joined channel's live gossip sender plus the room secret that put us
+/// there -- see `RoomSecret` and `topic_for_secret`. Bundled together
+/// (rather than two parallel maps keyed by name) so the two can never
+/// drift out of sync with each other.
+struct JoinedChannel {
+    secret: RoomSecret,
+    sender: GossipSender,
+}
+
 /// Handle to the running network stack.
 ///
 /// Keeps the endpoint/router alive (dropping the router aborts its accept
@@ -126,10 +142,10 @@ pub struct Net {
     /// Retained (rather than handed to the endpoint builder and dropped) so
     /// later joins can add more hints the same way.
     address_lookup: MemoryLookup,
-    /// One gossip sender per joined channel, keyed by topic. Shared with
-    /// spawned join tasks, which insert their new sender here once
+    /// One entry per joined channel, keyed by its local display name.
+    /// Shared with spawned join tasks, which insert their entry here once
     /// subscribed -- see `Net::join`.
-    senders: Arc<Mutex<HashMap<TopicId, GossipSender>>>,
+    channels: Arc<Mutex<HashMap<String, JoinedChannel>>>,
     events_tx: mpsc::Sender<NetEvent>,
     /// Backs history backfill (see backfill.rs): serves our blobs to peers
     /// that fetch from us, and lets us fetch from a peer that announced a
@@ -145,17 +161,22 @@ impl Net {
     /// "general" channel plus every channel in `known_channels` (the
     /// previous session's `ChannelRegistry`, so nothing joined last time is
     /// forgotten -- see `crate::channel_registry`), seeding bootstrap peers
-    /// from each channel's stored addresses. If `join_ticket` names a
-    /// channel not already covered, that channel is joined too, using the
-    /// ticket's address as an extra bootstrap candidate. Spawns a gossip
-    /// task per joined channel forwarding events to `events_tx`. Returns
-    /// the names of the channels joined, in join order, plus the name of
-    /// the channel that should start active (the `--join` ticket's
-    /// channel, if one was given and usable, else "general").
+    /// from each channel's stored addresses and reusing each channel's
+    /// already-known `RoomSecret` rather than generating a new one. If
+    /// `join_ticket` names a channel not already covered, that channel is
+    /// joined too, using the ticket's secret and address. A channel with no
+    /// prior secret at all -- i.e. "general" on a genuinely first run, with
+    /// no `--join` ticket for it either -- gets a freshly generated one, so
+    /// even your very first, un-shared "general" is its own private room
+    /// (see `RoomSecret`'s doc comment). Spawns a gossip task per joined
+    /// channel forwarding events to `events_tx`. Returns the names of the
+    /// channels joined, in join order, plus the name of the channel that
+    /// should start active (the `--join` ticket's channel, if one was given
+    /// and usable, else "general").
     pub async fn start(
         secret_key: SecretKey,
         join_ticket: Option<String>,
-        known_channels: Vec<(String, Vec<EndpointAddr>)>,
+        known_channels: Vec<(String, RoomSecret, Vec<EndpointAddr>)>,
         events_tx: mpsc::Sender<NetEvent>,
         backfill: BackfillStore,
     ) -> anyhow::Result<(Self, Vec<String>, String)> {
@@ -197,7 +218,7 @@ impl Net {
             router,
             gossip,
             address_lookup,
-            senders: Arc::new(Mutex::new(HashMap::new())),
+            channels: Arc::new(Mutex::new(HashMap::new())),
             events_tx,
             backfill,
             our_id,
@@ -222,20 +243,35 @@ impl Net {
 
         let mut joined = Vec::new();
 
-        let mut general_bootstrap = known_channels
+        // The default channel's room secret: reuse what we already know it
+        // as (from a previous session), else the `--join` ticket's secret
+        // if it names "general", else generate a brand-new one -- see this
+        // method's doc comment on why a fresh, un-shared "general" is
+        // still its own private room rather than a well-known public one.
+        let general_known = known_channels
             .iter()
-            .find(|(name, _)| name.as_str() == DEFAULT_CHANNEL)
-            .map(|(_, addrs)| addrs.clone())
+            .find(|(name, _, _)| name.as_str() == DEFAULT_CHANNEL);
+        let general_secret = general_known
+            .map(|(_, secret, _)| *secret)
+            .or_else(|| {
+                ticket
+                    .as_ref()
+                    .filter(|t| t.name == DEFAULT_CHANNEL)
+                    .map(|t| t.secret)
+            })
+            .unwrap_or_else(RoomSecret::generate);
+        let mut general_bootstrap = general_known
+            .map(|(_, _, addrs)| addrs.clone())
             .unwrap_or_default();
         if let Some(t) = ticket.as_ref().filter(|t| t.name == DEFAULT_CHANNEL) {
             general_bootstrap.push(t.addr.clone());
         }
-        net.subscribe_and_register(DEFAULT_CHANNEL, general_bootstrap)
+        net.subscribe_and_register(DEFAULT_CHANNEL, general_secret, general_bootstrap)
             .await
             .context("failed to join default channel")?;
         joined.push(DEFAULT_CHANNEL.to_string());
 
-        for (name, addrs) in &known_channels {
+        for (name, secret, addrs) in &known_channels {
             if name.as_str() == DEFAULT_CHANNEL {
                 continue;
             }
@@ -243,7 +279,7 @@ impl Net {
             if let Some(t) = ticket.as_ref().filter(|t| t.name.as_str() == name.as_str()) {
                 bootstrap.push(t.addr.clone());
             }
-            net.subscribe_and_register(name, bootstrap)
+            net.subscribe_and_register(name, *secret, bootstrap)
                 .await
                 .with_context(|| format!("failed to rejoin channel {name:?}"))?;
             joined.push(name.clone());
@@ -251,7 +287,7 @@ impl Net {
 
         let active = match &ticket {
             Some(t) if !joined.contains(&t.name) => {
-                net.subscribe_and_register(&t.name, vec![t.addr.clone()])
+                net.subscribe_and_register(&t.name, t.secret, vec![t.addr.clone()])
                     .await
                     .with_context(|| format!("failed to join channel {:?}", t.name))?;
                 joined.push(t.name.clone());
@@ -264,17 +300,19 @@ impl Net {
         Ok((net, joined, active))
     }
 
-    /// Subscribes to `name`'s topic, registers the resulting sender, and
-    /// spawns its forwarding (and, if `bootstrap` is non-empty, retry-join)
-    /// tasks. Shared by startup (`Net::start`) and runtime (`Net::join`)
-    /// joins so the two paths can't drift apart. `bootstrap` may combine
-    /// addresses from more than one source (e.g. a `--join` ticket and
-    /// previously-learned peers from `crate::channel_registry`) --
-    /// duplicates are harmless, since iroh-gossip dedupes its bootstrap set
-    /// internally.
+    /// Subscribes to `secret`'s topic, registers `name` to the resulting
+    /// sender (plus `secret`, so `ticket_for`/`secret_for` can look it back
+    /// up later), and spawns its forwarding (and, if `bootstrap` is
+    /// non-empty, retry-join) tasks. Shared by startup (`Net::start`) and
+    /// runtime (`Net::join`) joins so the two paths can't drift apart.
+    /// `bootstrap` may combine addresses from more than one source (e.g. a
+    /// `--join` ticket and previously-learned peers from
+    /// `crate::channel_registry`) -- duplicates are harmless, since
+    /// iroh-gossip dedupes its bootstrap set internally.
     async fn subscribe_and_register(
         &self,
         name: &str,
+        secret: RoomSecret,
         bootstrap: Vec<EndpointAddr>,
     ) -> anyhow::Result<()> {
         for addr in &bootstrap {
@@ -282,7 +320,7 @@ impl Net {
         }
         let bootstrap_ids: Vec<EndpointId> = bootstrap.iter().map(|addr| addr.id).collect();
 
-        let topic = topic_for_name(name);
+        let topic = topic_for_secret(&secret);
         let (sender, receiver) = self
             .gossip
             .subscribe(topic, bootstrap_ids.clone())
@@ -291,10 +329,13 @@ impl Net {
             .split();
         debug!(channel = %name, bootstrap = bootstrap_ids.len(), "joined channel");
 
-        self.senders
-            .lock()
-            .expect("senders lock poisoned")
-            .insert(topic, sender.clone());
+        self.channels.lock().expect("channels lock poisoned").insert(
+            name.to_string(),
+            JoinedChannel {
+                secret,
+                sender: sender.clone(),
+            },
+        );
 
         if !bootstrap_ids.is_empty() {
             tokio::spawn(retry_join(sender, bootstrap_ids));
@@ -309,22 +350,44 @@ impl Net {
         Ok(())
     }
 
+    /// The room secret backing `name`, if it's currently joined -- so
+    /// callers (e.g. `main.rs`, to persist it to
+    /// `crate::channel_registry`) can look up what `Net` resolved or
+    /// generated for a channel once it's joined. `None` if `name` isn't
+    /// joined.
+    pub fn secret_for(&self, name: &str) -> Option<RoomSecret> {
+        self.channels
+            .lock()
+            .expect("channels lock poisoned")
+            .get(name)
+            .map(|c| c.secret)
+    }
+
     /// Joins (or creates) a channel named by a bare name or an invite
-    /// ticket string. Returns `Some(message)` immediately if `arg` looks
-    /// like a ticket but fails to decode (see `parse_join_arg`) -- this is
-    /// checked synchronously so the caller can show it right away. Also
-    /// returns `Some(message)` if the ticket decodes but names our own
-    /// identity (see `is_self`); unlike the decode-failure case, the join
-    /// below still proceeds (using no bootstrap, since a self-referential
-    /// one is useless) so the channel is created/switched to regardless.
-    /// Otherwise this is fire-and-forget: spawns its own task and reports
-    /// the outcome back as a `NetEvent::Joined`/`JoinFailed`, so the
-    /// caller's event loop never awaits network I/O directly.
+    /// ticket string.
     ///
-    /// A no-op re-subscribe if the channel is already joined -- it still
-    /// reports `Joined` so the UI can switch to it.
+    /// A bare name that isn't already joined creates a brand-new room with
+    /// a freshly generated `RoomSecret` -- private until you `/invite`
+    /// someone into it. A ticket's secret is used as-is. If `name` is
+    /// *already* joined, its existing secret always wins: a bare name is a
+    /// no-op re-subscribe, while a ticket whose secret doesn't match is
+    /// rejected with an explanatory message instead of silently switching
+    /// rooms out from under an existing tab -- names are just local
+    /// labels, so two unrelated rooms can otherwise happen to want the
+    /// same one.
+    ///
+    /// Returns `Some(message)` immediately if `arg` looks like a ticket but
+    /// fails to decode (see `parse_join_arg`), if it names a different
+    /// room than one we already have under that name (see above), or if it
+    /// decodes but names our own identity (see `is_self`) -- in the
+    /// identity case the join below still proceeds (using no bootstrap,
+    /// since a self-referential one is useless) so the channel is
+    /// created/switched to regardless. Otherwise this is fire-and-forget:
+    /// spawns its own task and reports the outcome back as a
+    /// `NetEvent::Joined`/`JoinFailed`, so the caller's event loop never
+    /// awaits network I/O directly.
     pub fn join(&self, arg: String) -> Option<String> {
-        let (name, bootstrap) = match parse_join_arg(&arg) {
+        let (name, ticket) = match parse_join_arg(&arg) {
             Ok(parsed) => parsed,
             Err(error) => return Some(error),
         };
@@ -332,16 +395,26 @@ impl Net {
             return None;
         }
 
-        let topic = topic_for_name(&name);
-        if self
-            .senders
+        let existing_secret = self
+            .channels
             .lock()
-            .expect("senders lock poisoned")
-            .contains_key(&topic)
+            .expect("channels lock poisoned")
+            .get(&name)
+            .map(|c| c.secret);
+        let ticket_secret = ticket.as_ref().map(|(secret, _)| *secret);
+        if let (Some(existing), Some(from_ticket)) = (existing_secret, ticket_secret)
+            && existing != from_ticket
         {
+            return Some(format!(
+                "that ticket is for a different room also named #{name} -- pick a new local name to join it"
+            ));
+        }
+        if existing_secret.is_some() {
             let _ = self.events_tx.try_send(NetEvent::Joined(name));
             return None;
         }
+        let secret = ticket_secret.unwrap_or_else(RoomSecret::generate);
+        let bootstrap = ticket.map(|(_, addr)| addr);
 
         let self_ticket = bootstrap
             .as_ref()
@@ -353,9 +426,10 @@ impl Net {
             )
         });
 
+        let topic = topic_for_secret(&secret);
         let gossip = self.gossip.clone();
         let address_lookup = self.address_lookup.clone();
-        let senders = Arc::clone(&self.senders);
+        let channels = Arc::clone(&self.channels);
         let events_tx = self.events_tx.clone();
         let endpoint = self.router.endpoint().clone();
         tokio::spawn(async move {
@@ -367,10 +441,13 @@ impl Net {
             match gossip.subscribe(topic, bootstrap_ids.clone()).await {
                 Ok(topic_handle) => {
                     let (sender, receiver) = topic_handle.split();
-                    senders
-                        .lock()
-                        .expect("senders lock poisoned")
-                        .insert(topic, sender.clone());
+                    channels.lock().expect("channels lock poisoned").insert(
+                        name.clone(),
+                        JoinedChannel {
+                            secret,
+                            sender: sender.clone(),
+                        },
+                    );
                     if !bootstrap_ids.is_empty() {
                         tokio::spawn(retry_join(sender, bootstrap_ids));
                     }
@@ -399,13 +476,12 @@ impl Net {
     /// shouldn't be able to compose a message for a channel it doesn't know
     /// about, so this would indicate a bug elsewhere.
     pub fn send(&self, channel: &str, message: ChatMessage) {
-        let topic = topic_for_name(channel);
         let Some(sender) = self
-            .senders
+            .channels
             .lock()
-            .expect("senders lock poisoned")
-            .get(&topic)
-            .cloned()
+            .expect("channels lock poisoned")
+            .get(channel)
+            .map(|c| c.sender.clone())
         else {
             warn!(%channel, "dropping message for unjoined channel");
             return;
@@ -432,13 +508,12 @@ impl Net {
     /// is inherently a neighbor-to-neighbor concern, not something that
     /// needs flooding. Fire-and-forget, like `send`.
     pub fn announce(&self, channel: &str, root: Hash) {
-        let topic = topic_for_name(channel);
         let Some(sender) = self
-            .senders
+            .channels
             .lock()
-            .expect("senders lock poisoned")
-            .get(&topic)
-            .cloned()
+            .expect("channels lock poisoned")
+            .get(channel)
+            .map(|c| c.sender.clone())
         else {
             return;
         };
@@ -496,12 +571,22 @@ impl Net {
     }
 
     /// Builds this instance's invite ticket string for `channel`: our
-    /// current address plus the channel's name, ready to be pasted into
-    /// another instance's `--join` flag or `/join` command. Synchronous --
-    /// `Endpoint::addr` doesn't need to await anything.
+    /// current address, the channel's room secret, and its display name,
+    /// ready to be pasted into another instance's `--join` flag or `/join`
+    /// command. Synchronous -- `Endpoint::addr` doesn't need to await
+    /// anything.
+    ///
+    /// # Panics
+    /// Panics if `channel` isn't currently joined -- every call site
+    /// (startup's own just-joined list, and `/invite`'s active channel)
+    /// only ever names a channel we're already in.
     pub fn ticket_for(&self, channel: &str) -> String {
+        let secret = self
+            .secret_for(channel)
+            .expect("ticket_for called for an unjoined channel");
         ChannelTicket {
             name: channel.to_string(),
+            secret,
             addr: self.router.endpoint().addr(),
         }
         .encode_string()
@@ -619,29 +704,32 @@ mod tests {
 
     #[test]
     fn parse_join_arg_treats_a_bare_name_as_a_channel_name() {
-        let (name, bootstrap) = parse_join_arg("project-x").unwrap();
+        let (name, ticket) = parse_join_arg("project-x").unwrap();
         assert_eq!(name, "project-x");
-        assert!(bootstrap.is_none());
+        assert!(ticket.is_none());
     }
 
     #[test]
     fn parse_join_arg_decodes_a_valid_ticket() {
         let addr = sample_addr();
-        let ticket = ChannelTicket {
+        let secret = RoomSecret::generate();
+        let encoded = ChannelTicket {
             name: "general".to_string(),
+            secret,
             addr: addr.clone(),
         }
         .encode_string();
 
-        let (name, bootstrap) = parse_join_arg(&ticket).unwrap();
+        let (name, ticket) = parse_join_arg(&encoded).unwrap();
         assert_eq!(name, "general");
-        assert_eq!(bootstrap, Some(addr));
+        assert_eq!(ticket, Some((secret, addr)));
     }
 
     #[test]
     fn parse_join_arg_reports_a_truncated_ticket_as_an_error_not_a_name() {
         let ticket = ChannelTicket {
             name: "general".to_string(),
+            secret: RoomSecret::generate(),
             addr: sample_addr(),
         }
         .encode_string();
@@ -673,5 +761,21 @@ mod tests {
 
         assert!(is_self(&our_addr, our_id));
         assert!(!is_self(&sample_addr(), our_id));
+    }
+
+    #[test]
+    fn topic_for_secret_differs_for_different_secrets_even_with_the_same_name() {
+        // The whole point of deriving the topic from the secret rather
+        // than the name: two rooms both called "general" must not land on
+        // the same swarm.
+        let a = topic_for_secret(&RoomSecret::generate());
+        let b = topic_for_secret(&RoomSecret::generate());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn topic_for_secret_is_deterministic_for_the_same_secret() {
+        let secret = RoomSecret::generate();
+        assert_eq!(topic_for_secret(&secret), topic_for_secret(&secret));
     }
 }
