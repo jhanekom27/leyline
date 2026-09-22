@@ -51,6 +51,12 @@ pub enum NetEvent {
     PeerJoined(String, [u8; 32]),
     /// A peer dropped from a channel's mesh.
     PeerLeft(String, [u8; 32]),
+    /// A gossip neighbor's dialable address (relay/direct-address hints)
+    /// was resolved via `Endpoint::remote_info`, ready to persist as a
+    /// bootstrap hint for reconnecting to this channel on a future run --
+    /// see `crate::channel_registry`. Best-effort: not every `PeerJoined`
+    /// produces one of these, since `remote_info` can return `None`.
+    PeerAddressLearned(String, EndpointAddr),
     /// A chat message was received and decoded.
     Received(String, ChatMessage),
     /// The receiver missed some messages because it wasn't keeping up.
@@ -94,6 +100,19 @@ fn parse_join_arg(arg: &str) -> Result<(String, Option<EndpointAddr>), String> {
     }
 }
 
+/// `true` if `addr` names our own endpoint id.
+///
+/// Used to detect a self-referential invite ticket -- e.g. pasting your
+/// own `/invite` ticket back in after a restart, since a ticket always
+/// encodes the *sharer's* address (`Net::ticket_for`), not a durable
+/// channel meeting point. iroh treats connecting to yourself as a no-op,
+/// so keeping such an address as a bootstrap candidate would otherwise
+/// produce a silently isolated topic subscription instead of a clear
+/// outcome.
+fn is_self(addr: &EndpointAddr, our_id: [u8; 32]) -> bool {
+    *addr.id.as_bytes() == our_id
+}
+
 /// Handle to the running network stack.
 ///
 /// Keeps the endpoint/router alive (dropping the router aborts its accept
@@ -122,19 +141,24 @@ pub struct Net {
 }
 
 impl Net {
-    /// Binds an endpoint using `secret_key`, joins the default "general"
-    /// channel (dialing the bootstrap peer from `join_ticket` if it names
-    /// "general"), additionally joins `join_ticket`'s channel if it names
-    /// something else, and spawns a gossip task per joined channel
-    /// forwarding events to `events_tx`. Returns the names of the channels
-    /// joined, in join order, so the caller can decide e.g. which one
-    /// starts active.
+    /// Binds an endpoint using `secret_key`, then joins the default
+    /// "general" channel plus every channel in `known_channels` (the
+    /// previous session's `ChannelRegistry`, so nothing joined last time is
+    /// forgotten -- see `crate::channel_registry`), seeding bootstrap peers
+    /// from each channel's stored addresses. If `join_ticket` names a
+    /// channel not already covered, that channel is joined too, using the
+    /// ticket's address as an extra bootstrap candidate. Spawns a gossip
+    /// task per joined channel forwarding events to `events_tx`. Returns
+    /// the names of the channels joined, in join order, plus the name of
+    /// the channel that should start active (the `--join` ticket's
+    /// channel, if one was given and usable, else "general").
     pub async fn start(
         secret_key: SecretKey,
         join_ticket: Option<String>,
+        known_channels: Vec<(String, Vec<EndpointAddr>)>,
         events_tx: mpsc::Sender<NetEvent>,
         backfill: BackfillStore,
-    ) -> anyhow::Result<(Self, Vec<String>)> {
+    ) -> anyhow::Result<(Self, Vec<String>, String)> {
         let ticket = join_ticket
             .map(|raw| ChannelTicket::decode_string(&raw))
             .transpose()
@@ -156,6 +180,7 @@ impl Net {
             .await
             .context("failed to bind iroh endpoint")?;
         let id = endpoint.id();
+        let our_id = *id.as_bytes();
         info!(%id, "endpoint bound");
 
         // Wait for a home relay so the address used for our own tickets
@@ -175,40 +200,84 @@ impl Net {
             senders: Arc::new(Mutex::new(HashMap::new())),
             events_tx,
             backfill,
-            our_id: *id.as_bytes(),
+            our_id,
         };
 
-        let general_bootstrap = ticket
-            .as_ref()
-            .filter(|t| t.name == DEFAULT_CHANNEL)
-            .map(|t| t.addr.clone());
+        // A ticket naming our own identity can't reach anyone -- an invite
+        // ticket always encodes the *sharer's* address (see
+        // `Net::ticket_for`), so pasting your own back in (e.g. after a
+        // restart) would otherwise silently try to bootstrap to yourself.
+        // Drop it as a bootstrap candidate; any peers already known for
+        // that channel (from `known_channels`) are used instead.
+        let ticket = ticket.filter(|t| {
+            let usable = !is_self(&t.addr, our_id);
+            if !usable {
+                warn!(
+                    channel = %t.name,
+                    "--join ticket points at our own identity; ignoring it and using known peers instead"
+                );
+            }
+            usable
+        });
+
+        let mut joined = Vec::new();
+
+        let mut general_bootstrap = known_channels
+            .iter()
+            .find(|(name, _)| name.as_str() == DEFAULT_CHANNEL)
+            .map(|(_, addrs)| addrs.clone())
+            .unwrap_or_default();
+        if let Some(t) = ticket.as_ref().filter(|t| t.name == DEFAULT_CHANNEL) {
+            general_bootstrap.push(t.addr.clone());
+        }
         net.subscribe_and_register(DEFAULT_CHANNEL, general_bootstrap)
             .await
             .context("failed to join default channel")?;
-        let mut joined = vec![DEFAULT_CHANNEL.to_string()];
+        joined.push(DEFAULT_CHANNEL.to_string());
 
-        if let Some(ticket) = ticket
-            && ticket.name != DEFAULT_CHANNEL
-        {
-            net.subscribe_and_register(&ticket.name, Some(ticket.addr))
+        for (name, addrs) in &known_channels {
+            if name.as_str() == DEFAULT_CHANNEL {
+                continue;
+            }
+            let mut bootstrap = addrs.clone();
+            if let Some(t) = ticket.as_ref().filter(|t| t.name.as_str() == name.as_str()) {
+                bootstrap.push(t.addr.clone());
+            }
+            net.subscribe_and_register(name, bootstrap)
                 .await
-                .with_context(|| format!("failed to join channel {:?}", ticket.name))?;
-            joined.push(ticket.name);
+                .with_context(|| format!("failed to rejoin channel {name:?}"))?;
+            joined.push(name.clone());
         }
 
-        Ok((net, joined))
+        let active = match &ticket {
+            Some(t) if !joined.contains(&t.name) => {
+                net.subscribe_and_register(&t.name, vec![t.addr.clone()])
+                    .await
+                    .with_context(|| format!("failed to join channel {:?}", t.name))?;
+                joined.push(t.name.clone());
+                t.name.clone()
+            }
+            Some(t) => t.name.clone(),
+            None => DEFAULT_CHANNEL.to_string(),
+        };
+
+        Ok((net, joined, active))
     }
 
     /// Subscribes to `name`'s topic, registers the resulting sender, and
-    /// spawns its forwarding (and, if `bootstrap` is given, retry-join)
+    /// spawns its forwarding (and, if `bootstrap` is non-empty, retry-join)
     /// tasks. Shared by startup (`Net::start`) and runtime (`Net::join`)
-    /// joins so the two paths can't drift apart.
+    /// joins so the two paths can't drift apart. `bootstrap` may combine
+    /// addresses from more than one source (e.g. a `--join` ticket and
+    /// previously-learned peers from `crate::channel_registry`) --
+    /// duplicates are harmless, since iroh-gossip dedupes its bootstrap set
+    /// internally.
     async fn subscribe_and_register(
         &self,
         name: &str,
-        bootstrap: Option<EndpointAddr>,
+        bootstrap: Vec<EndpointAddr>,
     ) -> anyhow::Result<()> {
-        if let Some(addr) = &bootstrap {
+        for addr in &bootstrap {
             self.address_lookup.add_endpoint_info(addr.clone());
         }
         let bootstrap_ids: Vec<EndpointId> = bootstrap.iter().map(|addr| addr.id).collect();
@@ -234,6 +303,7 @@ impl Net {
             name.to_string(),
             receiver,
             self.events_tx.clone(),
+            self.router.endpoint().clone(),
         ));
 
         Ok(())
@@ -242,10 +312,14 @@ impl Net {
     /// Joins (or creates) a channel named by a bare name or an invite
     /// ticket string. Returns `Some(message)` immediately if `arg` looks
     /// like a ticket but fails to decode (see `parse_join_arg`) -- this is
-    /// checked synchronously so the caller can show it right away. On
-    /// success, this is otherwise fire-and-forget: spawns its own task and
-    /// reports the outcome back as a `NetEvent::Joined`/`JoinFailed`, so
-    /// the caller's event loop never awaits network I/O directly.
+    /// checked synchronously so the caller can show it right away. Also
+    /// returns `Some(message)` if the ticket decodes but names our own
+    /// identity (see `is_self`); unlike the decode-failure case, the join
+    /// below still proceeds (using no bootstrap, since a self-referential
+    /// one is useless) so the channel is created/switched to regardless.
+    /// Otherwise this is fire-and-forget: spawns its own task and reports
+    /// the outcome back as a `NetEvent::Joined`/`JoinFailed`, so the
+    /// caller's event loop never awaits network I/O directly.
     ///
     /// A no-op re-subscribe if the channel is already joined -- it still
     /// reports `Joined` so the UI can switch to it.
@@ -269,10 +343,21 @@ impl Net {
             return None;
         }
 
+        let self_ticket = bootstrap
+            .as_ref()
+            .is_some_and(|addr| is_self(addr, self.our_id));
+        let bootstrap = if self_ticket { None } else { bootstrap };
+        let message = self_ticket.then(|| {
+            format!(
+                "that invite ticket points at your own identity, so it can't connect you to anyone -- joining #{name} anyway"
+            )
+        });
+
         let gossip = self.gossip.clone();
         let address_lookup = self.address_lookup.clone();
         let senders = Arc::clone(&self.senders);
         let events_tx = self.events_tx.clone();
+        let endpoint = self.router.endpoint().clone();
         tokio::spawn(async move {
             if let Some(addr) = &bootstrap {
                 address_lookup.add_endpoint_info(addr.clone());
@@ -289,7 +374,12 @@ impl Net {
                     if !bootstrap_ids.is_empty() {
                         tokio::spawn(retry_join(sender, bootstrap_ids));
                     }
-                    tokio::spawn(forward_events(name.clone(), receiver, events_tx.clone()));
+                    tokio::spawn(forward_events(
+                        name.clone(),
+                        receiver,
+                        events_tx.clone(),
+                        endpoint,
+                    ));
                     let _ = events_tx.send(NetEvent::Joined(name)).await;
                 }
                 Err(err) => {
@@ -299,7 +389,8 @@ impl Net {
                 }
             }
         });
-        None
+
+        message
     }
 
     /// Encodes and broadcasts a chat message to `channel`. Fire-and-forget:
@@ -442,15 +533,18 @@ async fn retry_join(sender: GossipSender, bootstrap: Vec<EndpointId>) {
 
 /// Reads gossip events off `receiver` and forwards them as `NetEvent`s
 /// tagged with `channel` until the receiver closes or `events_tx` is
-/// dropped.
+/// dropped. `endpoint` is used to resolve a newly-up neighbor's dialable
+/// address (see `announce_learned_address`).
 async fn forward_events(
     channel: String,
     mut receiver: GossipReceiver,
     events_tx: mpsc::Sender<NetEvent>,
+    endpoint: Endpoint,
 ) {
     while let Some(event) = receiver.next().await {
         let net_event = match event {
             Ok(GossipEvent::NeighborUp(id)) => {
+                announce_learned_address(&channel, id, &endpoint, &events_tx).await;
                 NetEvent::PeerJoined(channel.clone(), *id.as_bytes())
             }
             Ok(GossipEvent::NeighborDown(id)) => {
@@ -484,6 +578,28 @@ async fn forward_events(
         }
     }
     debug!(%channel, "gossip event forwarder stopped");
+}
+
+/// Resolves a newly-up neighbor's dialable address (relay/direct hints)
+/// via `Endpoint::remote_info` and reports it as
+/// `NetEvent::PeerAddressLearned`, so it can be persisted as a bootstrap
+/// hint for a future restart -- see `crate::channel_registry`.
+/// Best-effort: `remote_info` can return `None` (e.g. no address info
+/// cached for `id` yet), in which case this is simply a no-op; presence
+/// (`NetEvent::PeerJoined`) is still reported by the caller regardless.
+async fn announce_learned_address(
+    channel: &str,
+    id: EndpointId,
+    endpoint: &Endpoint,
+    events_tx: &mpsc::Sender<NetEvent>,
+) {
+    let Some(info) = endpoint.remote_info(id).await else {
+        return;
+    };
+    let addr = EndpointAddr::from_parts(info.id(), info.into_addrs().map(|a| a.into_addr()));
+    let _ = events_tx
+        .send(NetEvent::PeerAddressLearned(channel.to_string(), addr))
+        .await;
 }
 
 #[cfg(test)]
@@ -547,5 +663,15 @@ mod tests {
         // channel literally named "leyline".
         let error = parse_join_arg("leyline").unwrap_err();
         assert!(error.contains("invite ticket"));
+    }
+
+    #[test]
+    fn is_self_detects_an_address_naming_our_own_id() {
+        let our_key = SecretKey::generate();
+        let our_id = *our_key.public().as_bytes();
+        let our_addr = EndpointAddr::from_parts(our_key.public(), []);
+
+        assert!(is_self(&our_addr, our_id));
+        assert!(!is_self(&sample_addr(), our_id));
     }
 }

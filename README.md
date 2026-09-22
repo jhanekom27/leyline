@@ -22,6 +22,15 @@ things are still deliberately minimal:
   saved to disk, so your endpoint id stays the same every time you start
   `leyline` (see [Build & run](#build--run) for how this affects local
   multi-instance testing).
+- **Channel membership and known peers persist too** -- every channel you
+  join (by name or ticket) and the addresses of peers you've talked to
+  are remembered on disk, so restarting `leyline` rejoins all of them and
+  reconnects automatically, without re-pasting an invite ticket. An
+  invite ticket itself is one-directional -- it bundles *your* current
+  address so someone else can bootstrap onto you -- so pasting your own
+  ticket back in after a restart can't reconnect you to anyone; it's
+  detected and ignored in favor of previously-known peers for that
+  channel.
 - **Backfill only covers channels you've joined** -- it rides each
   channel's existing gossip topic, so you still need a name or ticket to
   join a channel before its history can sync to you.
@@ -109,7 +118,7 @@ Typed into the message box and submitted with `Enter`:
 | --- | --- |
 | `/join <channel-name>` | Join or create a channel by name, then switch to it |
 | `/join <ticket>` | Join the channel named in a pasted invite ticket |
-| `/invite` | Show the active channel's invite ticket in the transcript, to share with others |
+| `/invite` | Show the active channel's invite ticket in the transcript (and copy it to your clipboard, if one is available) to share with others |
 
 ## Roadmap
 

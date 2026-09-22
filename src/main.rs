@@ -1,5 +1,6 @@
 mod app;
 mod backfill;
+mod channel_registry;
 mod identity;
 mod message;
 mod net;
@@ -12,14 +13,16 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Context;
+use arboard::Clipboard;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio::time::interval;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use app::{AppState, InputAction};
 use backfill::BackfillStore;
+use channel_registry::ChannelRegistry;
 use net::{Net, NetEvent};
 use storage::MessageStore;
 
@@ -33,15 +36,34 @@ async fn main() -> anyhow::Result<()> {
     let backfill = BackfillStore::new(dirs.data_dir().join("blobs"))
         .await
         .context("failed to initialize history backfill storage")?;
+    let registry = ChannelRegistry::load(dirs.data_dir().join("channels"))
+        .context("failed to initialize channel registry")?;
 
     let secret_key = identity::load_or_generate(&dirs.config_dir().join("identity"))
         .context("failed to load or generate identity")?;
     let join_ticket = parse_join_arg()?;
 
+    // What to rejoin from the previous session -- see channel_registry.rs
+    // and `Net::start`. Empty on a first run (just "general" then).
+    let known_channels = registry
+        .channel_names()
+        .into_iter()
+        .map(|name| {
+            let addrs = registry.bootstrap_for(&name);
+            (name, addrs)
+        })
+        .collect();
+
     let (net_tx, net_rx) = mpsc::channel(64);
-    let (net, joined_channels) = Net::start(secret_key, join_ticket, net_tx, backfill.clone())
-        .await
-        .context("failed to start networking")?;
+    let (net, joined_channels, active_channel) = Net::start(
+        secret_key,
+        join_ticket,
+        known_channels,
+        net_tx,
+        backfill.clone(),
+    )
+    .await
+    .context("failed to start networking")?;
     println!("invite tickets (share via --join <ticket> or the in-app /join <ticket> command):");
     for name in &joined_channels {
         let ticket = net.ticket_for(name);
@@ -49,8 +71,18 @@ async fn main() -> anyhow::Result<()> {
         println!("  #{name}: {ticket}");
     }
 
+    let session = Session {
+        net,
+        net_rx,
+        joined_channels,
+        active_channel,
+        store,
+        backfill,
+        registry,
+    };
+
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, net, net_rx, joined_channels, store, backfill).await;
+    let result = run(&mut terminal, session).await;
     ratatui::restore();
     result
 }
@@ -105,20 +137,42 @@ fn init_logging(dirs: &directories::ProjectDirs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resources `run` needs besides the terminal, grouped into one struct so
+/// its signature doesn't grow a parameter per resource.
+struct Session {
+    net: Net,
+    net_rx: mpsc::Receiver<NetEvent>,
+    joined_channels: Vec<String>,
+    active_channel: String,
+    store: MessageStore,
+    backfill: BackfillStore,
+    registry: ChannelRegistry,
+}
+
 /// The "snappy async event loop": crossterm's async `EventStream` and the
 /// network's `NetEvent`s merged via `tokio::select!`, redrawing only when
 /// something actually changed -- see concept.md's "snappy async event
 /// loop".
-async fn run(
-    terminal: &mut ratatui::DefaultTerminal,
-    net: Net,
-    mut net_rx: mpsc::Receiver<NetEvent>,
-    joined_channels: Vec<String>,
-    store: MessageStore,
-    backfill: BackfillStore,
-) -> anyhow::Result<()> {
-    let mut app = AppState::new(net.our_id, joined_channels.clone());
+async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyhow::Result<()> {
+    let Session {
+        net,
+        mut net_rx,
+        joined_channels,
+        active_channel,
+        store,
+        backfill,
+        mut registry,
+    } = session;
+
+    let mut app = AppState::new(net.our_id, joined_channels.clone(), &active_channel);
     for name in &joined_channels {
+        // Ensures a brand-new channel ("general" on a first run, or a
+        // `--join` ticket's channel) lands in the registry, so it's
+        // rejoined automatically next time -- see channel_registry.rs.
+        // A no-op for channels the registry already knew about.
+        if let Err(err) = registry.record_channel(name) {
+            warn!(channel = %name, "failed to persist joined channel: {err}");
+        }
         match store.load(name) {
             Ok(history) => {
                 if let Err(err) = backfill.record_messages(name, &history).await {
@@ -129,6 +183,19 @@ async fn run(
             Err(err) => warn!(channel = %name, "failed to load message history: {err}"),
         }
     }
+
+    // `None` if no clipboard is available (e.g. a headless SSH session) --
+    // `/invite` still prints the ticket either way, this just skips the
+    // auto-copy. Held for the whole session rather than recreated per
+    // `/invite`, since a dropped `Clipboard` can lose its contents on
+    // X11/Wayland if nothing else has claimed ownership yet.
+    let mut clipboard = match Clipboard::new() {
+        Ok(clipboard) => Some(clipboard),
+        Err(err) => {
+            debug!("clipboard unavailable, /invite won't auto-copy: {err}");
+            None
+        }
+    };
 
     let mut term_events = EventStream::new();
     let mut tick = interval(Duration::from_millis(250));
@@ -155,13 +222,17 @@ async fn run(
                                 net.send(&channel, message);
                             }
                             Some(InputAction::Join(arg)) => {
-                                if let Some(error) = net.join(arg) {
-                                    app.push_system(error);
+                                if let Some(message) = net.join(arg) {
+                                    app.push_system(message);
                                 }
                             }
                             Some(InputAction::Invite(channel)) => {
                                 let ticket = net.ticket_for(&channel);
-                                app.push_system(format!("invite for #{channel}: {ticket}"));
+                                let copied = clipboard.as_mut().is_some_and(|clipboard| {
+                                    clipboard.set_text(ticket.clone()).is_ok()
+                                });
+                                let suffix = if copied { " (copied to clipboard)" } else { "" };
+                                app.push_system(format!("invite for #{channel}: {ticket}{suffix}"));
                             }
                             None => {}
                         }
@@ -183,6 +254,18 @@ async fn run(
                     net.announce(channel, root);
                 }
 
+                // Also peek for a channel finishing a runtime `/join`, so
+                // it's persisted to the channel registry -- see
+                // channel_registry.rs -- and rejoined automatically on a
+                // future restart. Channels joined at startup are already
+                // in the registry (see the loop above), so this only
+                // matters for new ones joined during this session.
+                if let NetEvent::Joined(name) = &net_event
+                    && let Err(err) = registry.record_channel(name)
+                {
+                    warn!(channel = %name, "failed to persist joined channel: {err}");
+                }
+
                 match net_event {
                     NetEvent::Announce(channel, announce) => {
                         net.sync_history(channel, announce);
@@ -198,6 +281,11 @@ async fn run(
                             && let Err(err) = backfill.record_messages(&channel, &newly_accepted).await
                         {
                             warn!(%channel, "failed to record backfilled messages: {err}");
+                        }
+                    }
+                    NetEvent::PeerAddressLearned(channel, addr) => {
+                        if let Err(err) = registry.record_peer(&channel, addr) {
+                            warn!(%channel, "failed to persist known peer address: {err}");
                         }
                     }
                     other => {

@@ -118,20 +118,25 @@ pub struct AppState {
 
 impl AppState {
     /// Builds the initial state for a session with the given identity and
-    /// already-joined channel names (in join order). The last-joined
-    /// channel starts active -- e.g. so `--join <ticket-for-project-x>`
-    /// lands you in `project-x`, not `general`.
+    /// already-joined channel names (in join order). `active_channel`
+    /// selects which one starts active -- e.g. so `--join
+    /// <ticket-for-project-x>` lands you in `project-x`, not `general` --
+    /// falling back to the first channel if `active_channel` isn't among
+    /// `channel_names`.
     ///
     /// # Panics
     /// Panics if `channel_names` is empty. `AppState` always has at least
     /// one channel, so `active` is always a valid index.
-    pub fn new(self_id: [u8; 32], channel_names: Vec<String>) -> Self {
+    pub fn new(self_id: [u8; 32], channel_names: Vec<String>, active_channel: &str) -> Self {
         assert!(
             !channel_names.is_empty(),
             "AppState must start with at least one channel"
         );
+        let active = channel_names
+            .iter()
+            .position(|name| name == active_channel)
+            .unwrap_or(0);
         let channels: Vec<Channel> = channel_names.into_iter().map(Channel::new).collect();
-        let active = channels.len() - 1;
         Self {
             self_id,
             channels,
@@ -311,10 +316,14 @@ impl AppState {
                 None
             }
             // Handled in main.rs before reaching here: `Announce` triggers
-            // `Net::sync_history`, and `HistoryFetched`'s payload goes
-            // through `merge_history` above, not this match. Both are
-            // network-sync bookkeeping, not transcript/presence state.
-            NetEvent::Announce(..) | NetEvent::HistoryFetched(..) => None,
+            // `Net::sync_history`, `HistoryFetched`'s payload goes through
+            // `merge_history` above, and `PeerAddressLearned` is persisted
+            // to the channel registry (see channel_registry.rs). All three
+            // are network-sync/reconnection bookkeeping, not transcript or
+            // presence state.
+            NetEvent::Announce(..)
+            | NetEvent::HistoryFetched(..)
+            | NetEvent::PeerAddressLearned(..) => None,
         }
     }
 
@@ -522,11 +531,15 @@ mod tests {
     const PEER_ID: [u8; 32] = [7; 32];
 
     fn app() -> AppState {
-        AppState::new(SELF_ID, vec!["general".to_string()])
+        AppState::new(SELF_ID, vec!["general".to_string()], "general")
     }
 
     fn multi_channel_app() -> AppState {
-        AppState::new(SELF_ID, vec!["general".to_string(), "random".to_string()])
+        AppState::new(
+            SELF_ID,
+            vec!["general".to_string(), "random".to_string()],
+            "random",
+        )
     }
 
     fn key(code: KeyCode) -> KeyEvent {
