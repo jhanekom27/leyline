@@ -15,6 +15,7 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey, address_lookup::memory::MemoryLookup,
     endpoint::presets, protocol::Router,
 };
+use iroh_blobs::Hash;
 use iroh_gossip::{
     api::{Event as GossipEvent, GossipReceiver, GossipSender},
     net::{GOSSIP_ALPN, Gossip},
@@ -24,7 +25,8 @@ use iroh_tickets::{ParseError, Ticket};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::message::ChatMessage;
+use crate::backfill::BackfillStore;
+use crate::message::{ChatMessage, GossipPayload, HistoryAnnounce};
 use crate::ticket::ChannelTicket;
 
 /// The channel every instance joins on startup.
@@ -57,6 +59,12 @@ pub enum NetEvent {
     Joined(String),
     /// A channel failed to join.
     JoinFailed(String, String),
+    /// A peer announced its current history root hash for a channel -- see
+    /// `crate::message::HistoryAnnounce` and backfill.rs.
+    Announce(String, HistoryAnnounce),
+    /// A history backfill fetch finished and decoded some messages, ready
+    /// to be deduped, persisted, and merged into the transcript.
+    HistoryFetched(String, Vec<ChatMessage>),
 }
 
 /// A channel's gossip topic is a deterministic hash of its human-readable
@@ -104,6 +112,10 @@ pub struct Net {
     /// subscribed -- see `Net::join`.
     senders: Arc<Mutex<HashMap<TopicId, GossipSender>>>,
     events_tx: mpsc::Sender<NetEvent>,
+    /// Backs history backfill (see backfill.rs): serves our blobs to peers
+    /// that fetch from us, and lets us fetch from a peer that announced a
+    /// root hash we don't have yet.
+    backfill: BackfillStore,
     /// Our own endpoint id, as raw bytes so callers don't need to depend on
     /// iroh types.
     pub our_id: [u8; 32],
@@ -121,6 +133,7 @@ impl Net {
         secret_key: SecretKey,
         join_ticket: Option<String>,
         events_tx: mpsc::Sender<NetEvent>,
+        backfill: BackfillStore,
     ) -> anyhow::Result<(Self, Vec<String>)> {
         let ticket = join_ticket
             .map(|raw| ChannelTicket::decode_string(&raw))
@@ -152,6 +165,7 @@ impl Net {
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let router = Router::builder(endpoint)
             .accept(GOSSIP_ALPN, gossip.clone())
+            .accept(iroh_blobs::ALPN, backfill.protocol_handler())
             .spawn();
 
         let net = Self {
@@ -160,6 +174,7 @@ impl Net {
             address_lookup,
             senders: Arc::new(Mutex::new(HashMap::new())),
             events_tx,
+            backfill,
             our_id: *id.as_bytes(),
         };
 
@@ -305,7 +320,7 @@ impl Net {
             return;
         };
         tokio::spawn(async move {
-            let bytes = match postcard::to_stdvec(&message) {
+            let bytes = match postcard::to_stdvec(&GossipPayload::Chat(message)) {
                 Ok(bytes) => bytes,
                 Err(err) => {
                     warn!("failed to encode chat message: {err}");
@@ -314,6 +329,77 @@ impl Net {
             };
             if let Err(err) = sender.broadcast(bytes.into()).await {
                 warn!("failed to broadcast chat message: {err}");
+            }
+        });
+    }
+
+    /// Announces our current history root hash for `channel` to our direct
+    /// gossip neighbors (see backfill.rs) -- sent whenever a channel gains a
+    /// neighbor, in either direction, so both a fresh join and a reconnect
+    /// give both sides a chance to notice they're missing something. Uses
+    /// `broadcast_neighbors` rather than a full-mesh `broadcast`, since this
+    /// is inherently a neighbor-to-neighbor concern, not something that
+    /// needs flooding. Fire-and-forget, like `send`.
+    pub fn announce(&self, channel: &str, root: Hash) {
+        let topic = topic_for_name(channel);
+        let Some(sender) = self
+            .senders
+            .lock()
+            .expect("senders lock poisoned")
+            .get(&topic)
+            .cloned()
+        else {
+            return;
+        };
+        let payload = GossipPayload::Announce(HistoryAnnounce {
+            sender: self.our_id,
+            root,
+        });
+        tokio::spawn(async move {
+            let bytes = match postcard::to_stdvec(&payload) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    warn!("failed to encode history announce: {err}");
+                    return;
+                }
+            };
+            if let Err(err) = sender.broadcast_neighbors(bytes.into()).await {
+                warn!("failed to broadcast history announce: {err}");
+            }
+        });
+    }
+
+    /// Reacts to a received `HistoryAnnounce`: if its root differs from what
+    /// we already have for `channel` (and it isn't an echo of our own
+    /// announce), fetches and decodes the delta directly from the
+    /// announcing peer and reports it back as `NetEvent::HistoryFetched`.
+    /// Fire-and-forget, like `send` and `join` -- a failed fetch is logged
+    /// and simply retried on the next announce, matching how presence and
+    /// other gossip state elsewhere is treated as eventually consistent
+    /// rather than a source of truth.
+    pub fn sync_history(&self, channel: String, announce: HistoryAnnounce) {
+        if announce.sender == self.our_id {
+            return;
+        }
+        if self.backfill.current_root(&channel) == Some(announce.root) {
+            return;
+        }
+
+        let backfill = self.backfill.clone();
+        let endpoint = self.router.endpoint().clone();
+        let events_tx = self.events_tx.clone();
+        tokio::spawn(async move {
+            match backfill
+                .fetch(&endpoint, &channel, announce.root, announce.sender)
+                .await
+            {
+                Ok(messages) if !messages.is_empty() => {
+                    let _ = events_tx
+                        .send(NetEvent::HistoryFetched(channel, messages))
+                        .await;
+                }
+                Ok(_) => {}
+                Err(err) => warn!(%channel, "failed to sync history: {err}"),
             }
         });
     }
@@ -371,8 +457,13 @@ async fn forward_events(
                 NetEvent::PeerLeft(channel.clone(), *id.as_bytes())
             }
             Ok(GossipEvent::Received(msg)) => {
-                match postcard::from_bytes::<ChatMessage>(&msg.content) {
-                    Ok(message) => NetEvent::Received(channel.clone(), message),
+                match postcard::from_bytes::<GossipPayload>(&msg.content) {
+                    Ok(GossipPayload::Chat(message)) => {
+                        NetEvent::Received(channel.clone(), message)
+                    }
+                    Ok(GossipPayload::Announce(announce)) => {
+                        NetEvent::Announce(channel.clone(), announce)
+                    }
                     Err(err) => {
                         warn!("dropping malformed gossip message: {err}");
                         continue;

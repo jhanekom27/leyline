@@ -6,24 +6,25 @@ and messages travel directly between peers using
 [iroh](https://github.com/n0-computer/iroh) + iroh-gossip, all inside a
 [ratatui](https://ratatui.rs) TUI.
 
-## Status: local message persistence
+## Status: history backfill for offline peers
 
-`leyline` persists chat messages locally, so each channel's scrollback
-survives a restart -- messages you send or receive are appended to a
-per-channel log on disk and reloaded the next time you start `leyline`.
-Combined with multi-channel support (one gossip task per joined topic, a
-tab bar to switch between them, and a presence sidebar scoped to whichever
-channel is active), a few things are still deliberately minimal until
-later roadmap steps land:
+`leyline` now backfills channel history for peers that were offline (or
+join a channel fresh): whenever a channel gains a gossip neighbor, both
+sides announce their current history's root hash -- an `iroh-blobs`
+content manifest -- and whichever side is behind automatically fetches
+the messages it's missing directly from the other, no manual command
+needed. Combined with local persistence, multi-channel support (one
+gossip task per joined topic, a tab bar to switch between them, and a
+presence sidebar scoped to whichever channel is active), a couple of
+things are still deliberately minimal:
 
 - **Identity persists across runs** -- your keypair is generated once and
   saved to disk, so your endpoint id stays the same every time you start
   `leyline` (see [Build & run](#build--run) for how this affects local
   multi-instance testing).
-- **No offline backfill yet** -- gossip is live broadcast only, so time
-  spent offline (or before a channel was joined) isn't recovered from
-  peers; only messages seen live get persisted. That's the stretch
-  roadmap step.
+- **Backfill only covers channels you've joined** -- it rides each
+  channel's existing gossip topic, so you still need a name or ticket to
+  join a channel before its history can sync to you.
 
 See [Roadmap](#roadmap) below for what's next.
 
@@ -119,7 +120,7 @@ Rough build order (see `concept.md` for the full design doc):
 - [x] 3. Invite ticket generation/parsing, identity persistence
 - [x] 4. Multi-channel support (one gossip task per joined topic), presence sidebar
 - [x] 5. Local message persistence + reload on start
-- [ ] 6. (Stretch) `iroh-blobs`-based history backfill for offline peers
+- [x] 6. (Stretch) `iroh-blobs`-based history backfill for offline peers
 
 ## Architecture
 

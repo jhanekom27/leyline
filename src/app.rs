@@ -152,6 +152,59 @@ impl AppState {
         }
     }
 
+    /// Merges a batch of possibly-historical messages fetched via backfill
+    /// (see backfill.rs, `NetEvent::HistoryFetched`) into `channel`'s
+    /// transcript. A no-op if `channel` isn't currently joined.
+    ///
+    /// Dedupes by id using the same `remember_seen` state as live messages.
+    /// Unlike live messages, which are simply appended, the channel's
+    /// `Chat` lines are then rebuilt sorted by `(ts_unix_ms, id)`, since a
+    /// backfilled batch can be older than what's already displayed and
+    /// mustn't be shown as the newest lines. `System` lines (e.g. earlier
+    /// invite output or errors) are left as-is, trailing after the
+    /// resorted chat history -- an accepted simplification, since backfill
+    /// is expected to land early in a session before much else happens.
+    ///
+    /// Returns the newly-accepted messages, in canonical order, so the
+    /// caller can persist just those to storage.rs without duplicating
+    /// anything already on disk.
+    pub fn merge_history(&mut self, channel: &str, messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+        let Some(channel) = self.channel_mut(channel) else {
+            return Vec::new();
+        };
+        let mut newly_accepted: Vec<ChatMessage> = messages
+            .into_iter()
+            .filter(|message| channel.remember_seen(message.id))
+            .collect();
+        if newly_accepted.is_empty() {
+            return newly_accepted;
+        }
+
+        let mut chats = Vec::with_capacity(channel.messages.len() + newly_accepted.len());
+        let mut systems = Vec::new();
+        for line in channel.messages.drain(..) {
+            match line {
+                TranscriptLine::Chat(message) => chats.push(message),
+                TranscriptLine::System(text) => systems.push(text),
+            }
+        }
+        chats.extend(newly_accepted.iter().cloned());
+        chats.sort_by_key(|m| (m.ts_unix_ms, m.id));
+
+        for message in chats {
+            channel.messages.push_back(TranscriptLine::Chat(message));
+        }
+        for text in systems {
+            channel.messages.push_back(TranscriptLine::System(text));
+        }
+        while channel.messages.len() > MAX_SCROLLBACK {
+            channel.messages.pop_front();
+        }
+
+        newly_accepted.sort_by_key(|m| (m.ts_unix_ms, m.id));
+        newly_accepted
+    }
+
     pub fn active(&self) -> &Channel {
         &self.channels[self.active]
     }
@@ -257,6 +310,11 @@ impl AppState {
                 self.push_system(format!("failed to join #{name}: {error}"));
                 None
             }
+            // Handled in main.rs before reaching here: `Announce` triggers
+            // `Net::sync_history`, and `HistoryFetched`'s payload goes
+            // through `merge_history` above, not this match. Both are
+            // network-sync bookkeeping, not transcript/presence state.
+            NetEvent::Announce(..) | NetEvent::HistoryFetched(..) => None,
         }
     }
 
@@ -902,5 +960,94 @@ mod tests {
         let mut app = app();
         app.load_history("nonexistent", vec![compose_message(PEER_ID, "hi")]);
         assert_eq!(app.active().messages.len(), 0);
+    }
+
+    fn dated_message(ts_unix_ms: u64, id: u64, sender: [u8; 32], text: &str) -> ChatMessage {
+        ChatMessage {
+            v: 1,
+            id,
+            sender,
+            ts_unix_ms,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn merge_history_dedupes_against_already_known_messages() {
+        let mut app = app();
+        let known = dated_message(100, 1, PEER_ID, "known");
+        app.load_history("general", vec![known.clone()]);
+
+        let new_message = dated_message(200, 2, PEER_ID, "new");
+        let accepted = app.merge_history("general", vec![known, new_message.clone()]);
+
+        assert_eq!(accepted, vec![new_message]);
+        assert_eq!(app.active().messages.len(), 2);
+    }
+
+    #[test]
+    fn merge_history_sorts_backfilled_messages_by_timestamp_not_append_order() {
+        let mut app = app();
+        let recent = dated_message(200, 1, PEER_ID, "recent");
+        app.load_history("general", vec![recent.clone()]);
+
+        let older = dated_message(100, 2, PEER_ID, "older");
+        app.merge_history("general", vec![older.clone()]);
+
+        let messages: Vec<&ChatMessage> = app.active().messages.iter().map(as_chat).collect();
+        assert_eq!(
+            messages,
+            vec![&older, &recent],
+            "an older backfilled message must sort before what was already there"
+        );
+    }
+
+    #[test]
+    fn merge_history_returns_nothing_when_everything_is_already_known() {
+        let mut app = app();
+        let message = dated_message(100, 1, PEER_ID, "hi");
+        app.load_history("general", vec![message.clone()]);
+
+        let accepted = app.merge_history("general", vec![message]);
+        assert!(accepted.is_empty());
+    }
+
+    #[test]
+    fn merge_history_on_an_unjoined_channel_is_a_no_op() {
+        let mut app = app();
+        let accepted = app.merge_history("nonexistent", vec![dated_message(100, 1, PEER_ID, "hi")]);
+        assert!(accepted.is_empty());
+        assert_eq!(app.active().messages.len(), 0);
+    }
+
+    #[test]
+    fn merge_history_keeps_system_lines_after_the_resorted_chat_messages() {
+        let mut app = app();
+        app.push_system("earlier notice");
+        let older = dated_message(100, 1, PEER_ID, "older");
+        app.merge_history("general", vec![older.clone()]);
+
+        let lines: Vec<&TranscriptLine> = app.active().messages.iter().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(as_chat(lines[0]), &older);
+        assert_eq!(as_system(lines[1]), "earlier notice");
+    }
+
+    #[test]
+    fn merge_history_enforces_the_scrollback_cap_evicting_the_oldest_first() {
+        let mut app = app();
+        let batch: Vec<ChatMessage> = (0..(MAX_SCROLLBACK as u64 + 10))
+            .map(|i| dated_message(i, i, PEER_ID, "msg"))
+            .collect();
+
+        let accepted = app.merge_history("general", batch);
+
+        assert_eq!(accepted.len(), MAX_SCROLLBACK + 10);
+        assert_eq!(app.active().messages.len(), MAX_SCROLLBACK);
+        let oldest_remaining = as_chat(app.active().messages.front().unwrap());
+        assert_eq!(
+            oldest_remaining.id, 10,
+            "the 10 oldest messages must have been evicted to stay within the cap"
+        );
     }
 }

@@ -1,4 +1,5 @@
 mod app;
+mod backfill;
 mod identity;
 mod message;
 mod net;
@@ -18,6 +19,7 @@ use tokio::time::interval;
 use tracing::{info, warn};
 
 use app::{AppState, InputAction};
+use backfill::BackfillStore;
 use net::{Net, NetEvent};
 use storage::MessageStore;
 
@@ -28,13 +30,16 @@ async fn main() -> anyhow::Result<()> {
 
     let store = MessageStore::new(dirs.data_dir().join("messages"))
         .context("failed to initialize message storage")?;
+    let backfill = BackfillStore::new(dirs.data_dir().join("blobs"))
+        .await
+        .context("failed to initialize history backfill storage")?;
 
     let secret_key = identity::load_or_generate(&dirs.config_dir().join("identity"))
         .context("failed to load or generate identity")?;
     let join_ticket = parse_join_arg()?;
 
     let (net_tx, net_rx) = mpsc::channel(64);
-    let (net, joined_channels) = Net::start(secret_key, join_ticket, net_tx)
+    let (net, joined_channels) = Net::start(secret_key, join_ticket, net_tx, backfill.clone())
         .await
         .context("failed to start networking")?;
     println!("invite tickets (share via --join <ticket> or the in-app /join <ticket> command):");
@@ -45,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, net, net_rx, joined_channels, store).await;
+    let result = run(&mut terminal, net, net_rx, joined_channels, store, backfill).await;
     ratatui::restore();
     result
 }
@@ -110,11 +115,17 @@ async fn run(
     mut net_rx: mpsc::Receiver<NetEvent>,
     joined_channels: Vec<String>,
     store: MessageStore,
+    backfill: BackfillStore,
 ) -> anyhow::Result<()> {
     let mut app = AppState::new(net.our_id, joined_channels.clone());
     for name in &joined_channels {
         match store.load(name) {
-            Ok(history) => app.load_history(name, history),
+            Ok(history) => {
+                if let Err(err) = backfill.record_messages(name, &history).await {
+                    warn!(channel = %name, "failed to seed history backfill: {err}");
+                }
+                app.load_history(name, history);
+            }
             Err(err) => warn!(channel = %name, "failed to load message history: {err}"),
         }
     }
@@ -138,6 +149,9 @@ async fn run(
                                 if let Err(err) = store.append(&channel, &message) {
                                     warn!(%channel, "failed to persist sent message: {err}");
                                 }
+                                if let Err(err) = backfill.record_message(&channel, &message).await {
+                                    warn!(%channel, "failed to record sent message for backfill: {err}");
+                                }
                                 net.send(&channel, message);
                             }
                             Some(InputAction::Join(arg)) => {
@@ -158,10 +172,44 @@ async fn run(
                 }
             }
             Some(net_event) = net_rx.recv() => {
-                if let Some((channel, message)) = app.handle_net_event(net_event)
-                    && let Err(err) = store.append(&channel, &message)
+                // Peek (without consuming) for a channel gaining a gossip
+                // neighbor, so we can also announce our history root to it
+                // -- see backfill.rs and concept.md's "Persistence and
+                // offline history" section. `app.handle_net_event` below
+                // still separately updates presence for this same event.
+                if let NetEvent::PeerJoined(channel, _) = &net_event
+                    && let Some(root) = backfill.current_root(channel)
                 {
-                    warn!(%channel, "failed to persist received message: {err}");
+                    net.announce(channel, root);
+                }
+
+                match net_event {
+                    NetEvent::Announce(channel, announce) => {
+                        net.sync_history(channel, announce);
+                    }
+                    NetEvent::HistoryFetched(channel, messages) => {
+                        let newly_accepted = app.merge_history(&channel, messages);
+                        for message in &newly_accepted {
+                            if let Err(err) = store.append(&channel, message) {
+                                warn!(%channel, "failed to persist backfilled message: {err}");
+                            }
+                        }
+                        if !newly_accepted.is_empty()
+                            && let Err(err) = backfill.record_messages(&channel, &newly_accepted).await
+                        {
+                            warn!(%channel, "failed to record backfilled messages: {err}");
+                        }
+                    }
+                    other => {
+                        if let Some((channel, message)) = app.handle_net_event(other) {
+                            if let Err(err) = store.append(&channel, &message) {
+                                warn!(%channel, "failed to persist received message: {err}");
+                            }
+                            if let Err(err) = backfill.record_message(&channel, &message).await {
+                                warn!(%channel, "failed to record received message for backfill: {err}");
+                            }
+                        }
+                    }
                 }
                 dirty = true;
             }
