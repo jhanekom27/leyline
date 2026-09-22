@@ -78,6 +78,18 @@ impl Channel {
             self.messages.pop_front();
         }
     }
+
+    /// Seeds this channel's transcript and dedupe state from persisted
+    /// history (see storage.rs), oldest message first. Reuses the same
+    /// dedupe/cap logic as live messages so loaded history behaves
+    /// identically to messages received during this session.
+    fn seed_history(&mut self, messages: Vec<ChatMessage>) {
+        for message in messages {
+            if self.remember_seen(message.id) {
+                self.push(TranscriptLine::Chat(message));
+            }
+        }
+    }
 }
 
 /// An action for the caller (`main.rs`) to perform in response to a
@@ -130,6 +142,16 @@ impl AppState {
         }
     }
 
+    /// Seeds `channel`'s transcript from persisted history loaded by the
+    /// caller (see storage.rs). A no-op if `channel` isn't currently
+    /// joined. Intended to be called once per joined channel right after
+    /// `AppState::new`, before the event loop starts.
+    pub fn load_history(&mut self, channel: &str, messages: Vec<ChatMessage>) {
+        if let Some(channel) = self.channel_mut(channel) {
+            channel.seed_history(messages);
+        }
+    }
+
     pub fn active(&self) -> &Channel {
         &self.channels[self.active]
     }
@@ -179,8 +201,12 @@ impl AppState {
     }
 
     /// Applies a network event: updates presence, pushes a deduped incoming
-    /// message, or reports a channel join's outcome.
-    pub fn handle_net_event(&mut self, event: NetEvent) {
+    /// message, or reports a channel join's outcome. Returns the channel
+    /// name and message when `event` was a `NetEvent::Received` that
+    /// resulted in a newly-accepted (non-duplicate) message, so the caller
+    /// can persist it (see storage.rs) -- `None` for every other event,
+    /// including a duplicate `Received`.
+    pub fn handle_net_event(&mut self, event: NetEvent) -> Option<(String, ChatMessage)> {
         match event {
             NetEvent::PeerJoined(channel_name, id) => {
                 if let Some(channel) = self.channel_mut(&channel_name)
@@ -188,22 +214,25 @@ impl AppState {
                 {
                     channel.peers.push(id);
                 }
+                None
             }
             NetEvent::PeerLeft(channel_name, id) => {
                 if let Some(channel) = self.channel_mut(&channel_name) {
                     channel.peers.retain(|peer| *peer != id);
                 }
+                None
             }
             NetEvent::Received(channel_name, message) => {
                 let is_active = self.active().name == channel_name;
-                if let Some(channel) = self.channel_mut(&channel_name)
-                    && channel.remember_seen(message.id)
-                {
-                    channel.push(TranscriptLine::Chat(message));
-                    if !is_active {
-                        channel.has_unread = true;
-                    }
+                let channel = self.channel_mut(&channel_name)?;
+                if !channel.remember_seen(message.id) {
+                    return None;
                 }
+                channel.push(TranscriptLine::Chat(message.clone()));
+                if !is_active {
+                    channel.has_unread = true;
+                }
+                Some((channel_name, message))
             }
             NetEvent::Lagged(channel_name) => {
                 if let Some(channel) = self.channel_mut(&channel_name) {
@@ -211,6 +240,7 @@ impl AppState {
                         "some messages may have been missed (lagged)".to_string(),
                     ));
                 }
+                None
             }
             NetEvent::Joined(name) => {
                 match self.channels.iter().position(|c| c.name == name) {
@@ -221,9 +251,11 @@ impl AppState {
                     }
                 }
                 self.active_mut().has_unread = false;
+                None
             }
             NetEvent::JoinFailed(name, error) => {
                 self.push_system(format!("failed to join #{name}: {error}"));
+                None
             }
         }
     }
@@ -817,5 +849,58 @@ mod tests {
         ));
         let last = as_system(app.active().messages.back().unwrap());
         assert_eq!(last, "failed to join #project-x: boom");
+    }
+
+    #[test]
+    fn handle_net_event_returns_channel_and_message_for_a_new_received_message() {
+        let mut app = app();
+        let message = compose_message(PEER_ID, "hello");
+        let result =
+            app.handle_net_event(NetEvent::Received("general".to_string(), message.clone()));
+        match result {
+            Some((channel, returned)) => {
+                assert_eq!(channel, "general");
+                assert_eq!(returned, message);
+            }
+            None => panic!("expected Some for a newly-received message"),
+        }
+    }
+
+    #[test]
+    fn handle_net_event_returns_none_for_a_duplicate_received_message() {
+        let mut app = app();
+        let message = compose_message(PEER_ID, "hello");
+        app.handle_net_event(NetEvent::Received("general".to_string(), message.clone()));
+        let result = app.handle_net_event(NetEvent::Received("general".to_string(), message));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn handle_net_event_returns_none_for_non_received_events() {
+        let mut app = app();
+        let result = app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn load_history_seeds_transcript_and_dedupes_like_live_messages() {
+        let mut app = app();
+        let message = compose_message(PEER_ID, "from before restart");
+        app.load_history("general", vec![message.clone()]);
+
+        assert_eq!(app.active().messages.len(), 1);
+        assert_eq!(as_chat(app.active().messages.back().unwrap()), &message);
+
+        // A live redelivery of the same id must still be deduped.
+        let before = app.active().messages.len();
+        app.handle_net_event(NetEvent::Received("general".to_string(), message));
+        assert_eq!(app.active().messages.len(), before);
+    }
+
+    #[test]
+    fn load_history_on_an_unjoined_channel_is_a_no_op() {
+        let mut app = app();
+        app.load_history("nonexistent", vec![compose_message(PEER_ID, "hi")]);
+        assert_eq!(app.active().messages.len(), 0);
     }
 }

@@ -15,15 +15,19 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio::time::interval;
-use tracing::info;
+use tracing::{info, warn};
 
 use app::{AppState, InputAction};
 use net::{Net, NetEvent};
+use storage::MessageStore;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let dirs = project_dirs()?;
     init_logging(&dirs)?;
+
+    let store = MessageStore::new(dirs.data_dir().join("messages"))
+        .context("failed to initialize message storage")?;
 
     let secret_key = identity::load_or_generate(&dirs.config_dir().join("identity"))
         .context("failed to load or generate identity")?;
@@ -41,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, net, net_rx, joined_channels).await;
+    let result = run(&mut terminal, net, net_rx, joined_channels, store).await;
     ratatui::restore();
     result
 }
@@ -105,8 +109,16 @@ async fn run(
     net: Net,
     mut net_rx: mpsc::Receiver<NetEvent>,
     joined_channels: Vec<String>,
+    store: MessageStore,
 ) -> anyhow::Result<()> {
-    let mut app = AppState::new(net.our_id, joined_channels);
+    let mut app = AppState::new(net.our_id, joined_channels.clone());
+    for name in &joined_channels {
+        match store.load(name) {
+            Ok(history) => app.load_history(name, history),
+            Err(err) => warn!(channel = %name, "failed to load message history: {err}"),
+        }
+    }
+
     let mut term_events = EventStream::new();
     let mut tick = interval(Duration::from_millis(250));
     let mut dirty = true;
@@ -122,7 +134,12 @@ async fn run(
                 match event? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         match app.handle_key(key) {
-                            Some(InputAction::Send(channel, message)) => net.send(&channel, message),
+                            Some(InputAction::Send(channel, message)) => {
+                                if let Err(err) = store.append(&channel, &message) {
+                                    warn!(%channel, "failed to persist sent message: {err}");
+                                }
+                                net.send(&channel, message);
+                            }
                             Some(InputAction::Join(arg)) => {
                                 if let Some(error) = net.join(arg) {
                                     app.push_system(error);
@@ -141,7 +158,11 @@ async fn run(
                 }
             }
             Some(net_event) = net_rx.recv() => {
-                app.handle_net_event(net_event);
+                if let Some((channel, message)) = app.handle_net_event(net_event)
+                    && let Err(err) = store.append(&channel, &message)
+                {
+                    warn!(%channel, "failed to persist received message: {err}");
+                }
                 dirty = true;
             }
             _ = tick.tick() => {

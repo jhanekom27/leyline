@@ -6,19 +6,24 @@ and messages travel directly between peers using
 [iroh](https://github.com/n0-computer/iroh) + iroh-gossip, all inside a
 [ratatui](https://ratatui.rs) TUI.
 
-## Status: multi-channel support
+## Status: local message persistence
 
-`leyline` can join multiple gossip channels at once -- one gossip task per
-channel -- with a tab bar to switch between them and a presence sidebar
-scoped to whichever channel is active. A few things are still deliberately
-minimal until later roadmap steps land:
+`leyline` persists chat messages locally, so each channel's scrollback
+survives a restart -- messages you send or receive are appended to a
+per-channel log on disk and reloaded the next time you start `leyline`.
+Combined with multi-channel support (one gossip task per joined topic, a
+tab bar to switch between them, and a presence sidebar scoped to whichever
+channel is active), a few things are still deliberately minimal until
+later roadmap steps land:
 
 - **Identity persists across runs** -- your keypair is generated once and
   saved to disk, so your endpoint id stays the same every time you start
   `leyline` (see [Build & run](#build--run) for how this affects local
   multi-instance testing).
-- **No local persistence yet** -- each channel's scrollback lives in
-  memory only and is lost on restart; that's the next roadmap step.
+- **No offline backfill yet** -- gossip is live broadcast only, so time
+  spent offline (or before a channel was joined) isn't recovered from
+  peers; only messages seen live get persisted. That's the stretch
+  roadmap step.
 
 See [Roadmap](#roadmap) below for what's next.
 
@@ -56,6 +61,8 @@ joins/creates that channel locally -- share its ticket with others via
 directly. Switch between joined channels with `Tab` / `Shift+Tab`.
 
 Your identity now persists in your OS config directory, keyed by your `$HOME`.
+Chat history persists the same way in your OS data directory -- one log
+file per joined channel, so scrollback survives a restart.
 Running two instances under the *same* `$HOME` on one machine loads the
 *same* identity for both -- and iroh rejects a peer connecting to itself --
 so for local multi-instance testing, give each instance its own fake home,
@@ -111,7 +118,7 @@ Rough build order (see `concept.md` for the full design doc):
 - [x] 2. wire up `iroh` + `iroh-gossip` so two local instances can talk over one gossip topic
 - [x] 3. Invite ticket generation/parsing, identity persistence
 - [x] 4. Multi-channel support (one gossip task per joined topic), presence sidebar
-- [ ] 5. **Up next:** Local message persistence + reload on start
+- [x] 5. Local message persistence + reload on start
 - [ ] 6. (Stretch) `iroh-blobs`-based history backfill for offline peers
 
 ## Architecture
