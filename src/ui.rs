@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, Paragraph};
 
-use crate::app::{AppState, hex_id};
+use crate::app::{AppState, TranscriptLine, hex_id};
 
 pub fn render(frame: &mut Frame, app: &AppState) {
     let [header, body, input] = Layout::vertical([
@@ -23,18 +23,39 @@ pub fn render(frame: &mut Frame, app: &AppState) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
-    let [title, identity] =
+    let [tabs, identity] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
-    let title_line = Paragraph::new(Line::from(vec![
-        Span::styled(" leyline ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(format!(
-            "#general -- {} peer(s) online",
-            app.peers.len()
-        )),
-    ]))
-    .style(Style::default().bg(Color::DarkGray));
-    frame.render_widget(title_line, title);
+    let mut spans = vec![Span::styled(
+        " leyline ",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    for (index, channel) in app.channels.iter().enumerate() {
+        let unread_marker = if channel.has_unread && index != app.active {
+            "*"
+        } else {
+            ""
+        };
+        let style = if index == app.active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(
+            format!(" #{}{unread_marker} ", channel.name),
+            style,
+        ));
+    }
+    spans.push(Span::raw(format!(
+        " -- {} peer(s) online",
+        app.active().peers.len()
+    )));
+
+    let tabs_line = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
+    frame.render_widget(tabs_line, tabs);
 
     let identity_line = Paragraph::new(Line::from(vec![
         Span::raw(" you: "),
@@ -52,31 +73,66 @@ fn render_body(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
+    let channel = app.active();
     let visible = area.height.saturating_sub(2).max(1) as usize; // minus borders
-    let total = app.messages.len();
-    let end = total.saturating_sub(app.scroll);
+    let total = channel.messages.len();
+    let end = total.saturating_sub(channel.scroll);
     let start = end.saturating_sub(visible);
+    let inner_width = (area.width as usize).saturating_sub(2).max(1); // minus borders
 
-    let items: Vec<ListItem> = app
+    let items: Vec<ListItem> = channel
         .messages
         .iter()
         .skip(start)
         .take(end - start)
-        .map(|m| {
-            let name = app.display_name(&m.sender);
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{name}: "), Style::default().fg(Color::Cyan)),
-                Span::raw(m.text.clone()),
-            ]))
+        .map(|line| match line {
+            TranscriptLine::Chat(m) => {
+                let name = app.display_name(&m.sender);
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{name}: "), Style::default().fg(Color::Cyan)),
+                    Span::raw(m.text.clone()),
+                ]))
+            }
+            TranscriptLine::System(text) => {
+                // System lines can be long (e.g. invite tickets, which are
+                // one unbroken token with no spaces to wrap on), and
+                // `List` doesn't wrap on its own -- without this, anything
+                // wider than the pane would just get clipped and
+                // unreadable/uncopyable.
+                let style = Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC);
+                let lines: Vec<Line> = wrap_chars(&format!("* {text}"), inner_width)
+                    .into_iter()
+                    .map(|chunk| Line::from(Span::styled(chunk, style)))
+                    .collect();
+                ListItem::new(lines)
+            }
         })
         .collect();
 
-    let list = List::new(items).block(Block::bordered().title("messages"));
+    let list = List::new(items).block(Block::bordered().title(format!("#{}", channel.name)));
     frame.render_widget(list, area);
 }
 
+/// Splits `text` into `width`-wide chunks, breaking mid-word if needed.
+/// Used instead of word-wrapping because the dominant case (invite
+/// tickets) is one long token with no natural break points at all.
+fn wrap_chars(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    chars
+        .chunks(width)
+        .map(|chunk| chunk.iter().collect())
+        .collect()
+}
+
 fn render_peers(frame: &mut Frame, area: Rect, app: &AppState) {
-    let items: Vec<ListItem> = app
+    let channel = app.active();
+    let items: Vec<ListItem> = channel
         .peers
         .iter()
         .map(|p| ListItem::new(format!("* {}", app.display_name(p))))
@@ -87,7 +143,8 @@ fn render_peers(frame: &mut Frame, area: Rect, app: &AppState) {
 
 fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
     const PROMPT: &str = "> ";
-    let block = Block::bordered().title("message (Enter to send, Esc to quit)");
+    let block = Block::bordered()
+        .title("message (Enter to send, /join <name|ticket>, /invite, Tab to switch, Esc to quit)");
     let inner = block.inner(area);
     let text_width = (inner.width as usize).saturating_sub(PROMPT.len()).max(1);
 

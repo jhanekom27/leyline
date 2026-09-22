@@ -1,20 +1,22 @@
 //! Invite ticket encode/decode.
 //!
-//! A ticket bundles a `NodeId` (+ known relay/addr hints) and a channel's
-//! `TopicId` into a single string a friend can paste in to join -- see
-//! concept.md's "Identity & channels" section. Built on the `iroh-tickets`
-//! crate's `Ticket` trait, which handles the base32 string round trip.
+//! A ticket bundles a channel name and one peer's address into a single
+//! string a friend can paste in to join -- see concept.md's "Identity &
+//! channels" section. The channel's gossip topic is derived deterministically
+//! from its name (see `net::topic_for_name`), so the ticket doesn't need to
+//! carry the topic separately -- there's no way for the two to disagree.
+//! Built on the `iroh-tickets` crate's `Ticket` trait, which handles the
+//! base32 string round trip.
 
 use iroh::EndpointAddr;
-use iroh_gossip::proto::TopicId;
 use iroh_tickets::{ParseError, Ticket};
 use serde::{Deserialize, Serialize};
 
-/// A channel's topic plus one peer's address, so a single pasted string is
+/// A channel name plus one peer's address, so a single pasted string is
 /// enough to join that peer's gossip swarm for that channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelTicket {
-    pub topic: TopicId,
+    pub name: String,
     pub addr: EndpointAddr,
 }
 
@@ -44,7 +46,7 @@ mod tests {
             [TransportAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 4242)))],
         );
         ChannelTicket {
-            topic: TopicId::from_bytes(rand::random()),
+            name: "general".to_string(),
             addr,
         }
     }

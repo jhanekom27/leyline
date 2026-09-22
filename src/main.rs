@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::info;
 
-use app::AppState;
+use app::{AppState, InputAction};
 use net::{Net, NetEvent};
 
 #[tokio::main]
@@ -30,22 +30,25 @@ async fn main() -> anyhow::Result<()> {
     let join_ticket = parse_join_arg()?;
 
     let (net_tx, net_rx) = mpsc::channel(64);
-    let net = Net::start(secret_key, join_ticket, net_tx)
+    let (net, joined_channels) = Net::start(secret_key, join_ticket, net_tx)
         .await
         .context("failed to start networking")?;
-    info!(ticket = %net.ticket, "ready");
-    println!("your invite ticket (share it with others via --join <ticket>):");
-    println!("{}", net.ticket);
+    println!("invite tickets (share via --join <ticket> or the in-app /join <ticket> command):");
+    for name in &joined_channels {
+        let ticket = net.ticket_for(name);
+        info!(channel = %name, %ticket, "ready");
+        println!("  #{name}: {ticket}");
+    }
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, net, net_rx).await;
+    let result = run(&mut terminal, net, net_rx, joined_channels).await;
     ratatui::restore();
     result
 }
 
-/// Parses an optional `--join <ticket>` flag used to bootstrap into the
-/// default channel via another instance's invite ticket (build-order step
-/// 3). Omit it to start alone, e.g. as the first peer others join.
+/// Parses an optional `--join <ticket>` flag used to bootstrap into another
+/// instance's channel via its invite ticket. Omit it to start alone with
+/// just the default "general" channel, e.g. as the first peer others join.
 fn parse_join_arg() -> anyhow::Result<Option<String>> {
     let mut args = std::env::args().skip(1);
     let mut ticket = None;
@@ -80,8 +83,9 @@ fn init_logging(dirs: &directories::ProjectDirs) -> anyhow::Result<()> {
     // Respect `RUST_LOG` if set; otherwise default to a level that shows
     // our own diagnostics and iroh-gossip's connection lifecycle (dialing,
     // joins) without iroh's very chatty low-level QUIC/relay tracing.
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,leyline=debug,iroh_gossip=debug"));
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info,leyline=debug,iroh_gossip=debug")
+    });
 
     tracing_subscriber::fmt()
         .with_writer(Mutex::new(log_file))
@@ -100,8 +104,9 @@ async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     net: Net,
     mut net_rx: mpsc::Receiver<NetEvent>,
+    joined_channels: Vec<String>,
 ) -> anyhow::Result<()> {
-    let mut app = AppState::new(net.our_id);
+    let mut app = AppState::new(net.our_id, joined_channels);
     let mut term_events = EventStream::new();
     let mut tick = interval(Duration::from_millis(250));
     let mut dirty = true;
@@ -116,8 +121,18 @@ async fn run(
             Some(event) = term_events.next() => {
                 match event? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if let Some(message) = app.handle_key(key) {
-                            net.send(message);
+                        match app.handle_key(key) {
+                            Some(InputAction::Send(channel, message)) => net.send(&channel, message),
+                            Some(InputAction::Join(arg)) => {
+                                if let Some(error) = net.join(arg) {
+                                    app.push_system(error);
+                                }
+                            }
+                            Some(InputAction::Invite(channel)) => {
+                                let ticket = net.ticket_for(&channel);
+                                app.push_system(format!("invite for #{channel}: {ticket}"));
+                            }
+                            None => {}
                         }
                         dirty = true;
                     }
