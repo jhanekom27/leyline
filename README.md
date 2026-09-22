@@ -6,16 +6,25 @@ and messages travel directly between peers using
 [iroh](https://github.com/n0-computer/iroh) + iroh-gossip, all inside a
 [ratatui](https://ratatui.rs) TUI.
 
-## Status: early skeleton
+## Status: real gossip networking, temporary bootstrapping
 
-Right now `leyline` is a **local-only TUI shell**: it renders the chat
-layout against a few hard-coded fake messages so the UI and keybindings can
-be validated before any networking is wired up. There is no peer-to-peer
-messaging yet -- see [Roadmap](#roadmap) below for what's next.
+`leyline` now wires up real `iroh` + `iroh-gossip` networking: two instances
+can join the same default "#general" channel and exchange messages. A few
+things are still deliberately minimal until later roadmap steps land:
+
+- **Identity is ephemeral** -- a new keypair is generated every run, so your
+  endpoint id changes each time (persistence is step 3).
+- **Bootstrapping peers is manual** -- there's no invite ticket system yet,
+  so a second instance connects with a `--connect <endpoint-id>` flag
+  instead of pasting a ticket (see [Build & run](#build--run)).
+- **One channel** -- everyone joins the same hard-coded "#general" topic;
+  multi-channel support is a later step.
+
+See [Roadmap](#roadmap) below for what's next.
 
 ## Requirements
 
-- A recent stable Rust toolchain with edition 2024 support (Rust 1.85 or newer)
+- A recent stable Rust toolchain with edition 2024 support (Rust 1.91 or newer -- iroh-gossip's current MSRV)
 
 ## Build & run
 
@@ -23,6 +32,18 @@ messaging yet -- see [Roadmap](#roadmap) below for what's next.
 cargo build --release
 cargo run
 ```
+
+Your endpoint id is shown in the TUI header (`you: <hex id>`). To have a
+second instance join the same channel and talk to the first, copy that id
+into a `--connect` flag in another terminal:
+
+```sh
+cargo run -- --connect <hex id from the first instance>
+```
+
+`--connect` can be repeated to dial multiple peers on startup. Connecting
+relies on iroh's default discovery/relay services, so all instances need
+outbound internet access.
 
 ## Keybindings
 
@@ -45,8 +66,8 @@ cargo run
 Rough build order (see `concept.md` for the full design doc):
 
 - [x] 1. `ratatui` chat UI against fake/local messages -- validate layout and keybindings
-- [ ] 2. **Up next:** wire up `iroh` + `iroh-gossip` so two local instances can talk over one gossip topic
-- [ ] 3. Invite ticket generation/parsing, identity persistence
+- [x] 2. wire up `iroh` + `iroh-gossip` so two local instances can talk over one gossip topic
+- [ ] 3. **Up next:** Invite ticket generation/parsing, identity persistence
 - [ ] 4. Multi-channel support (one gossip task per joined topic), presence sidebar
 - [ ] 5. Local message persistence + reload on start
 - [ ] 6. (Stretch) `iroh-blobs`-based history backfill for offline peers

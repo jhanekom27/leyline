@@ -1894,6 +1894,7 @@ dependencies = [
  "iroh",
  "iroh-gossip",
  "postcard",
+ "rand 0.10.3",
  "ratatui",
  "serde",
  "tokio",

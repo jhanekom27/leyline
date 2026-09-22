@@ -1,57 +1,61 @@
 //! Owns all UI state and the pure logic that mutates it.
 //!
 //! Per concept.md's "one owner of UI state" principle: nothing here does
-//! network or file I/O. `handle_key` is a pure function of the current state
-//! and a keypress, safe to call directly from the render loop.
+//! network or file I/O. `handle_key` is a pure function of the current
+//! state and a keypress -- when the user sends a message it returns the
+//! composed `ChatMessage` so the caller can hand it off to the network
+//! layer, rather than reaching for I/O itself.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::message::ChatMessage;
+use crate::net::NetEvent;
 
 /// Cap on in-memory scrollback, per concept.md's guidance on bounding
 /// render/memory cost in a long-lived session.
 const MAX_SCROLLBACK: usize = 500;
 
-/// Fake sender ids used to seed the UI before identity.rs exists.
-const SELF_SENDER: [u8; 32] = [0; 32];
-const ALICE_SENDER: [u8; 32] = [1; 32];
-const BOB_SENDER: [u8; 32] = [2; 32];
+/// Cap on how many recently-seen message ids we remember. Gossip is
+/// best-effort and can redeliver, so incoming messages are deduped by id --
+/// see concept.md's "Message wire format" section.
+const MAX_SEEN_IDS: usize = 256;
 
 /// All state needed to render the TUI and respond to input.
 pub struct AppState {
+    /// Our own identity, so we can tell our messages apart from peers'.
+    pub self_id: [u8; 32],
     pub messages: VecDeque<ChatMessage>,
-    pub peers: Vec<String>,
+    pub peers: Vec<[u8; 32]>,
     pub input: String,
     pub cursor: usize,
     pub scroll: usize,
     pub should_quit: bool,
+    /// Recently-seen message ids, oldest first, for incoming-message dedupe.
+    seen_ids: VecDeque<u64>,
 }
 
 impl AppState {
-    /// Builds the initial state, seeded with a few fake messages/peers so
-    /// the layout can be visually validated without real networking.
-    pub fn new() -> Self {
-        let mut messages = VecDeque::new();
-        messages.push_back(fake_message(ALICE_SENDER, "hey, anyone around?"));
-        messages.push_back(fake_message(BOB_SENDER, "just got here"));
-        messages.push_back(fake_message(SELF_SENDER, "o/"));
-
+    /// Builds the initial state for a session with the given identity.
+    /// Messages and peers start empty and populate from real `NetEvent`s.
+    pub fn new(self_id: [u8; 32]) -> Self {
         Self {
-            messages,
-            peers: vec!["alice".to_string(), "bob".to_string()],
+            self_id,
+            messages: VecDeque::new(),
+            peers: Vec::new(),
             input: String::new(),
             cursor: 0,
             scroll: 0,
             should_quit: false,
+            seen_ids: VecDeque::new(),
         }
     }
 
-    /// Pure key handling: no I/O, no network. Safe to call on every keypress.
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    /// Pure key handling: no I/O, no network. Returns the composed message
+    /// when `Enter` sends one, so the caller can broadcast it.
+    pub fn handle_key(&mut self, key: KeyEvent) -> Option<ChatMessage> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => self.should_quit = true,
@@ -61,7 +65,7 @@ impl AppState {
             KeyCode::Char('u') if ctrl => self.delete_to_start(),
             KeyCode::Char('k') if ctrl => self.delete_to_end(),
             KeyCode::Char('w') if ctrl => self.delete_word_backward(),
-            KeyCode::Enter => self.submit_input(),
+            KeyCode::Enter => return self.submit_input(),
             KeyCode::Backspace => self.delete_backward(),
             KeyCode::Delete => self.delete_forward(),
             KeyCode::Home => self.move_home(),
@@ -73,16 +77,66 @@ impl AppState {
             KeyCode::Char(c) => self.insert_char(c),
             _ => {}
         }
+        None
     }
 
-    fn submit_input(&mut self) {
+    /// Applies a network event: updates presence, or pushes a deduped
+    /// incoming message into the scrollback.
+    pub fn handle_net_event(&mut self, event: NetEvent) {
+        match event {
+            NetEvent::PeerJoined(id) => {
+                if !self.peers.contains(&id) {
+                    self.peers.push(id);
+                }
+            }
+            NetEvent::PeerLeft(id) => {
+                self.peers.retain(|peer| *peer != id);
+            }
+            NetEvent::Received(message) => {
+                if self.remember_seen(message.id) {
+                    self.push_message(message);
+                }
+            }
+            NetEvent::Lagged => {}
+        }
+    }
+
+    /// Displays a sender as "you" for our own id, otherwise a shortened hex
+    /// id -- the same fallback real, unnamed peers use until nicknames or
+    /// presence info (build-order step 4) land.
+    pub fn display_name(&self, sender: &[u8; 32]) -> String {
+        if *sender == self.self_id {
+            "you".to_string()
+        } else {
+            hex_prefix(sender)
+        }
+    }
+
+    fn submit_input(&mut self) -> Option<ChatMessage> {
         if self.input.trim().is_empty() {
-            return;
+            return None;
         }
         let text = std::mem::take(&mut self.input);
         self.cursor = 0;
-        self.push_message(fake_message(SELF_SENDER, &text));
         self.scroll = 0;
+        let message = compose_message(self.self_id, &text);
+        self.remember_seen(message.id);
+        self.push_message(message.clone());
+        Some(message)
+    }
+
+    /// Records `id` as seen, evicting the oldest entry once over capacity.
+    /// Returns `true` if `id` had not already been seen (i.e. it should be
+    /// displayed).
+    fn remember_seen(&mut self, id: u64) -> bool {
+        if self.seen_ids.contains(&id) {
+            return false;
+        }
+        self.seen_ids.push_back(id);
+        if self.seen_ids.len() > MAX_SEEN_IDS {
+            self.seen_ids.pop_front();
+        }
+        true
     }
 
     fn char_count(&self) -> usize {
@@ -185,33 +239,15 @@ impl AppState {
     }
 }
 
-impl Default for AppState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Maps a known fake sender id to a display name, falling back to a
-/// shortened hex id -- the same fallback real, unnamed peers will use later.
-pub fn display_name(sender: &[u8; 32]) -> String {
-    if *sender == SELF_SENDER {
-        "you".to_string()
-    } else if *sender == ALICE_SENDER {
-        "alice".to_string()
-    } else if *sender == BOB_SENDER {
-        "bob".to_string()
-    } else {
-        hex_prefix(sender)
-    }
-}
-
+/// Shortened hex id used to display peers we don't have a nickname for.
 fn hex_prefix(bytes: &[u8; 32]) -> String {
     bytes[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn next_id() -> u64 {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
+/// Full hex id, e.g. for display in the header so it can be copied into
+/// another instance's `--connect` flag.
+pub fn hex_id(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn now_unix_ms() -> u64 {
@@ -221,10 +257,10 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn fake_message(sender: [u8; 32], text: &str) -> ChatMessage {
+fn compose_message(sender: [u8; 32], text: &str) -> ChatMessage {
     ChatMessage {
         v: 1,
-        id: next_id(),
+        id: rand::random(),
         sender,
         ts_unix_ms: now_unix_ms(),
         text: text.to_string(),
@@ -235,13 +271,20 @@ fn fake_message(sender: [u8; 32], text: &str) -> ChatMessage {
 mod tests {
     use super::*;
 
+    const SELF_ID: [u8; 32] = [9; 32];
+    const PEER_ID: [u8; 32] = [7; 32];
+
+    fn app() -> AppState {
+        AppState::new(SELF_ID)
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     #[test]
     fn typing_composes_input() {
-        let mut app = AppState::new();
+        let mut app = app();
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
         assert_eq!(app.input, "hi");
@@ -249,7 +292,7 @@ mod tests {
 
     #[test]
     fn backspace_edits_input() {
-        let mut app = AppState::new();
+        let mut app = app();
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
         app.handle_key(key(KeyCode::Backspace));
@@ -258,49 +301,53 @@ mod tests {
 
     #[test]
     fn enter_sends_and_clears_input() {
-        let mut app = AppState::new();
+        let mut app = app();
         let before = app.messages.len();
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
-        app.handle_key(key(KeyCode::Enter));
+        let sent = app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.input, "");
         assert_eq!(app.messages.len(), before + 1);
         assert_eq!(app.messages.back().unwrap().text, "hi");
-        assert_eq!(app.messages.back().unwrap().sender, SELF_SENDER);
+        assert_eq!(app.messages.back().unwrap().sender, SELF_ID);
+        let sent = sent.expect("enter with non-empty input returns the composed message");
+        assert_eq!(sent.text, "hi");
+        assert_eq!(sent.sender, SELF_ID);
     }
 
     #[test]
     fn empty_enter_does_not_send() {
-        let mut app = AppState::new();
+        let mut app = app();
         let before = app.messages.len();
-        app.handle_key(key(KeyCode::Enter));
+        let sent = app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.messages.len(), before);
+        assert!(sent.is_none());
     }
 
     #[test]
     fn esc_quits() {
-        let mut app = AppState::new();
+        let mut app = app();
         app.handle_key(key(KeyCode::Esc));
         assert!(app.should_quit);
     }
 
     #[test]
     fn ctrl_c_quits() {
-        let mut app = AppState::new();
+        let mut app = app();
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_quit);
     }
 
     #[test]
-    fn display_name_maps_known_fake_senders() {
-        assert_eq!(display_name(&SELF_SENDER), "you");
-        assert_eq!(display_name(&ALICE_SENDER), "alice");
-        assert_eq!(display_name(&BOB_SENDER), "bob");
+    fn display_name_maps_self_and_falls_back_to_hex_for_others() {
+        let app = app();
+        assert_eq!(app.display_name(&SELF_ID), "you");
+        assert_eq!(app.display_name(&PEER_ID), hex_prefix(&PEER_ID));
     }
 
     #[test]
     fn left_right_move_cursor_without_editing() {
-        let mut app = AppState::new();
+        let mut app = app();
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
         assert_eq!(app.cursor, 2);
@@ -315,7 +362,7 @@ mod tests {
 
     #[test]
     fn insert_in_the_middle_of_input() {
-        let mut app = AppState::new();
+        let mut app = app();
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
         app.handle_key(key(KeyCode::Left));
@@ -326,7 +373,7 @@ mod tests {
 
     #[test]
     fn home_and_end_jump_cursor() {
-        let mut app = AppState::new();
+        let mut app = app();
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
         app.handle_key(key(KeyCode::Home));
@@ -337,7 +384,7 @@ mod tests {
 
     #[test]
     fn ctrl_a_and_ctrl_e_jump_cursor() {
-        let mut app = AppState::new();
+        let mut app = app();
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
@@ -348,7 +395,7 @@ mod tests {
 
     #[test]
     fn delete_key_removes_char_at_cursor() {
-        let mut app = AppState::new();
+        let mut app = app();
         for c in ['h', 'i', '!'] {
             app.handle_key(key(KeyCode::Char(c)));
         }
@@ -360,7 +407,7 @@ mod tests {
 
     #[test]
     fn ctrl_u_deletes_to_start() {
-        let mut app = AppState::new();
+        let mut app = app();
         for c in ['h', 'i', '!'] {
             app.handle_key(key(KeyCode::Char(c)));
         }
@@ -372,7 +419,7 @@ mod tests {
 
     #[test]
     fn ctrl_k_deletes_to_end() {
-        let mut app = AppState::new();
+        let mut app = app();
         for c in ['h', 'i', '!'] {
             app.handle_key(key(KeyCode::Char(c)));
         }
@@ -385,7 +432,7 @@ mod tests {
 
     #[test]
     fn ctrl_w_deletes_word_backward() {
-        let mut app = AppState::new();
+        let mut app = app();
         for c in "hello world".chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
@@ -395,5 +442,33 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(app.input, "");
         assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn peer_joined_and_left_update_peers() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::PeerJoined(PEER_ID));
+        assert_eq!(app.peers, vec![PEER_ID]);
+        app.handle_net_event(NetEvent::PeerJoined(PEER_ID));
+        assert_eq!(
+            app.peers,
+            vec![PEER_ID],
+            "joining twice should not duplicate"
+        );
+        app.handle_net_event(NetEvent::PeerLeft(PEER_ID));
+        assert!(app.peers.is_empty());
+    }
+
+    #[test]
+    fn received_message_is_deduped_by_id() {
+        let mut app = app();
+        let message = compose_message(PEER_ID, "hi from a peer");
+        let before = app.messages.len();
+        app.handle_net_event(NetEvent::Received(message.clone()));
+        assert_eq!(app.messages.len(), before + 1);
+        // Gossip is best-effort and can redeliver -- the same id must not
+        // be shown twice.
+        app.handle_net_event(NetEvent::Received(message));
+        assert_eq!(app.messages.len(), before + 1);
     }
 }

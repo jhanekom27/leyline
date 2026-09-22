@@ -7,28 +7,40 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, Paragraph};
 
-use crate::app::{AppState, display_name};
+use crate::app::{AppState, hex_id};
 
 pub fn render(frame: &mut Frame, app: &AppState) {
     let [header, body, input] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(2),
         Constraint::Min(1),
         Constraint::Length(3),
     ])
     .areas(frame.area());
 
-    render_header(frame, header);
+    render_header(frame, header, app);
     render_body(frame, body, app);
     render_input(frame, input, app);
 }
 
-fn render_header(frame: &mut Frame, area: Rect) {
-    let header = Paragraph::new(Line::from(vec![
+fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
+    let [title, identity] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+
+    let title_line = Paragraph::new(Line::from(vec![
         Span::styled(" leyline ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("#general -- fake local data, no networking yet"),
+        Span::raw(format!(
+            "#general -- {} peer(s) online",
+            app.peers.len()
+        )),
     ]))
     .style(Style::default().bg(Color::DarkGray));
-    frame.render_widget(header, area);
+    frame.render_widget(title_line, title);
+
+    let identity_line = Paragraph::new(Line::from(vec![
+        Span::raw(" you: "),
+        Span::styled(hex_id(&app.self_id), Style::default().fg(Color::Cyan)),
+    ]));
+    frame.render_widget(identity_line, identity);
 }
 
 fn render_body(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -51,7 +63,7 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
         .skip(start)
         .take(end - start)
         .map(|m| {
-            let name = display_name(&m.sender);
+            let name = app.display_name(&m.sender);
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{name}: "), Style::default().fg(Color::Cyan)),
                 Span::raw(m.text.clone()),
@@ -67,7 +79,7 @@ fn render_peers(frame: &mut Frame, area: Rect, app: &AppState) {
     let items: Vec<ListItem> = app
         .peers
         .iter()
-        .map(|p| ListItem::new(format!("* {p}")))
+        .map(|p| ListItem::new(format!("* {}", app.display_name(p))))
         .collect();
     let list = List::new(items).block(Block::bordered().title("online"));
     frame.render_widget(list, area);
