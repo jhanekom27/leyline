@@ -52,9 +52,12 @@ mechanisms, not one, since they trade off differently:
 
 ## Channels & presence
 
-- [ ] **`/leave <channel>`** -- there's currently no way to leave a channel
-  once joined, only `/join`. Needs to drop the gossip task in `net.rs` and
-  remove the entry from `channel_registry.rs`.
+- [x] **`/leave [channel]`** -- leaves the active channel, or a named one
+  if given. Drops the channel's gossip subscription (`net.rs`), forgets it
+  in `channel_registry.rs`, and also clears its local message log
+  (`storage.rs`) and backfill manifest (`backfill.rs`), so a later rejoin
+  under the same display name never inherits an unrelated room's history.
+  Refuses to leave your only remaining channel.
 - [ ] **`/who`** -- list full endpoint ids (plus any alias) for the active
   channel's peers; today the header only shows a count and the sidebar
   only a 4-byte hex prefix.

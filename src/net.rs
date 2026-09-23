@@ -23,6 +23,7 @@ use iroh_gossip::{
 };
 use iroh_tickets::{ParseError, Ticket};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::backfill::BackfillStore;
@@ -127,9 +128,17 @@ fn is_self(addr: &EndpointAddr, our_id: [u8; 32]) -> bool {
 /// there -- see `RoomSecret` and `topic_for_secret`. Bundled together
 /// (rather than two parallel maps keyed by name) so the two can never
 /// drift out of sync with each other.
+///
+/// Also holds the background tasks feeding this channel's `GossipReceiver`
+/// (`forward_events`) and retrying its bootstrap join (`retry_join`, if
+/// spawned). `iroh-gossip` only actually leaves a topic once *both* its
+/// `GossipSender` and `GossipReceiver` halves are dropped -- since
+/// `forward_events` holds the receiver in an unbounded loop, `Net::leave`
+/// has to abort these tasks explicitly to drop it.
 struct JoinedChannel {
     secret: RoomSecret,
     sender: GossipSender,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 /// Handle to the running network stack.
@@ -339,23 +348,28 @@ impl Net {
             .split();
         debug!(channel = %name, bootstrap = bootstrap_ids.len(), "joined channel");
 
-        self.channels.lock().expect("channels lock poisoned").insert(
-            name.to_string(),
-            JoinedChannel {
-                secret,
-                sender: sender.clone(),
-            },
-        );
-
+        let mut tasks = Vec::new();
         if !bootstrap_ids.is_empty() {
-            tokio::spawn(retry_join(sender, bootstrap_ids));
+            tasks.push(tokio::spawn(retry_join(sender.clone(), bootstrap_ids)));
         }
-        tokio::spawn(forward_events(
+        tasks.push(tokio::spawn(forward_events(
             name.to_string(),
             receiver,
             self.events_tx.clone(),
             self.router.endpoint().clone(),
-        ));
+        )));
+
+        self.channels
+            .lock()
+            .expect("channels lock poisoned")
+            .insert(
+                name.to_string(),
+                JoinedChannel {
+                    secret,
+                    sender,
+                    tasks,
+                },
+            );
 
         Ok(())
     }
@@ -451,22 +465,24 @@ impl Net {
             match gossip.subscribe(topic, bootstrap_ids.clone()).await {
                 Ok(topic_handle) => {
                     let (sender, receiver) = topic_handle.split();
-                    channels.lock().expect("channels lock poisoned").insert(
-                        name.clone(),
-                        JoinedChannel {
-                            secret,
-                            sender: sender.clone(),
-                        },
-                    );
+                    let mut tasks = Vec::new();
                     if !bootstrap_ids.is_empty() {
-                        tokio::spawn(retry_join(sender, bootstrap_ids));
+                        tasks.push(tokio::spawn(retry_join(sender.clone(), bootstrap_ids)));
                     }
-                    tokio::spawn(forward_events(
+                    tasks.push(tokio::spawn(forward_events(
                         name.clone(),
                         receiver,
                         events_tx.clone(),
                         endpoint,
-                    ));
+                    )));
+                    channels.lock().expect("channels lock poisoned").insert(
+                        name.clone(),
+                        JoinedChannel {
+                            secret,
+                            sender,
+                            tasks,
+                        },
+                    );
                     let _ = events_tx.send(NetEvent::Joined(name)).await;
                 }
                 Err(err) => {
@@ -478,6 +494,34 @@ impl Net {
         });
 
         message
+    }
+
+    /// Leaves a previously joined channel: drops its gossip subscription
+    /// and stops its background tasks. `iroh-gossip` only actually leaves
+    /// a topic once both the `GossipSender` and `GossipReceiver` halves
+    /// are dropped (see `JoinedChannel`'s doc comment) -- removing the map
+    /// entry drops our `GossipSender`, and aborting `tasks` drops the
+    /// `GossipReceiver` held by `forward_events`, which would otherwise
+    /// run forever.
+    ///
+    /// A no-op (logged) if `channel` isn't currently joined -- the caller
+    /// (`app::AppState::run_leave`) only ever names a channel it already
+    /// has a tab for, which is only ever true once it's actually joined.
+    pub fn leave(&self, channel: &str) {
+        let removed = self
+            .channels
+            .lock()
+            .expect("channels lock poisoned")
+            .remove(channel);
+        match removed {
+            Some(joined) => {
+                for task in joined.tasks {
+                    task.abort();
+                }
+                debug!(%channel, "left channel");
+            }
+            None => warn!(%channel, "tried to leave a channel that wasn't joined"),
+        }
     }
 
     /// Encodes and broadcasts a chat message to `channel`. Fire-and-forget:

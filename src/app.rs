@@ -111,6 +111,14 @@ pub enum InputAction {
     /// typed after `/nick` (see `run_command` and
     /// `crate::net::Net::set_nickname`).
     Nick(String),
+    /// Leave a previously joined channel -- already resolved to a
+    /// concrete, currently-joined name by `run_leave` (either explicitly
+    /// typed after `/leave`, or the active channel if omitted). The
+    /// caller is responsible for actually tearing down its gossip
+    /// subscription and persisted state (see `crate::net::Net::leave`,
+    /// `crate::channel_registry`, `crate::storage`, `crate::backfill`)
+    /// and then calling `AppState::remove_channel`.
+    Leave(String),
 }
 
 /// All state needed to render the TUI and respond to input.
@@ -364,6 +372,37 @@ impl AppState {
         }
     }
 
+    /// Removes `channel`'s tab and all its in-memory state (transcript,
+    /// presence, dedupe buffers) -- called once the caller has actually
+    /// torn down its gossip subscription and persisted state (see
+    /// `InputAction::Leave`). Adjusts `active` to keep pointing at the
+    /// same tab if it was after the removed one, or lands on the
+    /// previous tab if the active tab itself was the one removed. A
+    /// no-op if `channel` isn't currently joined.
+    ///
+    /// # Panics
+    /// Panics if `channel` is leyline's only joined channel -- `AppState`
+    /// always needs at least one (see `AppState::new`), and `run_leave`
+    /// is the only caller that decides whether to request a removal, so
+    /// it must already refuse this case before ever returning
+    /// `InputAction::Leave`.
+    pub fn remove_channel(&mut self, channel: &str) {
+        let Some(index) = self.channels.iter().position(|c| c.name == channel) else {
+            return;
+        };
+        assert!(
+            self.channels.len() > 1,
+            "must not remove leyline's only channel"
+        );
+        self.channels.remove(index);
+        if self.active > index {
+            self.active -= 1;
+        } else if self.active == index {
+            self.active = self.active.min(self.channels.len().saturating_sub(1));
+        }
+        self.push_system(format!("left #{channel}"));
+    }
+
     /// Displays a sender as "you" for our own id; their pet name if one
     /// has been assigned via `/alias`; else their last broadcast nickname
     /// from `/nick`, suffixed with their hex prefix since a nickname is
@@ -441,6 +480,7 @@ impl AppState {
             "invite" => Some(InputAction::Invite(self.active().name.clone())),
             "alias" => self.run_alias(arg.trim()),
             "nick" => self.run_nick(arg.trim()),
+            "leave" => self.run_leave(arg.trim()),
             _ => {
                 self.push_system(format!("unknown command: /{name}"));
                 None
@@ -493,6 +533,32 @@ impl AppState {
             "nickname set to {arg} (broadcast to joined channels)"
         ));
         Some(InputAction::Nick(arg.to_string()))
+    }
+
+    /// Handles `/leave [channel]`: `arg` is everything after `/leave `
+    /// (already trimmed), naming the channel to leave, or empty to leave
+    /// the currently active one (mirroring `/invite`). Refuses -- with a
+    /// system notice, returning `None` -- to leave a channel that isn't
+    /// currently joined, or leyline's only remaining joined channel,
+    /// since `AppState` always needs at least one (see `AppState::new`).
+    /// On success, returns an `InputAction::Leave` for the caller to tear
+    /// down; the tab itself is only removed once that's done, via
+    /// `remove_channel`.
+    fn run_leave(&mut self, arg: &str) -> Option<InputAction> {
+        let target = if arg.is_empty() {
+            self.active().name.clone()
+        } else {
+            arg.to_string()
+        };
+        if !self.channels.iter().any(|c| c.name == target) {
+            self.push_system(format!("not currently in #{target}"));
+            return None;
+        }
+        if self.channels.len() <= 1 {
+            self.push_system("cannot leave your only channel");
+            return None;
+        }
+        Some(InputAction::Leave(target))
     }
 
     /// Resolves a hex-prefix (case-insensitive, as typed after `/alias`)
@@ -1195,6 +1261,83 @@ mod tests {
             InputAction::Invite(channel) => assert_eq!(channel, "random"),
             _ => panic!("expected InputAction::Invite"),
         }
+    }
+
+    #[test]
+    fn slash_leave_with_no_arg_leaves_the_active_channel() {
+        let mut app = multi_channel_app();
+        let action = submit(&mut app, "/leave");
+        match action.expect("/leave returns an action") {
+            InputAction::Leave(channel) => assert_eq!(channel, "random"),
+            _ => panic!("expected InputAction::Leave"),
+        }
+    }
+
+    #[test]
+    fn slash_leave_with_a_name_leaves_that_channel_even_if_inactive() {
+        let mut app = multi_channel_app();
+        assert_eq!(app.active().name, "random");
+        let action = submit(&mut app, "/leave general");
+        match action.expect("/leave returns an action") {
+            InputAction::Leave(channel) => assert_eq!(channel, "general"),
+            _ => panic!("expected InputAction::Leave"),
+        }
+    }
+
+    #[test]
+    fn slash_leave_refuses_an_unjoined_channel() {
+        let mut app = multi_channel_app();
+        let action = submit(&mut app, "/leave nonexistent");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "not currently in #nonexistent");
+    }
+
+    #[test]
+    fn slash_leave_refuses_the_only_channel() {
+        let mut app = app();
+        let action = submit(&mut app, "/leave");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "cannot leave your only channel");
+    }
+
+    #[test]
+    fn remove_channel_switches_active_to_the_previous_tab_when_removing_the_active_one() {
+        let mut app = multi_channel_app();
+        assert_eq!(app.active().name, "random");
+        app.remove_channel("random");
+        assert_eq!(app.channels.len(), 1);
+        assert_eq!(app.active().name, "general");
+    }
+
+    #[test]
+    fn remove_channel_keeps_the_active_tab_selected_when_removing_a_different_one() {
+        let mut app = multi_channel_app();
+        assert_eq!(app.active().name, "random");
+        app.remove_channel("general");
+        assert_eq!(app.channels.len(), 1);
+        assert_eq!(
+            app.active().name,
+            "random",
+            "removing an earlier tab must not change which channel is active"
+        );
+    }
+
+    #[test]
+    fn remove_channel_pushes_a_left_system_notice() {
+        let mut app = multi_channel_app();
+        app.remove_channel("random");
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "left #random");
+    }
+
+    #[test]
+    fn remove_channel_is_a_no_op_for_an_unknown_channel() {
+        let mut app = multi_channel_app();
+        app.remove_channel("nonexistent");
+        assert_eq!(app.channels.len(), 2);
+        assert_eq!(app.active().name, "random");
     }
 
     #[test]

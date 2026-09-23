@@ -82,6 +82,22 @@ impl MessageStore {
         Ok(())
     }
 
+    /// Deletes `channel`'s persisted history file, if any -- e.g. when the
+    /// user runs `/leave` (see `app::AppState::run_leave`). Without this,
+    /// a later rejoin under the same display name -- almost certainly a
+    /// different room, since `net::topic_for_secret` derives the swarm
+    /// from a fresh `RoomSecret`, not the name -- would have an unrelated
+    /// room's old messages loaded straight into it (see `load`). A no-op
+    /// if the channel has no history file.
+    pub fn delete(&self, channel: &str) -> anyhow::Result<()> {
+        let path = self.path_for(channel);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).with_context(|| format!("failed to delete {}", path.display())),
+        }
+    }
+
     /// Derives `channel`'s log file path from a blake3 hash of its name.
     fn path_for(&self, channel: &str) -> PathBuf {
         self.dir
@@ -163,6 +179,45 @@ mod tests {
             store.load("general").unwrap(),
             vec![sample_message(1, "in general")]
         );
+        assert_eq!(
+            store.load("random").unwrap(),
+            vec![sample_message(2, "in random")]
+        );
+    }
+
+    #[test]
+    fn delete_removes_the_log_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MessageStore::new(dir.path().to_path_buf()).unwrap();
+        store.append("general", &sample_message(1, "hi")).unwrap();
+
+        store.delete("general").unwrap();
+
+        assert_eq!(store.load("general").unwrap(), Vec::new());
+        assert!(!store.path_for("general").exists());
+    }
+
+    #[test]
+    fn delete_is_a_no_op_when_no_history_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MessageStore::new(dir.path().to_path_buf()).unwrap();
+        store.delete("general").unwrap();
+    }
+
+    #[test]
+    fn deleting_one_channel_does_not_affect_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MessageStore::new(dir.path().to_path_buf()).unwrap();
+        store
+            .append("general", &sample_message(1, "in general"))
+            .unwrap();
+        store
+            .append("random", &sample_message(2, "in random"))
+            .unwrap();
+
+        store.delete("general").unwrap();
+
+        assert_eq!(store.load("general").unwrap(), Vec::new());
         assert_eq!(
             store.load("random").unwrap(),
             vec![sample_message(2, "in random")]

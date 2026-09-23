@@ -258,6 +258,17 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                             Some(InputAction::Nick(name)) => {
                                 net.set_nickname(name);
                             }
+                            Some(InputAction::Leave(channel)) => {
+                                net.leave(&channel);
+                                if let Err(err) = registry.forget_channel(&channel) {
+                                    warn!(%channel, "failed to remove channel from registry: {err}");
+                                }
+                                if let Err(err) = store.delete(&channel) {
+                                    warn!(%channel, "failed to delete channel history: {err}");
+                                }
+                                backfill.forget_channel(&channel);
+                                app.remove_channel(&channel);
+                            }
                             None => {}
                         }
                         dirty = true;

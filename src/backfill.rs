@@ -82,6 +82,22 @@ impl BackfillStore {
             .map(|manifest| manifest.root)
     }
 
+    /// Forgets `channel`'s in-memory manifest tracking -- e.g. when the
+    /// user runs `/leave` (see `app::AppState::run_leave`) -- so
+    /// `current_root` reverts to `None` and a later rejoin under the same
+    /// display name starts from an empty root instead of announcing an
+    /// unrelated room's history as this one's (see `storage.rs`'s
+    /// `delete` for the same concern on the local message log). Doesn't
+    /// reclaim the underlying message/manifest blobs already written to
+    /// the blob store -- they're content-addressed and harmless to keep,
+    /// and garbage-collecting them isn't worth the complexity here.
+    pub fn forget_channel(&self, channel: &str) {
+        self.channels
+            .lock()
+            .expect("channels lock poisoned")
+            .remove(channel);
+    }
+
     /// Adds `message` to `channel`'s manifest -- a convenience wrapper
     /// around `record_messages` for a single message; see there for details.
     pub async fn record_message(
@@ -283,6 +299,20 @@ mod tests {
             None,
             "recording into one channel must not affect another"
         );
+    }
+
+    #[tokio::test]
+    async fn forget_channel_clears_the_current_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let backfill = BackfillStore::new(dir.path()).await.unwrap();
+        backfill
+            .record_messages("general", &[message(100, 1, "first")])
+            .await
+            .unwrap();
+
+        backfill.forget_channel("general");
+
+        assert_eq!(backfill.current_root("general"), None);
     }
 
     /// Regression test for the bug where a peer's announced root only ever

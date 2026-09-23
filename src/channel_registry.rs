@@ -113,6 +113,20 @@ impl ChannelRegistry {
         self.save()
     }
 
+    /// Removes `channel`'s entry entirely, forgetting its room secret and
+    /// any known peers -- e.g. when the user runs `/leave` (see
+    /// `app::AppState::run_leave`), so a future restart no longer rejoins
+    /// it. A no-op (including no write to disk) if `channel` isn't
+    /// recorded.
+    pub fn forget_channel(&mut self, channel: &str) -> anyhow::Result<()> {
+        let before = self.channels.len();
+        self.channels.retain(|c| c.name != channel);
+        if self.channels.len() == before {
+            return Ok(());
+        }
+        self.save()
+    }
+
     /// Records `addr` as a currently-reachable peer for `channel`: moves
     /// it to the front if already known (deduped by node id, so a
     /// re-sighting doesn't create a duplicate), then evicts the oldest
@@ -232,6 +246,58 @@ mod tests {
             .record_channel("general", RoomSecret::generate())
             .unwrap();
         assert_eq!(registry.secret_for("general"), Some(first));
+    }
+
+    #[test]
+    fn forget_channel_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = registry_at(&dir);
+        registry
+            .record_channel("general", RoomSecret::generate())
+            .unwrap();
+        registry.forget_channel("general").unwrap();
+        assert!(registry.channel_names().is_empty());
+        assert_eq!(registry.secret_for("general"), None);
+    }
+
+    #[test]
+    fn forget_channel_is_a_no_op_for_an_unknown_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = registry_at(&dir);
+        registry
+            .record_channel("general", RoomSecret::generate())
+            .unwrap();
+        registry.forget_channel("nonexistent").unwrap();
+        assert_eq!(registry.channel_names(), vec!["general".to_string()]);
+    }
+
+    #[test]
+    fn forget_channel_only_removes_the_named_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = registry_at(&dir);
+        registry
+            .record_channel("general", RoomSecret::generate())
+            .unwrap();
+        registry
+            .record_channel("random", RoomSecret::generate())
+            .unwrap();
+        registry.forget_channel("general").unwrap();
+        assert_eq!(registry.channel_names(), vec!["random".to_string()]);
+    }
+
+    #[test]
+    fn forget_channel_persists_across_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("channels");
+
+        let mut registry = ChannelRegistry::load(path.clone()).unwrap();
+        registry
+            .record_channel("general", RoomSecret::generate())
+            .unwrap();
+        registry.forget_channel("general").unwrap();
+
+        let reloaded = ChannelRegistry::load(path).unwrap();
+        assert!(reloaded.channel_names().is_empty());
     }
 
     #[test]
