@@ -15,10 +15,12 @@ typed -- actually determines its gossip topic, so a channel is only
 reachable by someone you've handed a ticket to, and two people who happen
 to pick the same name never end up in the same swarm. `leyline` also
 backfills channel history for peers that were offline (or join a channel
-fresh): whenever a channel gains a gossip neighbor, both sides announce
-their current history's root hash -- an `iroh-blobs` content manifest --
-and whichever side is behind automatically fetches the messages it's
-missing directly from the other, no manual command needed. Combined with
+fresh): whenever a channel gains a gossip neighbor, and again periodically
+regardless of neighbor churn, every peer floods its current history's
+root hash -- an `iroh-blobs` content manifest -- to the whole channel,
+and whoever's behind automatically fetches the messages they're missing
+directly from whoever announced them, no manual command needed -- not
+just from whichever peer you happened to connect through. Combined with
 local persistence, multi-channel support (one gossip task per joined
 topic, a tab bar to switch between them, and a presence sidebar scoped to
 whichever channel is active), a couple of things are still deliberately

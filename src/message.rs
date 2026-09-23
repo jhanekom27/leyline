@@ -38,12 +38,15 @@ pub enum GossipPayload {
     Identity(IdentityAnnounce),
 }
 
-/// Broadcast to direct neighbors whenever a channel gains one (see net.rs's
-/// handling of `iroh_gossip`'s `NeighborUp`): advertises the sender's current
-/// history root hash for that channel, so a peer missing messages can fetch
-/// them via `iroh-blobs` -- concept.md's "Persistence & history backfill"
-/// section describes this as asking a peer "for their log's latest hash and
-/// pull the delta". See backfill.rs for how the root hash is built and used.
+/// Flooded to the whole channel whenever a channel gains a gossip neighbor
+/// (see net.rs's handling of `iroh_gossip`'s `NeighborUp`), and again
+/// periodically regardless of neighbor churn (see main.rs's history-announce
+/// heartbeat): advertises the sender's current history root hash for that
+/// channel, so any peer missing messages -- not only the sender's direct
+/// gossip neighbors -- can fetch them via `iroh-blobs`. concept.md's
+/// "Persistence & history backfill" section describes this as asking a peer
+/// "for their log's latest hash and pull the delta". See backfill.rs for how
+/// the root hash is built and used.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryAnnounce {
     /// The announcing peer's own NodeId, so a recipient knows who to fetch

@@ -191,11 +191,18 @@ everything sent while they were away. Two pieces cover that:
   `HashSeq` manifest, so its root hash summarizes "everything I have for
   this channel" — two peers holding the same message set always compute
   the same root, regardless of arrival order. Whenever a channel gains a
-  gossip neighbor (in either direction), both sides announce their current
-  root (`HistoryAnnounce`, over gossip); whichever side's root differs
-  fetches the manifest and any missing message blobs directly from the
-  other, over the same endpoint on `iroh-blobs`' own ALPN, then merges the
-  result into its transcript and local log.
+  gossip neighbor (in either direction), and again periodically regardless
+  of neighbor churn (`main.rs`'s history-announce heartbeat), every peer
+  floods its current root to the whole channel (`HistoryAnnounce`, over
+  gossip's full-mesh `broadcast` rather than a neighbor-scoped one) —
+  whoever's root differs fetches the manifest and any missing message
+  blobs directly from the announcer, over the same endpoint on
+  `iroh-blobs`' own ALPN, then merges the result into its transcript and
+  local log. Flooding (instead of only telling direct neighbors) matters
+  because iroh-gossip's HyParView layer only keeps a handful of peers as
+  direct neighbors at a time — without it, a channel with more members
+  than that would leave most pairs unable to ever notice they're missing
+  each other's history.
 
 Backfill only rides a channel's existing gossip topic, so it only ever
 covers channels already joined — a name or ticket is still needed to join

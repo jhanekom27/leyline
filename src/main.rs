@@ -158,6 +158,27 @@ struct Session {
     contacts: Contacts,
 }
 
+/// How often each joined channel with any recorded history re-announces its
+/// current root to the whole channel (see `net::Net::announce`), on top of
+/// the immediate re-announce whenever a channel gains a gossip neighbor.
+/// Much coarser than `tick` below, since this goes out over the network --
+/// but still frequent enough that a peer only ever bootstrapped through one
+/// specific channel member still hears from every other member within one
+/// interval, not only whoever it happens to be a direct gossip neighbor of
+/// (see concept.md's "Persistence & history backfill" section).
+const HISTORY_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Announces `channel`'s current history root to the whole channel, if
+/// we've recorded any messages for it yet (see `BackfillStore::current_root`
+/// and `net::Net::announce`) -- a no-op otherwise, since there's nothing to
+/// offer. Shared by the per-neighbor fast path and the periodic heartbeat in
+/// `run` below, so the two can't drift apart.
+fn announce_history(net: &Net, backfill: &BackfillStore, channel: &str) {
+    if let Some(root) = backfill.current_root(channel) {
+        net.announce(channel, root);
+    }
+}
+
 /// The "snappy async event loop": crossterm's async `EventStream` and the
 /// network's `NetEvent`s merged via `tokio::select!`, redrawing only when
 /// something actually changed -- see concept.md's "snappy async event
@@ -215,6 +236,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
 
     let mut term_events = EventStream::new();
     let mut tick = interval(Duration::from_millis(250));
+    let mut history_heartbeat = interval(HISTORY_ANNOUNCE_INTERVAL);
     let mut dirty = true;
 
     while !app.should_quit {
@@ -286,9 +308,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                 // below still separately updates presence for this same
                 // event.
                 if let NetEvent::PeerJoined(channel, _) = &net_event {
-                    if let Some(root) = backfill.current_root(channel) {
-                        net.announce(channel, root);
-                    }
+                    announce_history(&net, &backfill, channel);
                     net.announce_nickname(channel);
                 }
 
@@ -344,6 +364,17 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
             }
             _ = tick.tick() => {
                 // Reserved for cursor blink / relative-timestamp refresh.
+            }
+            _ = history_heartbeat.tick() => {
+                // Re-announce every joined channel's history root
+                // periodically, not just on neighbor churn -- covers peers
+                // we're connected to the same swarm alongside but never
+                // became a direct gossip neighbor of (see
+                // `announce_history` and concept.md's "Persistence &
+                // history backfill" section).
+                for channel in &app.channels {
+                    announce_history(&net, &backfill, &channel.name);
+                }
             }
         }
     }

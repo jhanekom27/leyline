@@ -554,13 +554,20 @@ impl Net {
         });
     }
 
-    /// Announces our current history root hash for `channel` to our direct
-    /// gossip neighbors (see backfill.rs) -- sent whenever a channel gains a
+    /// Announces our current history root hash for `channel` to the whole
+    /// channel -- see backfill.rs. Called whenever a channel gains a
     /// neighbor, in either direction, so both a fresh join and a reconnect
-    /// give both sides a chance to notice they're missing something. Uses
-    /// `broadcast_neighbors` rather than a full-mesh `broadcast`, since this
-    /// is inherently a neighbor-to-neighbor concern, not something that
-    /// needs flooding. Fire-and-forget, like `send`.
+    /// give every side a chance to notice they're missing something, and
+    /// again periodically regardless of neighbor churn (see main.rs's
+    /// history-announce heartbeat), so peers who never become each other's
+    /// direct gossip neighbor still eventually hear about each other's
+    /// history. Uses a full-mesh `broadcast`, the same as `send` and
+    /// `set_nickname` -- unlike `announce_nickname`, this deliberately isn't
+    /// neighbor-scoped: iroh-gossip's HyParView layer only keeps a handful
+    /// of peers (its "active view") as direct neighbors at once, so once a
+    /// channel outgrows that, most members would otherwise never receive
+    /// each other's announces and could only ever backfill from whichever
+    /// peer they happened to bootstrap through. Fire-and-forget, like `send`.
     pub fn announce(&self, channel: &str, root: Hash) {
         let Some(sender) = self
             .channels
@@ -583,7 +590,7 @@ impl Net {
                     return;
                 }
             };
-            if let Err(err) = sender.broadcast_neighbors(bytes.into()).await {
+            if let Err(err) = sender.broadcast(bytes.into()).await {
                 warn!("failed to broadcast history announce: {err}");
             }
         });
