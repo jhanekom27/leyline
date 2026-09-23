@@ -12,8 +12,8 @@ use std::time::Duration;
 use anyhow::Context;
 use futures::StreamExt;
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, SecretKey, address_lookup::memory::MemoryLookup,
-    endpoint::presets, protocol::Router,
+    Endpoint, EndpointAddr, EndpointId, NET_REPORT_TIMEOUT, SecretKey,
+    address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router,
 };
 use iroh_blobs::Hash;
 use iroh_gossip::{
@@ -24,6 +24,7 @@ use iroh_gossip::{
 use iroh_tickets::{ParseError, Ticket};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::backfill::BackfillStore;
@@ -222,9 +223,23 @@ impl Net {
         let our_id = *id.as_bytes();
         info!(%id, "endpoint bound");
 
-        // Wait for a home relay so the address used for our own tickets
-        // below has a usable relay hint, not just a bare id.
-        endpoint.online().await;
+        // Wait (briefly) for a home relay so the address used for our own
+        // tickets below has a usable relay hint, not just a bare id.
+        // `online()` has no timeout of its own -- iroh's own docs warn it
+        // will await indefinitely if no relay is reachable (no internet, a
+        // captive portal, a restrictive firewall, ...) -- so bound it
+        // ourselves rather than hanging the whole app, including the TUI,
+        // on network access we may never get. iroh keeps retrying in the
+        // background regardless of this timeout; local data, joined
+        // channels, and the TUI should all still come up without a relay,
+        // so a peer with a directly reachable address (e.g. on the same
+        // LAN) can still connect even then.
+        if timeout(Duration::from_secs(NET_REPORT_TIMEOUT), endpoint.online())
+            .await
+            .is_err()
+        {
+            warn!("no relay reachable within {NET_REPORT_TIMEOUT}s yet; continuing without one");
+        }
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let router = Router::builder(endpoint)
