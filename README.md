@@ -147,6 +147,7 @@ Typed into the message box and submitted with `Enter`:
 | `/leave <channel-name>` | Leave a specific joined channel without switching to it |
 | `/alias <hex-prefix> <name>` | Assign a local pet name to the peer whose endpoint id starts with `<hex-prefix>`, shown in place of their hex id from then on (local only, never sent to peers) |
 | `/nick <name>` | Broadcast a chosen display name to every joined channel (spoofable -- shown as `name (hex-prefix)` until you `/alias` that peer) |
+| `/help` | Show the full list of commands and keybindings |
 
 ## Roadmap
 

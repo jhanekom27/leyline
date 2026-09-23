@@ -481,11 +481,25 @@ impl AppState {
             "alias" => self.run_alias(arg.trim()),
             "nick" => self.run_nick(arg.trim()),
             "leave" => self.run_leave(arg.trim()),
+            "help" => self.run_help(),
             _ => {
                 self.push_system(format!("unknown command: /{name}"));
                 None
             }
         }
+    }
+
+    /// Handles `/help`: pushes the full command/keybinding reference as a
+    /// system notice. The input box's border only shows a short hint (see
+    /// `ui::render_input`) to stay uncluttered, so this is where that
+    /// detail actually lives.
+    fn run_help(&mut self) -> Option<InputAction> {
+        self.push_system(
+            "commands: /join <name|ticket>, /invite, /leave [channel], \
+             /alias <hex-prefix> <name>, /nick <name>, /help -- \
+             keys: Tab/Shift+Tab switch channels, Up/Down scroll, Esc/Ctrl+C quit",
+        );
+        None
     }
 
     /// Handles `/alias <hex-prefix> <name>`: `arg` is everything after
@@ -1248,6 +1262,15 @@ mod tests {
         assert!(action.is_none());
         let last = as_system(app.active().messages.back().unwrap());
         assert_eq!(last, "unknown command: /bogus");
+    }
+
+    #[test]
+    fn help_command_pushes_a_system_notice_and_returns_none() {
+        let mut app = app();
+        let action = submit(&mut app, "/help");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.starts_with("commands:"), "got: {last}");
     }
 
     #[test]
