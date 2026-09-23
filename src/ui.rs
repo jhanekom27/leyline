@@ -140,7 +140,15 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
     // below has to work in rows to stay accurate.
     let mut rows = build_message_rows(app, channel, inner_width);
     let total = rows.len();
-    let end = total.saturating_sub(channel.scroll);
+    // `channel.scroll` grows unboundedly while `Up` is held (see
+    // `AppState::handle_key`) since it has no way to know how many rows
+    // of *wrapped* content exist -- that depends on the terminal width,
+    // which is only known here. Clamp it so scrolling past the oldest
+    // message just holds the view there instead of pushing every row
+    // off-screen.
+    let max_scroll = total.saturating_sub(visible_rows);
+    let scroll = channel.scroll.min(max_scroll);
+    let end = total.saturating_sub(scroll);
     let start = end.saturating_sub(visible_rows);
     let items: Vec<ListItem> = rows.drain(start..end).map(ListItem::new).collect();
 
