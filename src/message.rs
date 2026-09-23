@@ -34,6 +34,8 @@ pub enum GossipPayload {
     Chat(ChatMessage),
     /// A history-sync announcement -- see `HistoryAnnounce`.
     Announce(HistoryAnnounce),
+    /// A broadcast-nickname announcement -- see `IdentityAnnounce`.
+    Identity(IdentityAnnounce),
 }
 
 /// Broadcast to direct neighbors whenever a channel gains one (see net.rs's
@@ -50,6 +52,23 @@ pub struct HistoryAnnounce {
     pub sender: [u8; 32],
     /// Root hash of the sender's current history manifest for this channel.
     pub root: iroh_blobs::Hash,
+}
+
+/// Broadcast to every joined channel when `/nick` is run, and re-sent to
+/// direct neighbors whenever a channel gains one (see net.rs's handling of
+/// `iroh_gossip`'s `NeighborUp`), the same way `HistoryAnnounce` is --
+/// otherwise a peer who joins after you set your nickname would never learn
+/// it. Convenient, but spoofable -- nothing stops two peers both claiming
+/// the same nickname -- so `AppState::display_name` shows it alongside the
+/// sender's id rather than in place of it, until a local petname (see
+/// `contacts.rs`) is pinned for that id. See features.md's "Broadcast
+/// nicknames".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityAnnounce {
+    /// The announcing peer's own NodeId.
+    pub sender: [u8; 32],
+    /// The chosen display nickname, as typed after `/nick`.
+    pub nickname: String,
 }
 
 #[cfg(test)]
@@ -86,9 +105,31 @@ mod tests {
     }
 
     #[test]
+    fn identity_payload_round_trips_through_postcard() {
+        let payload = GossipPayload::Identity(IdentityAnnounce {
+            sender: [5; 32],
+            nickname: "alice".to_string(),
+        });
+        let bytes = postcard::to_stdvec(&payload).unwrap();
+        let decoded: GossipPayload = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
     fn chat_and_announce_payloads_are_distinguishable() {
         let chat_bytes = postcard::to_stdvec(&GossipPayload::Chat(sample_chat())).unwrap();
         let decoded: GossipPayload = postcard::from_bytes(&chat_bytes).unwrap();
         assert!(matches!(decoded, GossipPayload::Chat(_)));
+    }
+
+    #[test]
+    fn chat_and_identity_payloads_are_distinguishable() {
+        let identity_bytes = postcard::to_stdvec(&GossipPayload::Identity(IdentityAnnounce {
+            sender: [5; 32],
+            nickname: "alice".to_string(),
+        }))
+        .unwrap();
+        let decoded: GossipPayload = postcard::from_bytes(&identity_bytes).unwrap();
+        assert!(matches!(decoded, GossipPayload::Identity(_)));
     }
 }

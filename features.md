@@ -19,14 +19,14 @@ mechanisms, not one, since they trade off differently:
   leyline's existing capability-based trust model (concept.md's "Room
   privacy") instead of fighting it. Does nothing for a peer you haven't met
   yet.
-- [ ] **Broadcast nicknames** -- `/nick <name>` announces a chosen display
+- [x] **Broadcast nicknames** -- `/nick <name>` announces a chosen display
   name to every joined channel, as a new `GossipPayload::Identity { sender,
   nickname }` variant sent alongside `Chat`/`Announce`, re-sent on
   `NeighborUp` the same way `HistoryAnnounce` already is. Convenient for
   peers you haven't petnamed, but spoofable -- nothing stops two peers both
   claiming "alice" -- so it should supplement the id, never fully replace
   it (e.g. `alice (a1b2)` until pinned locally).
-- [ ] Resolution order in `display_name`: local petname if set, then the
+- [x] Resolution order in `display_name`: local petname if set, then the
   last-seen broadcast nickname, then the `hex_prefix` fallback it already
   has today.
 

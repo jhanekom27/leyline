@@ -142,6 +142,7 @@ Typed into the message box and submitted with `Enter`:
 | `/join <ticket>` | Join the channel named in a pasted invite ticket |
 | `/invite` | Show the active channel's invite ticket in the transcript (and copy it to your clipboard, if one is available) to share with others |
 | `/alias <hex-prefix> <name>` | Assign a local pet name to the peer whose endpoint id starts with `<hex-prefix>`, shown in place of their hex id from then on (local only, never sent to peers) |
+| `/nick <name>` | Broadcast a chosen display name to every joined channel (spoofable -- shown as `name (hex-prefix)` until you `/alias` that peer) |
 
 ## Roadmap
 

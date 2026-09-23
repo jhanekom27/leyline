@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::backfill::BackfillStore;
-use crate::message::{ChatMessage, GossipPayload, HistoryAnnounce};
+use crate::message::{ChatMessage, GossipPayload, HistoryAnnounce, IdentityAnnounce};
 use crate::ticket::{ChannelTicket, RoomSecret};
 
 /// The channel every instance joins on startup.
@@ -68,6 +68,9 @@ pub enum NetEvent {
     /// A peer announced its current history root hash for a channel -- see
     /// `crate::message::HistoryAnnounce` and backfill.rs.
     Announce(String, HistoryAnnounce),
+    /// A peer announced (or re-announced) their broadcast nickname -- see
+    /// `crate::message::IdentityAnnounce`.
+    Identity(String, IdentityAnnounce),
     /// A history backfill fetch finished and decoded some messages, ready
     /// to be deduped, persisted, and merged into the transcript.
     HistoryFetched(String, Vec<ChatMessage>),
@@ -151,6 +154,12 @@ pub struct Net {
     /// that fetch from us, and lets us fetch from a peer that announced a
     /// root hash we don't have yet.
     backfill: BackfillStore,
+    /// Our current broadcast nickname, if `/nick` has been run this session
+    /// -- re-sent to each channel's newly-up neighbors the same way a
+    /// `HistoryAnnounce` is (see `announce_nickname`), so a peer who
+    /// connects after we set it still learns it. Never persisted, unlike
+    /// `contacts.rs`'s petnames -- see features.md's "Broadcast nicknames".
+    nickname: Mutex<Option<String>>,
     /// Our own endpoint id, as raw bytes so callers don't need to depend on
     /// iroh types.
     pub our_id: [u8; 32],
@@ -221,6 +230,7 @@ impl Net {
             channels: Arc::new(Mutex::new(HashMap::new())),
             events_tx,
             backfill,
+            nickname: Mutex::new(None),
             our_id,
         };
 
@@ -535,6 +545,81 @@ impl Net {
         });
     }
 
+    /// Sets our broadcast nickname and immediately floods it to every
+    /// currently-joined channel via a full `broadcast` (like `send` -- not
+    /// neighbor-scoped, since a `/nick` should propagate through the whole
+    /// mesh like a chat message would). Fire-and-forget, like `send`.
+    pub fn set_nickname(&self, nickname: String) {
+        *self.nickname.lock().expect("nickname lock poisoned") = Some(nickname.clone());
+        let senders: Vec<GossipSender> = self
+            .channels
+            .lock()
+            .expect("channels lock poisoned")
+            .values()
+            .map(|c| c.sender.clone())
+            .collect();
+        let payload = GossipPayload::Identity(IdentityAnnounce {
+            sender: self.our_id,
+            nickname,
+        });
+        tokio::spawn(async move {
+            let bytes = match postcard::to_stdvec(&payload) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    warn!("failed to encode identity announce: {err}");
+                    return;
+                }
+            };
+            for sender in senders {
+                if let Err(err) = sender.broadcast(bytes.clone().into()).await {
+                    warn!("failed to broadcast identity announce: {err}");
+                }
+            }
+        });
+    }
+
+    /// Re-announces our current nickname (if `/nick` has been run this
+    /// session) to `channel`'s direct gossip neighbors -- called whenever a
+    /// channel gains one, the same way `announce` re-sends the history
+    /// root, so a peer who connects after we set our nickname still learns
+    /// it. A no-op if no nickname has been set yet. Fire-and-forget, like
+    /// `announce`.
+    pub fn announce_nickname(&self, channel: &str) {
+        let Some(nickname) = self
+            .nickname
+            .lock()
+            .expect("nickname lock poisoned")
+            .clone()
+        else {
+            return;
+        };
+        let Some(sender) = self
+            .channels
+            .lock()
+            .expect("channels lock poisoned")
+            .get(channel)
+            .map(|c| c.sender.clone())
+        else {
+            return;
+        };
+        let payload = GossipPayload::Identity(IdentityAnnounce {
+            sender: self.our_id,
+            nickname,
+        });
+        tokio::spawn(async move {
+            let bytes = match postcard::to_stdvec(&payload) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    warn!("failed to encode identity announce: {err}");
+                    return;
+                }
+            };
+            if let Err(err) = sender.broadcast_neighbors(bytes.into()).await {
+                warn!("failed to broadcast identity announce: {err}");
+            }
+        });
+    }
+
     /// Reacts to a received `HistoryAnnounce`: if its root differs from what
     /// we already have for `channel` (and it isn't an echo of our own
     /// announce), fetches and decodes the delta directly from the
@@ -642,6 +727,9 @@ async fn forward_events(
                     }
                     Ok(GossipPayload::Announce(announce)) => {
                         NetEvent::Announce(channel.clone(), announce)
+                    }
+                    Ok(GossipPayload::Identity(identity)) => {
+                        NetEvent::Identity(channel.clone(), identity)
                     }
                     Err(err) => {
                         warn!("dropping malformed gossip message: {err}");

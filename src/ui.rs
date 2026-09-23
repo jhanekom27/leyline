@@ -144,7 +144,7 @@ fn render_peers(frame: &mut Frame, area: Rect, app: &AppState) {
 fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
     const PROMPT: &str = "> ";
     let block = Block::bordered().title(
-        "message (Enter to send, /join <name|ticket>, /invite, /alias <id> <name>, Tab to switch, Esc to quit)",
+        "message (Enter to send, /join <name|ticket>, /invite, /alias <id> <name>, /nick <name>, Tab to switch, Esc to quit)",
     );
     let inner = block.inner(area);
     let text_width = (inner.width as usize).saturating_sub(PROMPT.len()).max(1);

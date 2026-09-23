@@ -60,6 +60,12 @@ comes down to in a TUI.
 - `contacts.rs` persists local pet names (`/alias <hex-prefix> <name>`)
   assigned to specific endpoint ids -- checked by `AppState::display_name`
   before its hex-prefix fallback, and never sent to peers.
+- `/nick <name>` broadcasts a chosen display name to every joined channel
+  (a `GossipPayload::Identity`, re-sent on `NeighborUp` the same way a
+  `HistoryAnnounce` is -- see "Message wire format" below). Unlike a pet
+  name, it's spoofable and not persisted, so `display_name` only falls
+  back to it after a local pet name, and shows it alongside the sender's
+  hex id rather than in place of it.
 
 ## Room privacy
 
@@ -116,6 +122,7 @@ itself:
 pub enum GossipPayload {
     Chat(ChatMessage),
     Announce(HistoryAnnounce), // see "Persistence & history backfill" below
+    Identity(IdentityAnnounce), // see "Identity & channels" above
 }
 ```
 

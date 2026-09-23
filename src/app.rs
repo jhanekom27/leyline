@@ -107,6 +107,10 @@ pub enum InputAction {
     /// a typed hex-prefix by `/alias` (see `run_command` and
     /// `crate::contacts`).
     Alias([u8; 32], String),
+    /// Broadcast a chosen display nickname to every joined channel, as
+    /// typed after `/nick` (see `run_command` and
+    /// `crate::net::Net::set_nickname`).
+    Nick(String),
 }
 
 /// All state needed to render the TUI and respond to input.
@@ -123,6 +127,12 @@ pub struct AppState {
     /// Seeded once at startup from `crate::contacts::Contacts` (see
     /// `load_contacts`); never sent over the wire.
     petnames: HashMap<[u8; 32], String>,
+    /// Last-seen broadcast nickname per sender, from `/nick` (see
+    /// `NetEvent::Identity`) -- checked by `display_name` after `petnames`
+    /// but before the hex-prefix fallback. In-memory only, unlike
+    /// `petnames`: a broadcast nickname isn't ours to persist, and its
+    /// owner re-announces it on every reconnect anyway.
+    nicknames: HashMap<[u8; 32], String>,
 }
 
 impl AppState {
@@ -154,6 +164,7 @@ impl AppState {
             cursor: 0,
             should_quit: false,
             petnames: HashMap::new(),
+            nicknames: HashMap::new(),
         }
     }
 
@@ -276,11 +287,12 @@ impl AppState {
     }
 
     /// Applies a network event: updates presence, pushes a deduped incoming
-    /// message, or reports a channel join's outcome. Returns the channel
-    /// name and message when `event` was a `NetEvent::Received` that
-    /// resulted in a newly-accepted (non-duplicate) message, so the caller
-    /// can persist it (see storage.rs) -- `None` for every other event,
-    /// including a duplicate `Received`.
+    /// message, records a peer's broadcast nickname, or reports a channel
+    /// join's outcome. Returns the channel name and message when `event`
+    /// was a `NetEvent::Received` that resulted in a newly-accepted
+    /// (non-duplicate) message, so the caller can persist it (see
+    /// storage.rs) -- `None` for every other event, including a duplicate
+    /// `Received`.
     pub fn handle_net_event(&mut self, event: NetEvent) -> Option<(String, ChatMessage)> {
         match event {
             NetEvent::PeerJoined(channel_name, id) => {
@@ -332,6 +344,14 @@ impl AppState {
                 self.push_system(format!("failed to join #{name}: {error}"));
                 None
             }
+            // A peer's (re-)announced broadcast nickname -- see
+            // features.md's "Broadcast nicknames". Simply overwrite
+            // whatever we last had for `sender`, so `display_name` always
+            // reflects the most recently seen one.
+            NetEvent::Identity(_channel, identity) => {
+                self.nicknames.insert(identity.sender, identity.nickname);
+                None
+            }
             // Handled in main.rs before reaching here: `Announce` triggers
             // `Net::sync_history`, `HistoryFetched`'s payload goes through
             // `merge_history` above, and `PeerAddressLearned` is persisted
@@ -344,13 +364,18 @@ impl AppState {
         }
     }
 
-    /// Displays a sender as "you" for our own id, their pet name if one
-    /// has been assigned via `/alias`, or else a shortened hex id.
+    /// Displays a sender as "you" for our own id; their pet name if one
+    /// has been assigned via `/alias`; else their last broadcast nickname
+    /// from `/nick`, suffixed with their hex prefix since a nickname is
+    /// spoofable and not unique (features.md's "Broadcast nicknames"); or,
+    /// absent both, a shortened hex id on its own.
     pub fn display_name(&self, sender: &[u8; 32]) -> String {
         if *sender == self.self_id {
             "you".to_string()
         } else if let Some(name) = self.petnames.get(sender) {
             name.clone()
+        } else if let Some(nickname) = self.nicknames.get(sender) {
+            format!("{nickname} ({})", hex_prefix(sender))
         } else {
             hex_prefix(sender)
         }
@@ -399,8 +424,8 @@ impl AppState {
     /// Parses a `/command [args]` line (the text after the leading `/`,
     /// already trimmed). Recognized commands may still return `None` after
     /// pushing a system notice (e.g. usage errors) -- only `/join`,
-    /// `/invite`, and a successful `/alias` need the caller to actually do
-    /// anything.
+    /// `/invite`, and a successful `/alias` or `/nick` need the caller to
+    /// actually do anything.
     fn run_command(&mut self, command: &str) -> Option<InputAction> {
         let (name, arg) = command.split_once(' ').unwrap_or((command, ""));
         match name {
@@ -415,6 +440,7 @@ impl AppState {
             }
             "invite" => Some(InputAction::Invite(self.active().name.clone())),
             "alias" => self.run_alias(arg.trim()),
+            "nick" => self.run_nick(arg.trim()),
             _ => {
                 self.push_system(format!("unknown command: /{name}"));
                 None
@@ -450,6 +476,23 @@ impl AppState {
                 None
             }
         }
+    }
+
+    /// Handles `/nick <name>`: `arg` is everything after `/nick ` (already
+    /// trimmed). Unlike `/alias`, there's no id to resolve -- a `/nick` is
+    /// about our own identity, not a peer's -- so a bare non-empty name is
+    /// all that's needed. Reports the outcome as a system notice either
+    /// way, and returns an `InputAction::Nick` for the caller to broadcast
+    /// (see `net::Net::set_nickname`) on success.
+    fn run_nick(&mut self, arg: &str) -> Option<InputAction> {
+        if arg.is_empty() {
+            self.push_system("usage: /nick <name>");
+            return None;
+        }
+        self.push_system(format!(
+            "nickname set to {arg} (broadcast to joined channels)"
+        ));
+        Some(InputAction::Nick(arg.to_string()))
     }
 
     /// Resolves a hex-prefix (case-insensitive, as typed after `/alias`)
@@ -625,6 +668,7 @@ fn compose_message(sender: [u8; 32], text: &str) -> ChatMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::IdentityAnnounce;
 
     const SELF_ID: [u8; 32] = [9; 32];
     const PEER_ID: [u8; 32] = [7; 32];
@@ -752,6 +796,66 @@ mod tests {
     }
 
     #[test]
+    fn display_name_uses_nickname_when_no_petname_is_set() {
+        let mut app = app();
+        let result = app.handle_net_event(NetEvent::Identity(
+            "general".to_string(),
+            IdentityAnnounce {
+                sender: PEER_ID,
+                nickname: "Alice".to_string(),
+            },
+        ));
+        assert!(result.is_none());
+        assert_eq!(
+            app.display_name(&PEER_ID),
+            format!("Alice ({})", hex_prefix(&PEER_ID)),
+            "a broadcast nickname must be shown alongside the hex id, since it's spoofable"
+        );
+    }
+
+    #[test]
+    fn display_name_prefers_petname_over_nickname() {
+        let mut app = app();
+        app.load_contacts(HashMap::from([(PEER_ID, "Bob".to_string())]));
+        app.handle_net_event(NetEvent::Identity(
+            "general".to_string(),
+            IdentityAnnounce {
+                sender: PEER_ID,
+                nickname: "Alice".to_string(),
+            },
+        ));
+        assert_eq!(
+            app.display_name(&PEER_ID),
+            "Bob",
+            "a pinned local petname must win over a peer's own broadcast nickname"
+        );
+    }
+
+    #[test]
+    fn identity_event_overwrites_previous_nickname_for_the_same_sender() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::Identity(
+            "general".to_string(),
+            IdentityAnnounce {
+                sender: PEER_ID,
+                nickname: "Alice".to_string(),
+            },
+        ));
+        app.handle_net_event(NetEvent::Identity(
+            "general".to_string(),
+            IdentityAnnounce {
+                sender: PEER_ID,
+                nickname: "Alicia".to_string(),
+            },
+        ));
+        assert_eq!(
+            app.display_name(&PEER_ID),
+            format!("Alicia ({})", hex_prefix(&PEER_ID)),
+            "display_name must reflect the last-seen nickname, not the first"
+        );
+    }
+
+    #[test]
     fn alias_assigns_a_petname_for_a_currently_online_peer() {
         let mut app = app();
         app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
@@ -827,6 +931,27 @@ mod tests {
     fn alias_usage_error_when_name_is_missing() {
         let mut app = app();
         let action = submit(&mut app, "/alias ffffffff");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.starts_with("usage:"));
+    }
+
+    #[test]
+    fn nick_command_returns_action_and_pushes_system_notice() {
+        let mut app = app();
+        let action = submit(&mut app, "/nick Alice");
+        match action.expect("a successful /nick returns an action") {
+            InputAction::Nick(name) => assert_eq!(name, "Alice"),
+            _ => panic!("expected InputAction::Nick"),
+        }
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("Alice"), "got: {last}");
+    }
+
+    #[test]
+    fn nick_usage_error_when_name_is_missing() {
+        let mut app = app();
+        let action = submit(&mut app, "/nick");
         assert!(action.is_none());
         let last = as_system(app.active().messages.back().unwrap());
         assert!(last.starts_with("usage:"));

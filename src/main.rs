@@ -255,6 +255,9 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                                     warn!("failed to persist pet name: {err}");
                                 }
                             }
+                            Some(InputAction::Nick(name)) => {
+                                net.set_nickname(name);
+                            }
                             None => {}
                         }
                         dirty = true;
@@ -265,14 +268,17 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
             }
             Some(net_event) = net_rx.recv() => {
                 // Peek (without consuming) for a channel gaining a gossip
-                // neighbor, so we can also announce our history root to it
-                // -- see backfill.rs and concept.md's "Persistence &
-                // history backfill" section. `app.handle_net_event` below
-                // still separately updates presence for this same event.
-                if let NetEvent::PeerJoined(channel, _) = &net_event
-                    && let Some(root) = backfill.current_root(channel)
-                {
-                    net.announce(channel, root);
+                // neighbor, so we can also announce our history root and
+                // our current nickname (if any) to it -- see backfill.rs,
+                // concept.md's "Persistence & history backfill" section,
+                // and `Net::announce_nickname`. `app.handle_net_event`
+                // below still separately updates presence for this same
+                // event.
+                if let NetEvent::PeerJoined(channel, _) = &net_event {
+                    if let Some(root) = backfill.current_root(channel) {
+                        net.announce(channel, root);
+                    }
+                    net.announce_nickname(channel);
                 }
 
                 // Also peek for a channel finishing a runtime `/join`, so
