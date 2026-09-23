@@ -12,7 +12,7 @@ The most requested gap: peers only ever show up as a truncated hex id
 for knowing which of your friends just said something. Two complementary
 mechanisms, not one, since they trade off differently:
 
-- [ ] **Local petnames** -- `/alias <hex-prefix> <name>` assigns a name to a
+- [x] **Local petnames** -- `/alias <hex-prefix> <name>` assigns a name to a
   specific endpoint id yourself. Stored locally only (a new `contacts.rs`,
   mirroring `channel_registry.rs`'s persisted-postcard-file pattern), never
   sent over the wire. Not spoofable, since only you control it -- fits

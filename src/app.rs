@@ -6,7 +6,7 @@
 //! or `/invite` command, it returns an `InputAction` describing what the
 //! caller should do, rather than reaching for I/O itself.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -103,6 +103,10 @@ pub enum InputAction {
     /// Build an invite ticket for the named channel and report it back
     /// (via `AppState::push_system`) once built.
     Invite(String),
+    /// Persist a local pet name for a specific endpoint id, resolved from
+    /// a typed hex-prefix by `/alias` (see `run_command` and
+    /// `crate::contacts`).
+    Alias([u8; 32], String),
 }
 
 /// All state needed to render the TUI and respond to input.
@@ -114,6 +118,11 @@ pub struct AppState {
     pub input: String,
     pub cursor: usize,
     pub should_quit: bool,
+    /// Local pet names assigned via `/alias`, keyed by endpoint id --
+    /// checked by `display_name` before falling back to a hex prefix.
+    /// Seeded once at startup from `crate::contacts::Contacts` (see
+    /// `load_contacts`); never sent over the wire.
+    petnames: HashMap<[u8; 32], String>,
 }
 
 impl AppState {
@@ -144,6 +153,7 @@ impl AppState {
             input: String::new(),
             cursor: 0,
             should_quit: false,
+            petnames: HashMap::new(),
         }
     }
 
@@ -155,6 +165,13 @@ impl AppState {
         if let Some(channel) = self.channel_mut(channel) {
             channel.seed_history(messages);
         }
+    }
+
+    /// Seeds local pet names persisted by the caller (see contacts.rs).
+    /// Intended to be called once, right after `AppState::new`, before
+    /// the event loop starts -- mirrors `load_history`.
+    pub fn load_contacts(&mut self, petnames: HashMap<[u8; 32], String>) {
+        self.petnames = petnames;
     }
 
     /// Merges a batch of possibly-historical messages fetched via backfill
@@ -327,12 +344,13 @@ impl AppState {
         }
     }
 
-    /// Displays a sender as "you" for our own id, otherwise a shortened hex
-    /// id -- the same fallback real, unnamed peers use until nicknames
-    /// land.
+    /// Displays a sender as "you" for our own id, their pet name if one
+    /// has been assigned via `/alias`, or else a shortened hex id.
     pub fn display_name(&self, sender: &[u8; 32]) -> String {
         if *sender == self.self_id {
             "you".to_string()
+        } else if let Some(name) = self.petnames.get(sender) {
+            name.clone()
         } else {
             hex_prefix(sender)
         }
@@ -380,8 +398,9 @@ impl AppState {
 
     /// Parses a `/command [args]` line (the text after the leading `/`,
     /// already trimmed). Recognized commands may still return `None` after
-    /// pushing a system notice (e.g. usage errors) -- only `/join` and
-    /// `/invite` need the caller to actually do anything.
+    /// pushing a system notice (e.g. usage errors) -- only `/join`,
+    /// `/invite`, and a successful `/alias` need the caller to actually do
+    /// anything.
     fn run_command(&mut self, command: &str) -> Option<InputAction> {
         let (name, arg) = command.split_once(' ').unwrap_or((command, ""));
         match name {
@@ -395,11 +414,91 @@ impl AppState {
                 }
             }
             "invite" => Some(InputAction::Invite(self.active().name.clone())),
+            "alias" => self.run_alias(arg.trim()),
             _ => {
                 self.push_system(format!("unknown command: /{name}"));
                 None
             }
         }
+    }
+
+    /// Handles `/alias <hex-prefix> <name>`: `arg` is everything after
+    /// `/alias ` (already trimmed). Splits it into the hex-prefix and the
+    /// (possibly multi-word) name to assign, resolves the prefix via
+    /// `resolve_id`, and on success updates `petnames` immediately -- for
+    /// instant UI feedback -- while returning an `InputAction::Alias` for
+    /// the caller to persist (see contacts.rs). Usage and resolution
+    /// errors are reported as a system notice instead.
+    fn run_alias(&mut self, arg: &str) -> Option<InputAction> {
+        let Some((prefix, name)) = arg.split_once(' ') else {
+            self.push_system("usage: /alias <hex-prefix> <name>");
+            return None;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            self.push_system("usage: /alias <hex-prefix> <name>");
+            return None;
+        }
+        match self.resolve_id(prefix) {
+            Ok(id) => {
+                self.petnames.insert(id, name.to_string());
+                self.push_system(format!("aliased {} as {name}", hex_id(&id)));
+                Some(InputAction::Alias(id, name.to_string()))
+            }
+            Err(err) => {
+                self.push_system(err);
+                None
+            }
+        }
+    }
+
+    /// Resolves a hex-prefix (case-insensitive, as typed after `/alias`)
+    /// to exactly one id in `known_ids`. Errors with a user-facing message
+    /// if the prefix isn't valid hex, matches no known id, or matches more
+    /// than one -- this is what makes `/alias` "do nothing for a peer you
+    /// haven't met yet" rather than guessing.
+    fn resolve_id(&self, prefix: &str) -> Result<[u8; 32], String> {
+        let prefix = prefix.to_lowercase();
+        let valid_hex = !prefix.is_empty()
+            && prefix.len() <= 64
+            && prefix.chars().all(|c| c.is_ascii_hexdigit());
+        if !valid_hex {
+            return Err(format!("invalid hex prefix: {prefix}"));
+        }
+        let matches: Vec<[u8; 32]> = self
+            .known_ids()
+            .into_iter()
+            .filter(|id| hex_id(id).starts_with(&prefix))
+            .collect();
+        match matches.as_slice() {
+            [] => Err(format!("no known peer matches '{prefix}'")),
+            [id] => Ok(*id),
+            _ => Err(format!(
+                "'{prefix}' matches multiple peers, use a longer prefix"
+            )),
+        }
+    }
+
+    /// Every endpoint id `AppState` has actually observed: everyone
+    /// currently online in any joined channel, plus the sender of any
+    /// chat message in any channel's transcript (including messages
+    /// loaded from history) -- i.e. everyone `/alias` could plausibly
+    /// name, whether or not they're online right now. Excludes our own
+    /// id, and is deduplicated.
+    fn known_ids(&self) -> Vec<[u8; 32]> {
+        let mut ids: Vec<[u8; 32]> = Vec::new();
+        for channel in &self.channels {
+            ids.extend(channel.peers.iter().copied());
+            for line in &channel.messages {
+                if let TranscriptLine::Chat(message) = line {
+                    ids.push(message.sender);
+                }
+            }
+        }
+        ids.retain(|id| *id != self.self_id);
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     fn char_count(&self) -> usize {
@@ -566,6 +665,16 @@ mod tests {
         }
     }
 
+    /// Types `text` character-by-character then presses `Enter`, returning
+    /// whatever action (if any) that produced -- shared by the `/alias`
+    /// tests below, which all follow this shape.
+    fn submit(app: &mut AppState, text: &str) -> Option<InputAction> {
+        for c in text.chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter))
+    }
+
     #[test]
     fn typing_composes_input() {
         let mut app = app();
@@ -633,6 +742,94 @@ mod tests {
         let app = app();
         assert_eq!(app.display_name(&SELF_ID), "you");
         assert_eq!(app.display_name(&PEER_ID), hex_prefix(&PEER_ID));
+    }
+
+    #[test]
+    fn display_name_uses_petname_when_one_is_set() {
+        let mut app = app();
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+        assert_eq!(app.display_name(&PEER_ID), "Alice");
+    }
+
+    #[test]
+    fn alias_assigns_a_petname_for_a_currently_online_peer() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+
+        let full_id = hex_id(&PEER_ID);
+        let action = submit(&mut app, &format!("/alias {} Alice", &full_id[..8]));
+
+        match action.expect("a successful /alias returns an action") {
+            InputAction::Alias(id, name) => {
+                assert_eq!(id, PEER_ID);
+                assert_eq!(name, "Alice");
+            }
+            _ => panic!("expected InputAction::Alias"),
+        }
+        assert_eq!(app.display_name(&PEER_ID), "Alice");
+    }
+
+    #[test]
+    fn alias_matches_a_peer_known_only_from_a_past_message() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::Received(
+            "general".to_string(),
+            compose_message(PEER_ID, "hi"),
+        ));
+
+        let full_id = hex_id(&PEER_ID);
+        let action = submit(&mut app, &format!("/alias {} Bob", &full_id[..8]));
+
+        assert!(
+            matches!(action, Some(InputAction::Alias(id, _)) if id == PEER_ID),
+            "a peer seen only as a message sender must still be aliasable"
+        );
+    }
+
+    #[test]
+    fn alias_reports_an_error_for_an_unknown_prefix() {
+        let mut app = app();
+        let action = submit(&mut app, "/alias ffffffff Carol");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("no known peer"), "got: {last}");
+    }
+
+    #[test]
+    fn alias_reports_an_error_for_an_ambiguous_prefix() {
+        let mut app = app();
+        let mut peer_a = [0xAB; 32];
+        let mut peer_b = [0xAB; 32];
+        peer_a[4] = 0x01;
+        peer_b[4] = 0x02;
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), peer_a));
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), peer_b));
+
+        // Both ids share this 4-byte (8 hex char) prefix.
+        let full_id = hex_id(&peer_a);
+        let action = submit(&mut app, &format!("/alias {} Dave", &full_id[..8]));
+
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("multiple peers"), "got: {last}");
+    }
+
+    #[test]
+    fn alias_rejects_a_non_hex_prefix() {
+        let mut app = app();
+        let action = submit(&mut app, "/alias not-hex Eve");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("invalid hex prefix"), "got: {last}");
+    }
+
+    #[test]
+    fn alias_usage_error_when_name_is_missing() {
+        let mut app = app();
+        let action = submit(&mut app, "/alias ffffffff");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.starts_with("usage:"));
     }
 
     #[test]

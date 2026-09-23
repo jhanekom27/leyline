@@ -57,6 +57,9 @@ comes down to in a TUI.
 - `channel_registry.rs` persists every joined channel's name, room secret,
   and known peer addresses locally, so restarting rejoins and reconnects
   without re-pasting a ticket.
+- `contacts.rs` persists local pet names (`/alias <hex-prefix> <name>`)
+  assigned to specific endpoint ids -- checked by `AppState::display_name`
+  before its hex-prefix fallback, and never sent to peers.
 
 ## Room privacy
 
@@ -203,6 +206,7 @@ src/
   identity.rs         // SecretKey load/persist
   ticket.rs           // RoomSecret + invite ticket encode/decode
   channel_registry.rs // persisted channel list, room secrets, known peers
+  contacts.rs         // persisted local pet names for peers
   storage.rs          // local per-channel message log persistence
   backfill.rs         // iroh-blobs history manifests for offline backfill
 ```

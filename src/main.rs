@@ -1,6 +1,7 @@
 mod app;
 mod backfill;
 mod channel_registry;
+mod contacts;
 mod identity;
 mod message;
 mod net;
@@ -23,6 +24,7 @@ use tracing::{debug, info, warn};
 use app::{AppState, InputAction};
 use backfill::BackfillStore;
 use channel_registry::ChannelRegistry;
+use contacts::Contacts;
 use net::{Net, NetEvent};
 use storage::MessageStore;
 
@@ -38,6 +40,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize history backfill storage")?;
     let registry = ChannelRegistry::load(dirs.data_dir().join("channels"))
         .context("failed to initialize channel registry")?;
+    let contacts = Contacts::load(dirs.data_dir().join("contacts"))
+        .context("failed to initialize contacts")?;
 
     let secret_key = identity::load_or_generate(&dirs.config_dir().join("identity"))
         .context("failed to load or generate identity")?;
@@ -82,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         store,
         backfill,
         registry,
+        contacts,
     };
 
     let mut terminal = ratatui::init();
@@ -150,6 +155,7 @@ struct Session {
     store: MessageStore,
     backfill: BackfillStore,
     registry: ChannelRegistry,
+    contacts: Contacts,
 }
 
 /// The "snappy async event loop": crossterm's async `EventStream` and the
@@ -165,9 +171,11 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
         store,
         backfill,
         mut registry,
+        mut contacts,
     } = session;
 
     let mut app = AppState::new(net.our_id, joined_channels.clone(), &active_channel);
+    app.load_contacts(contacts.all());
     for name in &joined_channels {
         // Ensures a brand-new channel ("general" on a first run, or a
         // `--join` ticket's channel) lands in the registry, so it's
@@ -241,6 +249,11 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                                 });
                                 let suffix = if copied { " (copied to clipboard)" } else { "" };
                                 app.push_system(format!("invite for #{channel}: {ticket}{suffix}"));
+                            }
+                            Some(InputAction::Alias(id, name)) => {
+                                if let Err(err) = contacts.set(id, name) {
+                                    warn!("failed to persist pet name: {err}");
+                                }
                             }
                             None => {}
                         }
