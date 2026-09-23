@@ -133,6 +133,13 @@ fn build_message_rows(app: &AppState, channel: &Channel, inner_width: usize) -> 
         match line {
             TranscriptLine::Chat(message) => {
                 let is_first_of_group = last_chat_sender != Some(message.sender);
+                if is_first_of_group && last_chat_sender.is_some() {
+                    // A blank row between two different senders' blocks,
+                    // so consecutive messages from the same sender read as
+                    // one continuous rail, while a new sender is set off
+                    // at a glance instead of just butting up against it.
+                    rows.push(Line::from(""));
+                }
                 last_chat_sender = Some(message.sender);
 
                 let color = user_color(&message.sender);
