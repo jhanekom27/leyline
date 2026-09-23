@@ -3,10 +3,13 @@
 
 use chrono::{DateTime, Local};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::scrollbar;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use textwrap::wrap;
 
 use crate::app::{AppState, Channel, TranscriptLine, hex_id};
@@ -142,8 +145,56 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
     let items: Vec<ListItem> = rows.drain(start..end).map(ListItem::new).collect();
 
     let title = format!("#{} · {} peer(s)", channel.name, channel.peers.len());
-    let list = List::new(items).block(Block::bordered().title(title));
+    let list = List::new(items).block(
+        Block::bordered()
+            .title(title)
+            .border_type(BorderType::Rounded),
+    );
     frame.render_widget(list, area);
+    render_scroll_indicator(frame, area, start, total, visible_rows);
+}
+
+/// Overlays a scroll-position thumb on the messages block's right border,
+/// so it's clear at a glance how far back you've scrolled and how much
+/// history is above. `start` is the same top-of-viewport row index used
+/// to slice the visible window above. Only drawn once the transcript
+/// actually overflows one screen (`total > visible_rows`) -- a
+/// full-height thumb on a short conversation would just be noise.
+fn render_scroll_indicator(
+    frame: &mut Frame,
+    area: Rect,
+    start: usize,
+    total: usize,
+    visible_rows: usize,
+) {
+    if total <= visible_rows {
+        return;
+    }
+    // `start` only ever ranges from 0 to `total - visible_rows` -- the
+    // viewport always shows a full page (see above), never overhanging
+    // past the end the way a bare `Paragraph::scroll` offset would -- so
+    // `content_length` must be the count of those valid positions, not
+    // `total` itself, or the thumb falls short of the bottom even when
+    // `start` is already at its max (i.e. fully scrolled down).
+    let scroll_positions = total.saturating_sub(visible_rows) + 1;
+    let mut state = ScrollbarState::new(scroll_positions)
+        .position(start)
+        .viewport_content_length(visible_rows);
+    let indicator = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .symbols(scrollbar::VERTICAL)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .thumb_symbol("▐")
+        .thumb_style(Color::Gray)
+        .track_style(Color::DarkGray);
+    frame.render_stateful_widget(
+        indicator,
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut state,
+    );
 }
 
 /// Renders `channel`'s transcript into rendered rows: a colored rail, time,
@@ -286,7 +337,11 @@ fn render_peers(frame: &mut Frame, area: Rect, app: &AppState) {
     let mut items: Vec<ListItem> = channel.peers.iter().map(|id| peer_item(app, id)).collect();
     items.push(peer_item(app, &app.self_id));
 
-    let list = List::new(items).block(Block::bordered().title("peers"));
+    let list = List::new(items).block(
+        Block::bordered()
+            .title("peers")
+            .border_type(BorderType::Rounded),
+    );
     frame.render_widget(list, area);
 }
 
@@ -304,13 +359,19 @@ fn peer_item(app: &AppState, id: &[u8; 32]) -> ListItem<'static> {
 /// descriptions still live in `/help`'s system notice and the README.
 fn render_hints(frame: &mut Frame, area: Rect) {
     let items: Vec<ListItem> = COMMAND_HINTS.iter().map(|hint| ListItem::new(*hint)).collect();
-    let list = List::new(items).block(Block::bordered().title("commands"));
+    let list = List::new(items).block(
+        Block::bordered()
+            .title("commands")
+            .border_type(BorderType::Rounded),
+    );
     frame.render_widget(list, area);
 }
 
 fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
     let prompt = format!("{} › ", app.display_name(&app.self_id));
-    let block = Block::bordered().title(" type a message · /help for commands ");
+    let block = Block::bordered()
+        .title(" type a message · /help for commands ")
+        .border_type(BorderType::Rounded);
     let inner = block.inner(area);
     let prompt_width = prompt.chars().count();
     let text_width = (inner.width as usize).saturating_sub(prompt_width).max(1);
