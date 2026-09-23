@@ -20,6 +20,20 @@ const NAME_WIDTH: usize = 10;
 /// Separates the name column from the message text.
 const SEPARATOR: &str = " │ ";
 
+/// Short usage reminders for every slash command, shown in the sidebar's
+/// commands panel (`render_hints`) when `AppState::show_hints` is on.
+/// Kept in sync with the Commands table in README.md and `run_help`'s
+/// system notice.
+const COMMAND_HINTS: &[&str] = &[
+    "/join <name|ticket>",
+    "/invite",
+    "/leave [channel]",
+    "/alias <hex> <name>",
+    "/nick <name>",
+    "/hints",
+    "/help",
+];
+
 /// Curated, dark-background-friendly colors used to visually separate
 /// senders -- see `user_color`.
 const USER_PALETTE: [Color; 8] = [
@@ -88,11 +102,29 @@ fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn render_body(frame: &mut Frame, area: Rect, app: &AppState) {
-    let [messages, peers] =
+    let [messages, sidebar] =
         Layout::horizontal([Constraint::Min(20), Constraint::Length(22)]).areas(area);
 
     render_messages(frame, messages, app);
+    render_sidebar(frame, sidebar, app);
+}
+
+/// Splits the RHS column into the peers list and, when `show_hints` is
+/// on, a command reference panel below it (toggled via `/hints` -- see
+/// `app::AppState::run_hints`). Peers keeps using whatever room is
+/// available (`Constraint::Min`), same as when the hints panel is
+/// hidden; the hints panel only ever takes exactly the room its fixed
+/// content needs (`Constraint::Length`).
+fn render_sidebar(frame: &mut Frame, area: Rect, app: &AppState) {
+    if !app.show_hints {
+        render_peers(frame, area, app);
+        return;
+    }
+    let hints_height = COMMAND_HINTS.len() as u16 + 2; // +2 for the block's borders
+    let [peers, hints] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(hints_height)]).areas(area);
     render_peers(frame, peers, app);
+    render_hints(frame, hints);
 }
 
 fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -265,6 +297,15 @@ fn peer_item(app: &AppState, id: &[u8; 32]) -> ListItem<'static> {
         Span::styled("● ", Style::default().fg(user_color(id))),
         Span::raw(app.display_name(id)),
     ]))
+}
+
+/// Renders the sidebar's command reference panel: one row per
+/// `COMMAND_HINTS` entry, showing just the bare usage -- full
+/// descriptions still live in `/help`'s system notice and the README.
+fn render_hints(frame: &mut Frame, area: Rect) {
+    let items: Vec<ListItem> = COMMAND_HINTS.iter().map(|hint| ListItem::new(*hint)).collect();
+    let list = List::new(items).block(Block::bordered().title("commands"));
+    frame.render_widget(list, area);
 }
 
 fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {

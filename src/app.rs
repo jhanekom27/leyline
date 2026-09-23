@@ -130,6 +130,11 @@ pub struct AppState {
     pub input: String,
     pub cursor: usize,
     pub should_quit: bool,
+    /// Whether the sidebar's command hints panel is shown -- toggled via
+    /// `/hints` (`run_hints`). Visible by default so the panel actually
+    /// teaches new users; in-memory only, like `scroll`/`input`, not
+    /// persisted across restarts.
+    pub show_hints: bool,
     /// Local pet names assigned via `/alias`, keyed by endpoint id --
     /// checked by `display_name` before falling back to a hex prefix.
     /// Seeded once at startup from `crate::contacts::Contacts` (see
@@ -171,6 +176,7 @@ impl AppState {
             input: String::new(),
             cursor: 0,
             should_quit: false,
+            show_hints: true,
             petnames: HashMap::new(),
             nicknames: HashMap::new(),
         }
@@ -481,6 +487,7 @@ impl AppState {
             "alias" => self.run_alias(arg.trim()),
             "nick" => self.run_nick(arg.trim()),
             "leave" => self.run_leave(arg.trim()),
+            "hints" => self.run_hints(),
             "help" => self.run_help(),
             _ => {
                 self.push_system(format!("unknown command: /{name}"));
@@ -496,9 +503,20 @@ impl AppState {
     fn run_help(&mut self) -> Option<InputAction> {
         self.push_system(
             "commands: /join <name|ticket>, /invite, /leave [channel], \
-             /alias <hex-prefix> <name>, /nick <name>, /help -- \
+             /alias <hex-prefix> <name>, /nick <name>, /hints, /help -- \
              keys: Tab/Shift+Tab switch channels, Up/Down scroll, Esc/Ctrl+C quit",
         );
+        None
+    }
+
+    /// Handles `/hints`: toggles the sidebar's command hints panel (see
+    /// `ui::render_sidebar`) and reports the new state as a system
+    /// notice. Purely local UI state -- no `InputAction` needed, unlike
+    /// commands that require the caller to do network I/O.
+    fn run_hints(&mut self) -> Option<InputAction> {
+        self.show_hints = !self.show_hints;
+        let state = if self.show_hints { "shown" } else { "hidden" };
+        self.push_system(format!("command hints {state}"));
         None
     }
 
@@ -1271,6 +1289,26 @@ mod tests {
         assert!(action.is_none());
         let last = as_system(app.active().messages.back().unwrap());
         assert!(last.starts_with("commands:"), "got: {last}");
+    }
+
+    #[test]
+    fn hints_are_shown_by_default() {
+        assert!(app().show_hints);
+    }
+
+    #[test]
+    fn slash_hints_toggles_visibility_and_reports_state() {
+        let mut app = app();
+
+        submit(&mut app, "/hints");
+        assert!(!app.show_hints);
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "command hints hidden");
+
+        submit(&mut app, "/hints");
+        assert!(app.show_hints);
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "command hints shown");
     }
 
     #[test]
