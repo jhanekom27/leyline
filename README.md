@@ -158,6 +158,7 @@ Typed into the message box and submitted with `Enter`:
 | `/reply` | Arm a reply to the most recent message in the active channel -- type normally afterward to send it as a reply (or press `Ctrl+R` instead to pick an older or specific-sender message) |
 | `/reply <text>` | Arm and immediately send `<text>` as a reply to the most recent message, in one step |
 | `/hints` | Toggle the sidebar's command hints panel on or off |
+| `/bell` | Toggle the terminal bell that rings when a message arrives, on or off (on by default; the setting persists across restarts) |
 | `/help` | Show the full list of commands and keybindings |
 
 ## Roadmap

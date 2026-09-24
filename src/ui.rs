@@ -43,6 +43,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/search <term> (/s)",
     "/reply [text]",
     "/hints",
+    "/bell",
     "/help",
 ];
 

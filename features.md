@@ -58,6 +58,11 @@ mechanisms, not one, since they trade off differently:
   older than what's loaded, without ever blocking input/render. The pane
   title reminds you a search is active and that `/search`/`/s` with no
   argument clears it.
+- [x] **Message bell** -- an incoming message rings the terminal bell
+  (ASCII BEL, `main.rs`'s `ring_bell`), regardless of which channel or
+  terminal tab is focused, so you notice leyline without watching the
+  TUI. `/bell` toggles it, persisted via a new `settings.rs` (mirrors
+  `contacts.rs`'s pattern) so the preference survives restarts.
 
 ## Channels & presence
 

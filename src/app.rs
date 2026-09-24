@@ -213,6 +213,11 @@ pub enum InputAction {
     /// app.rs never touches the clipboard directly, matching this module's
     /// doc comment.
     Paste(String),
+    /// Persist a new bell-on-incoming-message preference, toggled via
+    /// `/bell` (see `run_bell` and `crate::settings::Settings`). Applied
+    /// immediately to `bell_enabled` for instant feedback; the caller only
+    /// needs to persist it to disk.
+    Bell(bool),
 }
 
 /// All state needed to render the TUI and respond to input.
@@ -229,6 +234,13 @@ pub struct AppState {
     /// teaches new users; in-memory only, like `scroll`/`input`, not
     /// persisted across restarts.
     pub show_hints: bool,
+    /// Whether an incoming message rings the terminal bell -- toggled via
+    /// `/bell` (`run_bell`). Unlike `show_hints`, this preference is
+    /// persisted across restarts (see `crate::settings::Settings`);
+    /// `AppState::new` just starts at the same default (`true`) until
+    /// `load_settings` seeds the actual saved value, mirroring how
+    /// `petnames` starts empty until `load_contacts` runs.
+    pub bell_enabled: bool,
     /// Local pet names assigned via `/alias`, keyed by endpoint id --
     /// checked by `display_name` before falling back to a hex prefix.
     /// Seeded once at startup from `crate::contacts::Contacts` (see
@@ -283,6 +295,7 @@ impl AppState {
             cursor: 0,
             should_quit: false,
             show_hints: true,
+            bell_enabled: true,
             petnames: HashMap::new(),
             nicknames: HashMap::new(),
             picking_reply: None,
@@ -305,6 +318,14 @@ impl AppState {
     /// the event loop starts -- mirrors `load_history`.
     pub fn load_contacts(&mut self, petnames: HashMap<[u8; 32], String>) {
         self.petnames = petnames;
+    }
+
+    /// Seeds the persisted bell preference loaded by the caller (see
+    /// settings.rs). Intended to be called once, right after
+    /// `AppState::new`, before the event loop starts -- mirrors
+    /// `load_contacts`.
+    pub fn load_settings(&mut self, bell_enabled: bool) {
+        self.bell_enabled = bell_enabled;
     }
 
     /// Merges a batch of possibly-historical messages fetched via backfill
@@ -761,6 +782,7 @@ impl AppState {
             "search" | "s" => self.run_search(arg.trim()),
             "reply" => self.run_reply(arg.trim()),
             "hints" => self.run_hints(),
+            "bell" => self.run_bell(),
             "help" => self.run_help(),
             _ => {
                 self.push_system(format!("unknown command: /{name}"));
@@ -777,7 +799,7 @@ impl AppState {
         self.push_system(
             "commands: /join <name|ticket>, /invite, /leave [channel], /who, \
              /send <path>, /save <hash-prefix>, /paste, /alias <hex-prefix> <name>, \
-             /nick <name>, /search <term> (or /s), /reply [text], /hints, /help -- keys: \
+             /nick <name>, /search <term> (or /s), /reply [text], /hints, /bell, /help -- keys: \
              Tab/Shift+Tab switch channels, Ctrl+V paste, Ctrl+R reply (\u{2191}/\u{2193} pick, \
              Enter confirm), Up/Down scroll, Esc/Ctrl+C quit",
         );
@@ -793,6 +815,19 @@ impl AppState {
         let state = if self.show_hints { "shown" } else { "hidden" };
         self.push_system(format!("command hints {state}"));
         None
+    }
+
+    /// Handles `/bell`: toggles whether an incoming message rings the
+    /// terminal bell (see main.rs's `ring_bell`) and reports the new state
+    /// as a system notice, mirroring `run_hints`. Unlike `show_hints`,
+    /// this preference is persisted (see settings.rs), so -- unlike
+    /// `run_hints` -- an `InputAction` is returned for the caller to save
+    /// it to disk.
+    fn run_bell(&mut self) -> Option<InputAction> {
+        self.bell_enabled = !self.bell_enabled;
+        let state = if self.bell_enabled { "on" } else { "off" };
+        self.push_system(format!("message bell {state}"));
+        Some(InputAction::Bell(self.bell_enabled))
     }
 
     /// Handles `/alias <hex-prefix> <name>`: `arg` is everything after
@@ -1916,6 +1951,41 @@ mod tests {
         assert!(app.show_hints);
         let last = as_system(app.active().messages.back().unwrap());
         assert_eq!(last, "command hints shown");
+    }
+
+    #[test]
+    fn bell_is_enabled_by_default() {
+        assert!(app().bell_enabled);
+    }
+
+    #[test]
+    fn slash_bell_toggles_and_reports_state_and_returns_an_action() {
+        let mut app = app();
+
+        let action = submit(&mut app, "/bell");
+        assert!(!app.bell_enabled);
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "message bell off");
+        match action.expect("/bell returns an action") {
+            InputAction::Bell(enabled) => assert!(!enabled),
+            _ => panic!("expected InputAction::Bell"),
+        }
+
+        let action = submit(&mut app, "/bell");
+        assert!(app.bell_enabled);
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "message bell on");
+        match action.expect("/bell returns an action") {
+            InputAction::Bell(enabled) => assert!(enabled),
+            _ => panic!("expected InputAction::Bell"),
+        }
+    }
+
+    #[test]
+    fn load_settings_seeds_bell_enabled() {
+        let mut app = app();
+        app.load_settings(false);
+        assert!(!app.bell_enabled);
     }
 
     #[test]

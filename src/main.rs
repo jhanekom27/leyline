@@ -7,11 +7,13 @@ mod identity;
 mod message;
 mod net;
 mod search;
+mod settings;
 mod storage;
 mod ticket;
 mod ui;
 
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -34,6 +36,7 @@ use contacts::Contacts;
 use files::{downloads_dir, resolve_destination};
 use net::{Net, NetEvent};
 use search::{SearchOutcome, run_on_disk_scan};
+use settings::Settings;
 use storage::MessageStore;
 
 #[tokio::main]
@@ -51,6 +54,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize channel registry")?;
     let contacts = Contacts::load(dirs.data_dir().join("contacts"))
         .context("failed to initialize contacts")?;
+    let settings = Settings::load(dirs.data_dir().join("settings"))
+        .context("failed to initialize settings")?;
 
     let secret_key = identity::load_or_generate(&dirs.config_dir().join("identity"))
         .context("failed to load or generate identity")?;
@@ -96,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
         backfill,
         registry,
         contacts,
+        settings,
         data_dir,
     };
 
@@ -173,6 +179,7 @@ struct Session {
     backfill: BackfillStore,
     registry: ChannelRegistry,
     contacts: Contacts,
+    settings: Settings,
     /// leyline's own data directory (`dirs.data_dir()`), needed so a
     /// `/save` with no resolvable OS Downloads folder still has somewhere
     /// to fall back to -- see `files::downloads_dir`.
@@ -200,6 +207,19 @@ fn announce_history(net: &Net, backfill: &BackfillStore, channel: &str) {
     }
 }
 
+/// Rings the terminal bell (ASCII BEL) to signal a newly-arrived message --
+/// see `AppState::bell_enabled`, toggled via `/bell` and persisted through
+/// settings.rs. A plain control byte, so it's safe to write straight to
+/// stdout even with `ratatui::init()` owning the alternate screen: it
+/// doesn't move the cursor or draw anything, and it's entirely up to the
+/// terminal emulator how (or whether) to actually alert -- the same as a
+/// shell's `printf '\a'`. Best-effort: a failed write here isn't worth
+/// surfacing, unlike a storage/backfill error.
+fn ring_bell() {
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(b"\x07").and_then(|()| stdout.flush());
+}
+
 /// The "snappy async event loop": crossterm's async `EventStream` and the
 /// network's `NetEvent`s merged via `tokio::select!`, redrawing only when
 /// something actually changed -- see concept.md's "snappy async event
@@ -214,11 +234,13 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
         backfill,
         mut registry,
         mut contacts,
+        mut settings,
         data_dir,
     } = session;
 
     let mut app = AppState::new(net.our_id, joined_channels.clone(), &active_channel);
     app.load_contacts(contacts.all());
+    app.load_settings(settings.bell_enabled());
     for name in &joined_channels {
         // Ensures a brand-new channel ("general" on a first run, or a
         // `--join` ticket's channel) lands in the registry, so it's
@@ -350,6 +372,11 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                             }
                             Some(InputAction::Paste(channel)) => {
                                 net.paste(channel);
+                            }
+                            Some(InputAction::Bell(enabled)) => {
+                                if let Err(err) = settings.set_bell_enabled(enabled) {
+                                    warn!("failed to persist bell setting: {err}");
+                                }
                             }
                             None => {}
                         }
@@ -500,6 +527,9 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                             }
                             if let Err(err) = backfill.record_message(&channel, &message).await {
                                 warn!(%channel, "failed to record received message for backfill: {err}");
+                            }
+                            if app.bell_enabled {
+                                ring_bell();
                             }
                         }
                     }
