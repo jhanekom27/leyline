@@ -4,6 +4,7 @@
 //! where a peer's announced filename turns into an actual, safe path on
 //! disk, and where "where did it go" gets answered with zero configuration.
 
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 /// Subfolder created under the OS Downloads directory (or the fallback
@@ -51,9 +52,8 @@ pub fn resolve_destination(dir: &Path, filename: &str) -> std::io::Result<PathBu
     std::fs::create_dir_all(dir)?;
 
     let safe_name = sanitize_filename(filename);
-    let candidate = dir.join(&safe_name);
-    if !candidate.exists() {
-        return Ok(candidate);
+    if let Some(path) = try_claim(dir, &safe_name)? {
+        return Ok(path);
     }
 
     let name_path = Path::new(&safe_name);
@@ -68,15 +68,41 @@ pub fn resolve_destination(dir: &Path, filename: &str) -> std::io::Result<PathBu
             Some(ext) => format!("{stem} ({attempt}).{ext}"),
             None => format!("{stem} ({attempt})"),
         };
-        let candidate = dir.join(candidate_name);
-        if !candidate.exists() {
-            return Ok(candidate);
+        if let Some(path) = try_claim(dir, &candidate_name)? {
+            return Ok(path);
         }
     }
     Err(std::io::Error::other(format!(
         "could not find a free name for {safe_name:?} in {}",
         dir.display()
     )))
+}
+
+/// Atomically claims `dir.join(name)` as a destination by creating an
+/// empty placeholder file there -- but only if nothing exists at that path
+/// yet (`create_new`). Returns `None` (not an error) if the name is
+/// already taken, so the caller moves on to the next candidate instead.
+///
+/// This closes a real race a plain "does it exist?" check leaves open:
+/// two `/save`s resolving a destination at (nearly) the same time can
+/// otherwise both see a name as free and both write to it, one silently
+/// clobbering the other -- confirmed by racing concurrent saves of the
+/// same file, which without this landed two different downloads on the
+/// exact same path. The placeholder gets overwritten with the real bytes
+/// once the download finishes (`net::Net::save_file`'s export), or
+/// removed if the download fails instead (same place), so a failed save
+/// never leaves a stray empty file behind. One tradeoff: since the
+/// destination now always already exists as this empty placeholder,
+/// iroh-blobs' reflink/copy-on-write fast path for the export never
+/// applies (it requires the target to be absent) -- falling back to a
+/// plain byte copy every time, which is a fine trade for closing the race.
+fn try_claim(dir: &Path, name: &str) -> std::io::Result<Option<PathBuf>> {
+    let path = dir.join(name);
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(_) => Ok(Some(path)),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 /// Formats a byte count for display, e.g. `2.1 MB`. Binary (1024-based)
@@ -176,6 +202,44 @@ mod tests {
         let path = resolve_destination(dir.path(), "../../etc/passwd").unwrap();
 
         assert_eq!(path, dir.path().join("passwd"));
+    }
+
+    #[test]
+    fn resolve_destination_leaves_an_empty_placeholder_at_the_claimed_path() {
+        // The whole point of claiming atomically: the returned path must
+        // already exist (as an empty file) the moment resolve_destination
+        // returns, not just "be free at the time of the check" -- that gap
+        // is exactly what let two concurrent /save calls race onto the
+        // same name before this.
+        let dir = tempfile::tempdir().unwrap();
+        let path = resolve_destination(dir.path(), "report.pdf").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn try_claim_prevents_a_second_concurrent_caller_from_getting_the_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = try_claim(dir.path(), "report.pdf").unwrap();
+        let second = try_claim(dir.path(), "report.pdf").unwrap();
+        assert!(first.is_some());
+        assert!(
+            second.is_none(),
+            "a second claim for the same name must not succeed while the first still holds it"
+        );
+    }
+
+    #[test]
+    fn resolve_destination_moves_past_a_claimed_but_still_empty_placeholder() {
+        // Simulates a save already in flight (claimed, not yet written):
+        // a second resolve_destination for the same filename must not
+        // reuse it, even though it looks identical to a genuinely empty
+        // downloaded file.
+        let dir = tempfile::tempdir().unwrap();
+        try_claim(dir.path(), "report.pdf").unwrap();
+
+        let path = resolve_destination(dir.path(), "report.pdf").unwrap();
+
+        assert_eq!(path, dir.path().join("report (1).pdf"));
     }
 
     #[test]
