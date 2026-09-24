@@ -31,6 +31,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/join <name|ticket>",
     "/invite",
     "/leave [channel]",
+    "/who",
     "/alias <hex> <name>",
     "/nick <name>",
     "/hints",

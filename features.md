@@ -58,9 +58,11 @@ mechanisms, not one, since they trade off differently:
   (`storage.rs`) and backfill manifest (`backfill.rs`), so a later rejoin
   under the same display name never inherits an unrelated room's history.
   Refuses to leave your only remaining channel.
-- [ ] **`/who`** -- list full endpoint ids (plus any alias) for the active
-  channel's peers; today the header only shows a count and the sidebar
-  only a 4-byte hex prefix.
+- [x] **`/who`** -- lists the active channel's peers with their full
+  endpoint id, broadcast nickname, and local alias, each shown
+  explicitly (unlike `display_name`'s blended, one-string precedence
+  order used elsewhere); previously the header only showed a count and
+  the sidebar only a 4-byte hex prefix.
 - [ ] **Last-seen timestamps** -- presence is purely ephemeral today
   (`NeighborUp`/`NeighborDown`, concept.md's "Presence" section).
   Persisting "last seen at T" per peer per channel would let offline

@@ -145,6 +145,7 @@ Typed into the message box and submitted with `Enter`:
 | `/invite` | Show the active channel's invite ticket in the transcript (and copy it to your clipboard, if one is available) to share with others |
 | `/leave` | Leave the active channel |
 | `/leave <channel-name>` | Leave a specific joined channel without switching to it |
+| `/who` | List the active channel's peers, showing each one's full endpoint id, broadcast nickname (if any), and local alias (if any) |
 | `/alias <hex-prefix> <name>` | Assign a local pet name to the peer whose endpoint id starts with `<hex-prefix>`, shown in place of their hex id from then on (local only, never sent to peers) |
 | `/nick <name>` | Broadcast a chosen display name to every joined channel (spoofable -- shown as `name (hex-prefix)` until you `/alias` that peer) |
 | `/hints` | Toggle the sidebar's command hints panel on or off |

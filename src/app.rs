@@ -487,6 +487,7 @@ impl AppState {
             "alias" => self.run_alias(arg.trim()),
             "nick" => self.run_nick(arg.trim()),
             "leave" => self.run_leave(arg.trim()),
+            "who" => self.run_who(),
             "hints" => self.run_hints(),
             "help" => self.run_help(),
             _ => {
@@ -502,7 +503,7 @@ impl AppState {
     /// detail actually lives.
     fn run_help(&mut self) -> Option<InputAction> {
         self.push_system(
-            "commands: /join <name|ticket>, /invite, /leave [channel], \
+            "commands: /join <name|ticket>, /invite, /leave [channel], /who, \
              /alias <hex-prefix> <name>, /nick <name>, /hints, /help -- \
              keys: Tab/Shift+Tab switch channels, Up/Down scroll, Esc/Ctrl+C quit",
         );
@@ -591,6 +592,51 @@ impl AppState {
             return None;
         }
         Some(InputAction::Leave(target))
+    }
+
+    /// Handles `/who`: lists the active channel's current peers, one per
+    /// system notice, each showing their full endpoint id plus their
+    /// broadcast nickname and/or local alias if set (see `who_line`).
+    /// Unlike `display_name`, which blends petname/nickname/hex-prefix
+    /// into a single string with a precedence order for compact display
+    /// elsewhere, `/who` exists specifically to show all three fields
+    /// explicitly (features.md's "`/who`" entry). Takes no argument --
+    /// like `/invite`, it always reports on the active channel. Purely
+    /// local, like `/hints`/`/help`: no `InputAction` needed.
+    fn run_who(&mut self) -> Option<InputAction> {
+        let channel = self.active();
+        let name = channel.name.clone();
+        let peers = channel.peers.clone();
+        if peers.is_empty() {
+            self.push_system(format!("no peers currently in #{name}"));
+            return None;
+        }
+        self.push_system(format!("peers in #{name} ({}):", peers.len()));
+        for id in &peers {
+            let line = self.who_line(id);
+            self.push_system(line);
+        }
+        None
+    }
+
+    /// Formats one `/who` line for `id`: its full hex id, plus `nickname:
+    /// <n>` and/or `alias: <a>` in parentheses for whichever of
+    /// `nicknames`/`petnames` actually have an entry for it -- both are
+    /// shown when both are set, and neither is invented when absent,
+    /// unlike `display_name`'s single-string fallback chain.
+    fn who_line(&self, id: &[u8; 32]) -> String {
+        let mut details = Vec::new();
+        if let Some(nickname) = self.nicknames.get(id) {
+            details.push(format!("nickname: {nickname}"));
+        }
+        if let Some(alias) = self.petnames.get(id) {
+            details.push(format!("alias: {alias}"));
+        }
+        if details.is_empty() {
+            hex_id(id)
+        } else {
+            format!("{} ({})", hex_id(id), details.join(", "))
+        }
     }
 
     /// Resolves a hex-prefix (case-insensitive, as typed after `/alias`)
@@ -770,6 +816,7 @@ mod tests {
 
     const SELF_ID: [u8; 32] = [9; 32];
     const PEER_ID: [u8; 32] = [7; 32];
+    const PEER_ID_2: [u8; 32] = [8; 32];
 
     fn app() -> AppState {
         AppState::new(SELF_ID, vec!["general".to_string()], "general")
@@ -1361,6 +1408,99 @@ mod tests {
         assert!(action.is_none());
         let last = as_system(app.active().messages.back().unwrap());
         assert_eq!(last, "cannot leave your only channel");
+    }
+
+    #[test]
+    fn slash_who_reports_no_peers_when_channel_is_empty() {
+        let mut app = app();
+        let action = submit(&mut app, "/who");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "no peers currently in #general");
+    }
+
+    #[test]
+    fn slash_who_lists_a_peer_with_no_nickname_or_alias() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        let action = submit(&mut app, "/who");
+        assert!(action.is_none());
+        let messages: Vec<&TranscriptLine> = app.active().messages.iter().collect();
+        let len = messages.len();
+        assert_eq!(as_system(messages[len - 2]), "peers in #general (1):");
+        assert_eq!(as_system(messages[len - 1]), hex_id(&PEER_ID));
+    }
+
+    #[test]
+    fn slash_who_shows_nickname_when_set() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        app.handle_net_event(NetEvent::Identity(
+            "general".to_string(),
+            IdentityAnnounce {
+                sender: PEER_ID,
+                nickname: "alice".to_string(),
+            },
+        ));
+        submit(&mut app, "/who");
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, format!("{} (nickname: alice)", hex_id(&PEER_ID)));
+    }
+
+    #[test]
+    fn slash_who_shows_alias_when_set() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        app.load_contacts(HashMap::from([(PEER_ID, "Bob".to_string())]));
+        submit(&mut app, "/who");
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, format!("{} (alias: Bob)", hex_id(&PEER_ID)));
+    }
+
+    #[test]
+    fn slash_who_shows_both_nickname_and_alias_when_both_are_set() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        app.load_contacts(HashMap::from([(PEER_ID, "Bob".to_string())]));
+        app.handle_net_event(NetEvent::Identity(
+            "general".to_string(),
+            IdentityAnnounce {
+                sender: PEER_ID,
+                nickname: "alice".to_string(),
+            },
+        ));
+        submit(&mut app, "/who");
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(
+            last,
+            format!("{} (nickname: alice, alias: Bob)", hex_id(&PEER_ID))
+        );
+    }
+
+    #[test]
+    fn slash_who_lists_every_peer_in_the_active_channel() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID_2));
+        submit(&mut app, "/who");
+        let messages: Vec<&TranscriptLine> = app.active().messages.iter().collect();
+        let len = messages.len();
+        assert_eq!(as_system(messages[len - 3]), "peers in #general (2):");
+        assert_eq!(as_system(messages[len - 2]), hex_id(&PEER_ID));
+        assert_eq!(as_system(messages[len - 1]), hex_id(&PEER_ID_2));
+    }
+
+    #[test]
+    fn slash_who_only_lists_the_active_channels_peers() {
+        let mut app = multi_channel_app();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        assert_eq!(app.active().name, "random");
+        submit(&mut app, "/who");
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(
+            last, "no peers currently in #random",
+            "a peer in another joined channel must not show up"
+        );
     }
 
     #[test]
