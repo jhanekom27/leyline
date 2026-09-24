@@ -865,6 +865,12 @@ impl Net {
                         .await;
                 }
                 Err(err) => {
+                    // `destination` was already claimed as an empty
+                    // placeholder by `files::resolve_destination` before
+                    // this task started (so concurrent saves can't race
+                    // onto the same name) -- clean it up on failure so a
+                    // failed save doesn't leave a stray empty file behind.
+                    let _ = std::fs::remove_file(&destination);
                     let _ = events_tx
                         .send(NetEvent::FileSaveFailed {
                             filename,

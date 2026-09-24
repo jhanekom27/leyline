@@ -446,36 +446,29 @@ impl AppState {
                 self.nicknames.insert(identity.sender, identity.nickname);
                 None
             }
-            // A `/send`ed file failed to import -- see `net::Net::send_file`.
-            NetEvent::FileSendFailed { path, error } => {
-                self.push_system(format!("failed to send {path}: {error}"));
-                None
-            }
             // A `/save`d file finished downloading -- see
             // `net::Net::save_file`.
             NetEvent::FileSaved { filename, path } => {
                 self.push_system(format!("saved {filename} to {}", path.display()));
                 None
             }
-            // A `/save`d file failed to download or write to disk -- see
-            // `net::Net::save_file`.
-            NetEvent::FileSaveFailed { filename, error } => {
-                self.push_system(format!("failed to save {filename}: {error}"));
-                None
-            }
             // Handled in main.rs before reaching here: `Announce` triggers
             // `Net::sync_history`, `HistoryFetched`'s payload goes through
             // `merge_history` above, `PeerAddressLearned` is persisted to
-            // the channel registry (see channel_registry.rs), and
-            // `FileReady` broadcasts and persists a finished `/send`
-            // before placing it in the transcript via
-            // `record_sent_message`. All four are network-sync/send
-            // bookkeeping, not transcript or presence state handled here
+            // the channel registry (see channel_registry.rs), `FileReady`
+            // broadcasts and persists a finished `/send` before placing it
+            // in the transcript via `record_sent_message`, and
+            // `FileSendFailed`/`FileSaveFailed` are also logged there via
+            // `tracing::warn!` (unlike the other system notices here, a
+            // failed file transfer is worth a trace in leyline.log too).
+            // None of these are transcript or presence state handled here
             // directly.
             NetEvent::Announce(..)
             | NetEvent::HistoryFetched(..)
             | NetEvent::PeerAddressLearned(..)
-            | NetEvent::FileReady(..) => None,
+            | NetEvent::FileReady(..)
+            | NetEvent::FileSendFailed { .. }
+            | NetEvent::FileSaveFailed { .. } => None,
         }
     }
 
@@ -836,11 +829,14 @@ impl AppState {
             return None;
         }
         match self.resolve_attachment(arg) {
-            Ok((hash, filename, sender)) => Some(InputAction::SaveFile {
-                hash,
-                filename,
-                sender,
-            }),
+            Ok((hash, filename, sender)) => {
+                self.push_system(format!("saving {filename}..."));
+                Some(InputAction::SaveFile {
+                    hash,
+                    filename,
+                    sender,
+                })
+            }
             Err(err) => {
                 self.push_system(err);
                 None
@@ -2278,6 +2274,8 @@ mod tests {
             }
             _ => panic!("expected InputAction::SaveFile"),
         }
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "saving report.pdf...");
     }
 
     #[test]
@@ -2352,14 +2350,23 @@ mod tests {
     }
 
     #[test]
-    fn file_send_failed_pushes_a_system_notice() {
+    fn file_send_failed_and_save_failed_are_a_no_op_here() {
+        // Both are handled in main.rs instead (which also logs them via
+        // tracing::warn!, unlike a plain push_system) -- see
+        // handle_net_event's doc comment.
         let mut app = app();
+        let before = app.active().messages.len();
+
         app.handle_net_event(NetEvent::FileSendFailed {
             path: "/tmp/missing.pdf".to_string(),
             error: "no such file".to_string(),
         });
-        let last = as_system(app.active().messages.back().unwrap());
-        assert!(last.contains("/tmp/missing.pdf") && last.contains("no such file"));
+        app.handle_net_event(NetEvent::FileSaveFailed {
+            filename: "report.pdf".to_string(),
+            error: "boom".to_string(),
+        });
+
+        assert_eq!(app.active().messages.len(), before);
     }
 
     #[test]

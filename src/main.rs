@@ -396,6 +396,22 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                             warn!(%channel, "failed to persist known peer address: {err}");
                         }
                     }
+                    // A `/send`ed file failed to import -- see
+                    // `net::Net::send_file`. Logged (unlike most other
+                    // system notices, which app.rs pushes on its own)
+                    // since it's a user-triggered action worth a trace in
+                    // leyline.log for later debugging.
+                    NetEvent::FileSendFailed { path, error } => {
+                        warn!(%path, "failed to send file: {error}");
+                        app.push_system(format!("failed to send {path}: {error}"));
+                    }
+                    // A `/save`d file failed to download or write to disk
+                    // -- see `net::Net::save_file`. Logged for the same
+                    // reason as `FileSendFailed` above.
+                    NetEvent::FileSaveFailed { filename, error } => {
+                        warn!(%filename, "failed to save file: {error}");
+                        app.push_system(format!("failed to save {filename}: {error}"));
+                    }
                     // A `/send`ed file finished importing and is ready to
                     // broadcast -- see `net::Net::send_file`. Broadcasting
                     // here (rather than inside `send_file` itself) keeps
