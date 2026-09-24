@@ -76,10 +76,12 @@ mechanisms, not one, since they trade off differently:
 
 ## Files & rich content
 
-- [ ] **File sharing** -- `iroh-blobs` is already wired up for history
+- [x] **File sharing** -- `iroh-blobs` is already wired up for history
   backfill (`backfill.rs`); the same blob transport generalizes to
   `/send <path>`, broadcasting a content hash + filename that peers fetch
-  on demand, the same way a history manifest is fetched today.
+  on demand (`/save <hash-prefix>`), the same way a history manifest is
+  fetched today. Receiving never downloads anything automatically; a saved
+  file always lands in the OS Downloads folder (`files.rs`).
 - [ ] **Clipboard paste-to-share** -- extend the existing `arboard`
   integration (currently only used to copy outgoing invite tickets) to
   accept incoming paste too, e.g. pasting an image shares it as a blob.

@@ -110,6 +110,7 @@ pub struct ChatMessage {
                            // verify/display without an extra lookup
     pub ts_unix_ms: u64,
     pub text: String,
+    pub attachment: Option<FileAttachment>, // a /send'd file, if any
 }
 ```
 
@@ -224,4 +225,5 @@ src/
   storage.rs          // local per-channel message log persistence
   search.rs           // shared match predicate + on-disk scan for /search
   backfill.rs         // iroh-blobs history manifests for offline backfill
+  files.rs            // /save destination resolution, filename safety, sizes
 ```

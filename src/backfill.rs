@@ -218,7 +218,10 @@ impl BackfillStore {
         let mut messages = Vec::with_capacity(manifest.len());
         for hash in manifest.iter() {
             match self.store.blobs().get_bytes(hash).await {
-                Ok(bytes) => match postcard::from_bytes::<ChatMessage>(&bytes) {
+                // `ChatMessage::decode` (not a plain `postcard::from_bytes`)
+                // so a peer still on an older build -- whose blobs predate
+                // `attachment` -- doesn't get silently dropped here.
+                Ok(bytes) => match ChatMessage::decode(&bytes) {
                     Ok(message) => messages.push(message),
                     Err(err) => warn!(%channel, "dropping malformed backfilled message: {err}"),
                 },
@@ -226,6 +229,50 @@ impl BackfillStore {
             }
         }
         Ok(messages)
+    }
+
+    /// Imports a local file into the shared blob store for `/send` -- see
+    /// features.md's "File sharing" idea. Streamed from disk (no need to
+    /// buffer the whole file in memory); the original file at `path` is
+    /// left untouched, though its bytes are copied into this store's own
+    /// directory, the same tradeoff already accepted above for
+    /// message/manifest blobs.
+    pub async fn add_file(&self, path: &Path) -> anyhow::Result<Hash> {
+        let tag = self
+            .store
+            .blobs()
+            .add_path(path)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to import {}: {err}", path.display()))?;
+        Ok(tag.hash)
+    }
+
+    /// Fetches a single file blob from `sender` and writes it straight to
+    /// `destination` -- the `/save` counterpart to `add_file`, using the
+    /// same pull-on-demand downloader as `fetch` above, just for one raw
+    /// blob instead of a history manifest.
+    pub async fn fetch_file(
+        &self,
+        endpoint: &Endpoint,
+        hash: Hash,
+        sender: [u8; 32],
+        destination: &Path,
+    ) -> anyhow::Result<()> {
+        let sender_id = EndpointId::from_bytes(&sender)
+            .map_err(|err| anyhow::anyhow!("invalid sender id: {err}"))?;
+
+        self.store
+            .downloader(endpoint)
+            .download(HashAndFormat::raw(hash), vec![sender_id])
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to download file: {err}"))?;
+
+        self.store
+            .blobs()
+            .export(hash, destination)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to write {}: {err}", destination.display()))?;
+        Ok(())
     }
 }
 
@@ -240,6 +287,7 @@ mod tests {
             sender: [1; 32],
             ts_unix_ms,
             text: text.to_string(),
+            attachment: None,
         }
     }
 

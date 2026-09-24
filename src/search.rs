@@ -49,6 +49,19 @@ pub fn matches(text: &str, term_lower: &str) -> bool {
     text.to_lowercase().contains(term_lower)
 }
 
+/// Whether `message` matches `term_lower` for the purposes of `/search`:
+/// its text, or -- since a file share's `text` is typically empty -- its
+/// attachment's filename, if it has one. The one definition of "does this
+/// message match", shared by `app::Channel::search_loaded` (the in-memory
+/// scan) and `run_on_disk_scan` below.
+pub fn message_matches(message: &ChatMessage, term_lower: &str) -> bool {
+    matches(&message.text, term_lower)
+        || message
+            .attachment
+            .as_ref()
+            .is_some_and(|attachment| matches(&attachment.filename, term_lower))
+}
+
 /// Scans `channel`'s full on-disk log (`storage::MessageStore::load`) for
 /// messages matching `term`, oldest first. Synchronous -- the caller
 /// (main.rs) is expected to run this inside a `tokio::task::spawn_blocking`,
@@ -64,7 +77,7 @@ pub fn run_on_disk_scan(store: &MessageStore, channel: &str, term: &str) -> Sear
     let messages = match store.load(channel) {
         Ok(all) => all
             .into_iter()
-            .filter(|message| matches(&message.text, &term_lower))
+            .filter(|message| message_matches(message, &term_lower))
             .collect(),
         Err(err) => {
             warn!(%channel, "search failed to read on-disk history: {err}");
@@ -89,6 +102,22 @@ mod tests {
             sender: [1; 32],
             ts_unix_ms: id,
             text: text.to_string(),
+            attachment: None,
+        }
+    }
+
+    fn file_message(id: u64, filename: &str) -> ChatMessage {
+        ChatMessage {
+            v: 2,
+            id,
+            sender: [1; 32],
+            ts_unix_ms: id,
+            text: String::new(),
+            attachment: Some(crate::message::FileAttachment {
+                filename: filename.to_string(),
+                size: 0,
+                hash: iroh_blobs::Hash::new(filename.as_bytes()),
+            }),
         }
     }
 
@@ -142,6 +171,28 @@ mod tests {
         store.append("random", &message(2, "match me too")).unwrap();
 
         let outcome = run_on_disk_scan(&store, "general", "match");
+
+        assert_eq!(outcome.messages.len(), 1);
+        assert_eq!(outcome.messages[0].id, 1);
+    }
+
+    #[test]
+    fn message_matches_finds_a_captionless_files_name() {
+        let shared = file_message(1, "vacation-photo.png");
+        assert!(message_matches(&shared, "vacation"));
+        assert!(!message_matches(&shared, "nonexistent"));
+    }
+
+    #[test]
+    fn run_on_disk_scan_finds_a_shared_files_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MessageStore::new(dir.path().to_path_buf()).unwrap();
+        store
+            .append("general", &file_message(1, "vacation-photo.png"))
+            .unwrap();
+        store.append("general", &message(2, "unrelated")).unwrap();
+
+        let outcome = run_on_disk_scan(&store, "general", "vacation");
 
         assert_eq!(outcome.messages.len(), 1);
         assert_eq!(outcome.messages[0].id, 1);

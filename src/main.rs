@@ -2,6 +2,7 @@ mod app;
 mod backfill;
 mod channel_registry;
 mod contacts;
+mod files;
 mod identity;
 mod message;
 mod net;
@@ -11,6 +12,7 @@ mod ticket;
 mod ui;
 
 use std::fs::OpenOptions;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -26,6 +28,7 @@ use app::{AppState, InputAction};
 use backfill::BackfillStore;
 use channel_registry::ChannelRegistry;
 use contacts::Contacts;
+use files::{downloads_dir, resolve_destination};
 use net::{Net, NetEvent};
 use search::{SearchOutcome, run_on_disk_scan};
 use storage::MessageStore;
@@ -34,6 +37,7 @@ use storage::MessageStore;
 async fn main() -> anyhow::Result<()> {
     let dirs = project_dirs()?;
     init_logging(&dirs)?;
+    let data_dir = dirs.data_dir().to_path_buf();
 
     let store = MessageStore::new(dirs.data_dir().join("messages"))
         .context("failed to initialize message storage")?;
@@ -89,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
         backfill,
         registry,
         contacts,
+        data_dir,
     };
 
     let mut terminal = ratatui::init();
@@ -158,6 +163,10 @@ struct Session {
     backfill: BackfillStore,
     registry: ChannelRegistry,
     contacts: Contacts,
+    /// leyline's own data directory (`dirs.data_dir()`), needed so a
+    /// `/save` with no resolvable OS Downloads folder still has somewhere
+    /// to fall back to -- see `files::downloads_dir`.
+    data_dir: PathBuf,
 }
 
 /// How often each joined channel with any recorded history re-announces its
@@ -195,6 +204,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
         backfill,
         mut registry,
         mut contacts,
+        data_dir,
     } = session;
 
     let mut app = AppState::new(net.our_id, joined_channels.clone(), &active_channel);
@@ -310,6 +320,24 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                                     let _ = search_tx.blocking_send(outcome);
                                 });
                             }
+                            Some(InputAction::SendFile { channel, path }) => {
+                                if let Some(message) = net.send_file(channel, path) {
+                                    app.push_system(message);
+                                }
+                            }
+                            Some(InputAction::SaveFile { hash, filename, sender }) => {
+                                let destination_dir = downloads_dir(&data_dir);
+                                match resolve_destination(&destination_dir, &filename) {
+                                    Ok(destination) => {
+                                        net.save_file(hash, filename, sender, destination);
+                                    }
+                                    Err(err) => {
+                                        app.push_system(format!(
+                                            "failed to save {filename}: {err}"
+                                        ));
+                                    }
+                                }
+                            }
                             None => {}
                         }
                         dirty = true;
@@ -367,6 +395,22 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                         if let Err(err) = registry.record_peer(&channel, addr) {
                             warn!(%channel, "failed to persist known peer address: {err}");
                         }
+                    }
+                    // A `/send`ed file finished importing and is ready to
+                    // broadcast -- see `net::Net::send_file`. Broadcasting
+                    // here (rather than inside `send_file` itself) keeps
+                    // every locally-authored message going out through the
+                    // same `net.send` call, the same way `InputAction::Send`
+                    // above does for typed text.
+                    NetEvent::FileReady(channel, message) => {
+                        net.send(&channel, message.clone());
+                        if let Err(err) = store.append(&channel, &message) {
+                            warn!(%channel, "failed to persist sent file: {err}");
+                        }
+                        if let Err(err) = backfill.record_message(&channel, &message).await {
+                            warn!(%channel, "failed to record sent file for backfill: {err}");
+                        }
+                        app.record_sent_message(&channel, message);
                     }
                     other => {
                         if let Some((channel, message)) = app.handle_net_event(other) {

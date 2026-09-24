@@ -7,11 +7,12 @@
 //! caller should do, rather than reaching for I/O itself.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use iroh_blobs::Hash;
 
-use crate::message::ChatMessage;
+use crate::message::{ChatMessage, now_unix_ms};
 use crate::net::NetEvent;
 use crate::search::{self, SearchOutcome, SearchResults};
 
@@ -106,7 +107,7 @@ impl Channel {
         self.messages
             .iter()
             .filter_map(|line| match line {
-                TranscriptLine::Chat(message) if search::matches(&message.text, term_lower) => {
+                TranscriptLine::Chat(message) if search::message_matches(message, term_lower) => {
                     Some(message.clone())
                 }
                 _ => None,
@@ -147,6 +148,20 @@ pub enum InputAction {
     /// `run_search`) -- see `search::run_on_disk_scan`,
     /// `AppState::apply_search_outcome`, and main.rs.
     Search { channel: String, term: String },
+    /// Share a local file with `channel` -- `path` exactly as typed after
+    /// `/send ` (see `run_send`). The caller (`net::Net::send_file`)
+    /// validates and imports it; app.rs never touches the filesystem.
+    SendFile { channel: String, path: String },
+    /// Fetch a previously shared file and save it locally -- `hash`,
+    /// `filename`, and `sender` already resolved from a typed hash-prefix
+    /// by `run_save` (see `resolve_attachment`). The caller
+    /// (`net::Net::save_file`) picks the destination and performs the
+    /// download; app.rs never touches the filesystem.
+    SaveFile {
+        hash: Hash,
+        filename: String,
+        sender: [u8; 32],
+    },
 }
 
 /// All state needed to render the TUI and respond to input.
@@ -431,15 +446,36 @@ impl AppState {
                 self.nicknames.insert(identity.sender, identity.nickname);
                 None
             }
+            // A `/send`ed file failed to import -- see `net::Net::send_file`.
+            NetEvent::FileSendFailed { path, error } => {
+                self.push_system(format!("failed to send {path}: {error}"));
+                None
+            }
+            // A `/save`d file finished downloading -- see
+            // `net::Net::save_file`.
+            NetEvent::FileSaved { filename, path } => {
+                self.push_system(format!("saved {filename} to {}", path.display()));
+                None
+            }
+            // A `/save`d file failed to download or write to disk -- see
+            // `net::Net::save_file`.
+            NetEvent::FileSaveFailed { filename, error } => {
+                self.push_system(format!("failed to save {filename}: {error}"));
+                None
+            }
             // Handled in main.rs before reaching here: `Announce` triggers
             // `Net::sync_history`, `HistoryFetched`'s payload goes through
-            // `merge_history` above, and `PeerAddressLearned` is persisted
-            // to the channel registry (see channel_registry.rs). All three
-            // are network-sync/reconnection bookkeeping, not transcript or
-            // presence state.
+            // `merge_history` above, `PeerAddressLearned` is persisted to
+            // the channel registry (see channel_registry.rs), and
+            // `FileReady` broadcasts and persists a finished `/send`
+            // before placing it in the transcript via
+            // `record_sent_message`. All four are network-sync/send
+            // bookkeeping, not transcript or presence state handled here
+            // directly.
             NetEvent::Announce(..)
             | NetEvent::HistoryFetched(..)
-            | NetEvent::PeerAddressLearned(..) => None,
+            | NetEvent::PeerAddressLearned(..)
+            | NetEvent::FileReady(..) => None,
         }
     }
 
@@ -472,6 +508,23 @@ impl AppState {
             self.active = self.active.min(self.channels.len().saturating_sub(1));
         }
         self.push_system(format!("left #{channel}"));
+    }
+
+    /// Places a locally-authored message (currently only a finished
+    /// `/send`, via `NetEvent::FileReady`) into `channel`'s transcript,
+    /// deduped the same way an incoming message is -- called by main.rs
+    /// once it has broadcast and persisted the message, since its content
+    /// (the file's hash) isn't known until the background import
+    /// finishes. Unlike `handle_net_event`'s `Received` case, never marks
+    /// the channel unread -- there's no point notifying yourself about
+    /// your own successfully sent file. A no-op if `channel` isn't
+    /// currently joined.
+    pub fn record_sent_message(&mut self, channel: &str, message: ChatMessage) {
+        if let Some(channel) = self.channel_mut(channel)
+            && channel.remember_seen(message.id)
+        {
+            channel.push(TranscriptLine::Chat(message));
+        }
     }
 
     /// Displays a sender as "you" for our own id; their pet name if one
@@ -553,6 +606,8 @@ impl AppState {
             "nick" => self.run_nick(arg.trim()),
             "leave" => self.run_leave(arg.trim()),
             "who" => self.run_who(),
+            "send" => self.run_send(arg.trim()),
+            "save" => self.run_save(arg.trim()),
             "search" | "s" => self.run_search(arg.trim()),
             "hints" => self.run_hints(),
             "help" => self.run_help(),
@@ -570,9 +625,9 @@ impl AppState {
     fn run_help(&mut self) -> Option<InputAction> {
         self.push_system(
             "commands: /join <name|ticket>, /invite, /leave [channel], /who, \
-             /alias <hex-prefix> <name>, /nick <name>, /search <term> (or \
-             /s), /hints, /help -- keys: Tab/Shift+Tab switch channels, \
-             Up/Down scroll, Esc/Ctrl+C quit",
+             /send <path>, /save <hash-prefix>, /alias <hex-prefix> <name>, \
+             /nick <name>, /search <term> (or /s), /hints, /help -- keys: \
+             Tab/Shift+Tab switch channels, Up/Down scroll, Esc/Ctrl+C quit",
         );
         None
     }
@@ -745,6 +800,51 @@ impl AppState {
         })
     }
 
+    /// Handles `/send <path>`: `arg` is everything after `/send ` (already
+    /// trimmed), naming a local file to share with the active channel.
+    /// Only checks that a path was given -- app.rs never touches the
+    /// filesystem (see this module's doc comment), so the path itself is
+    /// validated by the caller (`net::Net::send_file`) once this returns.
+    /// Pushes an immediate breadcrumb since importing and broadcasting a
+    /// file happens in the background and may take a moment.
+    fn run_send(&mut self, arg: &str) -> Option<InputAction> {
+        if arg.is_empty() {
+            self.push_system("usage: /send <path>");
+            return None;
+        }
+        let name = Path::new(arg)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| arg.to_string());
+        self.push_system(format!("sending {name}..."));
+        Some(InputAction::SendFile {
+            channel: self.active().name.clone(),
+            path: arg.to_string(),
+        })
+    }
+
+    /// Handles `/save <hash-prefix>`: `arg` is everything after `/save `
+    /// (already trimmed), naming (a prefix of) a file previously shared in
+    /// any joined channel -- see `resolve_attachment`. Mirrors `/alias`'s
+    /// hex-prefix resolution for a consistent UX.
+    fn run_save(&mut self, arg: &str) -> Option<InputAction> {
+        if arg.is_empty() {
+            self.push_system("usage: /save <hash-prefix>");
+            return None;
+        }
+        match self.resolve_attachment(arg) {
+            Ok((hash, filename, sender)) => Some(InputAction::SaveFile {
+                hash,
+                filename,
+                sender,
+            }),
+            Err(err) => {
+                self.push_system(err);
+                None
+            }
+        }
+    }
+
     /// Resolves a hex-prefix (case-insensitive, as typed after `/alias`)
     /// to exactly one id in `known_ids`. Errors with a user-facing message
     /// if the prefix isn't valid hex, matches no known id, or matches more
@@ -792,6 +892,53 @@ impl AppState {
         ids.sort();
         ids.dedup();
         ids
+    }
+
+    /// Resolves a hex-prefix (case-insensitive, as typed after `/save`) to
+    /// exactly one attachment in `known_attachments`, returning its hash,
+    /// filename, and original sender (who `/save` fetches from -- see
+    /// `net::Net::save_file`). Mirrors `resolve_id`'s errors for a
+    /// consistent UX: invalid hex, no match, or an ambiguous prefix.
+    fn resolve_attachment(&self, prefix: &str) -> Result<(Hash, String, [u8; 32]), String> {
+        let prefix = prefix.to_lowercase();
+        let valid_hex = !prefix.is_empty()
+            && prefix.len() <= 64
+            && prefix.chars().all(|c| c.is_ascii_hexdigit());
+        if !valid_hex {
+            return Err(format!("invalid hash prefix: {prefix}"));
+        }
+        let matches: Vec<(Hash, String, [u8; 32])> = self
+            .known_attachments()
+            .into_iter()
+            .filter(|(hash, _, _)| hash.to_hex().starts_with(&prefix))
+            .collect();
+        match matches.as_slice() {
+            [] => Err(format!("no known file matches '{prefix}'")),
+            [one] => Ok(one.clone()),
+            _ => Err(format!(
+                "'{prefix}' matches multiple files, use a longer prefix"
+            )),
+        }
+    }
+
+    /// Every file attachment `AppState` has seen in any joined channel's
+    /// transcript (including history loaded at startup), deduplicated by
+    /// hash -- i.e. everything `/save` could plausibly resolve. Mirrors
+    /// `known_ids`'s shape.
+    fn known_attachments(&self) -> Vec<(Hash, String, [u8; 32])> {
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for channel in &self.channels {
+            for line in &channel.messages {
+                if let TranscriptLine::Chat(message) = line
+                    && let Some(attachment) = &message.attachment
+                    && seen.insert(attachment.hash)
+                {
+                    result.push((attachment.hash, attachment.filename.clone(), message.sender));
+                }
+            }
+        }
+        result
     }
 
     fn char_count(&self) -> usize {
@@ -898,20 +1045,14 @@ pub fn hex_id(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 fn compose_message(sender: [u8; 32], text: &str) -> ChatMessage {
     ChatMessage {
-        v: 1,
+        v: 2,
         id: rand::random(),
         sender,
         ts_unix_ms: now_unix_ms(),
         text: text.to_string(),
+        attachment: None,
     }
 }
 
@@ -1754,6 +1895,22 @@ mod tests {
             sender,
             ts_unix_ms,
             text: text.to_string(),
+            attachment: None,
+        }
+    }
+
+    fn file_message(id: u64, sender: [u8; 32], filename: &str, content: &[u8]) -> ChatMessage {
+        ChatMessage {
+            v: 2,
+            id,
+            sender,
+            ts_unix_ms: id,
+            text: String::new(),
+            attachment: Some(crate::message::FileAttachment {
+                filename: filename.to_string(),
+                size: content.len() as u64,
+                hash: iroh_blobs::Hash::new(content),
+            }),
         }
     }
 
@@ -2029,5 +2186,167 @@ mod tests {
         assert!(app.active().search.is_none());
         let last = as_system(app.active().messages.back().unwrap());
         assert_eq!(last, "search cleared");
+    }
+
+    #[test]
+    fn slash_send_with_arg_returns_send_file_action_and_pushes_a_breadcrumb() {
+        let mut app = app();
+        let action = submit(&mut app, "/send /tmp/report.pdf");
+        match action.expect("non-empty /send returns an action") {
+            InputAction::SendFile { channel, path } => {
+                assert_eq!(channel, "general");
+                assert_eq!(path, "/tmp/report.pdf");
+            }
+            _ => panic!("expected InputAction::SendFile"),
+        }
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "sending report.pdf...");
+    }
+
+    #[test]
+    fn slash_send_without_arg_shows_usage_and_returns_none() {
+        let mut app = app();
+        let action = submit(&mut app, "/send");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.starts_with("usage:"), "got: {last}");
+    }
+
+    #[test]
+    fn slash_save_resolves_a_known_attachment_by_hash_prefix() {
+        let mut app = app();
+        let message = file_message(1, PEER_ID, "report.pdf", b"report contents");
+        let hash = message.attachment.as_ref().unwrap().hash;
+        app.handle_net_event(NetEvent::Received("general".to_string(), message));
+
+        let full_hash = hash.to_hex();
+        let action = submit(&mut app, &format!("/save {}", &full_hash[..8]));
+
+        match action.expect("a successful /save returns an action") {
+            InputAction::SaveFile {
+                hash: resolved_hash,
+                filename,
+                sender,
+            } => {
+                assert_eq!(resolved_hash, hash);
+                assert_eq!(filename, "report.pdf");
+                assert_eq!(sender, PEER_ID);
+            }
+            _ => panic!("expected InputAction::SaveFile"),
+        }
+    }
+
+    #[test]
+    fn slash_save_reports_an_error_for_an_unknown_prefix() {
+        let mut app = app();
+        let action = submit(&mut app, "/save ffffffff");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("no known file"), "got: {last}");
+    }
+
+    #[test]
+    fn slash_save_without_arg_shows_usage_and_returns_none() {
+        let mut app = app();
+        let action = submit(&mut app, "/save");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.starts_with("usage:"), "got: {last}");
+    }
+
+    #[test]
+    fn slash_save_rejects_a_non_hex_prefix() {
+        let mut app = app();
+        let action = submit(&mut app, "/save not-hex");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("invalid hash prefix"), "got: {last}");
+    }
+
+    #[test]
+    fn resolve_attachment_ignores_duplicate_sends_of_the_same_file() {
+        let mut app = app();
+        let message = file_message(1, PEER_ID, "report.pdf", b"same bytes");
+        let hash = message.attachment.as_ref().unwrap().hash;
+        // The same file, resent (e.g. to two different channels) -- must
+        // not turn into an "ambiguous prefix" error just because it shows
+        // up twice.
+        app.handle_net_event(NetEvent::Received("general".to_string(), message));
+        let resent = file_message(2, PEER_ID_2, "report.pdf", b"same bytes");
+        app.handle_net_event(NetEvent::Received("general".to_string(), resent));
+
+        let resolved = app.resolve_attachment(&hash.to_hex()[..8]).unwrap();
+
+        assert_eq!(resolved.0, hash);
+    }
+
+    #[test]
+    fn record_sent_message_places_the_message_without_marking_unread() {
+        let mut app = multi_channel_app();
+        app.active = 1; // "random" is active; "general" is not
+        let message = file_message(1, SELF_ID, "report.pdf", b"contents");
+
+        app.record_sent_message("general", message.clone());
+
+        assert_eq!(as_chat(app.channels[0].messages.back().unwrap()), &message);
+        assert!(
+            !app.channels[0].has_unread,
+            "a self-sent file shouldn't flag its channel unread"
+        );
+    }
+
+    #[test]
+    fn record_sent_message_dedupes_by_id() {
+        let mut app = app();
+        let message = file_message(1, SELF_ID, "report.pdf", b"contents");
+        app.record_sent_message("general", message.clone());
+
+        let before = app.active().messages.len();
+        app.record_sent_message("general", message);
+
+        assert_eq!(app.active().messages.len(), before);
+    }
+
+    #[test]
+    fn file_send_failed_pushes_a_system_notice() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::FileSendFailed {
+            path: "/tmp/missing.pdf".to_string(),
+            error: "no such file".to_string(),
+        });
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("/tmp/missing.pdf") && last.contains("no such file"));
+    }
+
+    #[test]
+    fn file_saved_pushes_a_system_notice_with_the_final_path() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::FileSaved {
+            filename: "report.pdf".to_string(),
+            path: std::path::PathBuf::from("/home/alice/Downloads/leyline/report.pdf"),
+        });
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(
+            last,
+            "saved report.pdf to /home/alice/Downloads/leyline/report.pdf"
+        );
+    }
+
+    #[test]
+    fn search_matches_an_attachments_filename() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::Received(
+            "general".to_string(),
+            file_message(1, PEER_ID, "vacation-photo.png", b"bytes"),
+        ));
+
+        submit(&mut app, "/search vacation");
+
+        let search = app
+            .active()
+            .search
+            .as_ref()
+            .expect("search should be active");
+        assert_eq!(search.messages.len(), 1);
     }
 }

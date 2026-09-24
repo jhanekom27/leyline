@@ -13,6 +13,7 @@ use ratatui::widgets::{
 use textwrap::wrap;
 
 use crate::app::{AppState, Channel, TranscriptLine, hex_id};
+use crate::files::human_size;
 use crate::message::ChatMessage;
 use crate::search::SearchResults;
 
@@ -34,6 +35,8 @@ const COMMAND_HINTS: &[&str] = &[
     "/invite",
     "/leave [channel]",
     "/who",
+    "/send <path>",
+    "/save <hash>",
     "/alias <hex> <name>",
     "/nick <name>",
     "/search <term> (/s)",
@@ -359,7 +362,9 @@ fn push_chat_rows(
     let name = fit_name(&app.display_name(&message.sender), NAME_WIDTH);
     let time = format_time(message.ts_unix_ms);
 
-    let mut wrapped = wrap(&message.text, layout.wrap_width);
+    let caption = attachment_caption(app, message);
+    let display_text = caption.as_deref().unwrap_or(&message.text);
+    let mut wrapped = wrap(display_text, layout.wrap_width);
     if wrapped.is_empty() {
         wrapped.push(std::borrow::Cow::Borrowed(""));
     }
@@ -383,6 +388,25 @@ fn push_chat_rows(
         ];
         spans.extend(highlighted_spans(chunk, term_lower));
         rows.push(Line::from(spans));
+    }
+}
+
+/// Builds the display line for a message's file attachment, if any --
+/// filename, human-readable size, and (for anyone else's message) the
+/// exact `/save` command to fetch it. Your own messages omit the hint
+/// since the file is already local. `None` for a plain text message, in
+/// which case `push_chat_rows` falls back to `message.text` unchanged.
+fn attachment_caption(app: &AppState, message: &ChatMessage) -> Option<String> {
+    let attachment = message.attachment.as_ref()?;
+    let size = human_size(attachment.size);
+    if message.sender == app.self_id {
+        Some(format!("shared {} ({size})", attachment.filename))
+    } else {
+        let hash_prefix = &attachment.hash.to_hex()[..8];
+        Some(format!(
+            "shared {} ({size}) -- /save {hash_prefix} to download",
+            attachment.filename
+        ))
     }
 }
 
@@ -626,5 +650,61 @@ mod tests {
             find_highlights("say hello", "hello"),
             vec![("say ".to_string(), false), ("hello".to_string(), true)]
         );
+    }
+
+    use crate::message::FileAttachment;
+
+    fn file_message(sender: [u8; 32], filename: &str, size: u64) -> ChatMessage {
+        ChatMessage {
+            v: 2,
+            id: 1,
+            sender,
+            ts_unix_ms: 0,
+            text: String::new(),
+            attachment: Some(FileAttachment {
+                filename: filename.to_string(),
+                size,
+                hash: iroh_blobs::Hash::new(filename.as_bytes()),
+            }),
+        }
+    }
+
+    #[test]
+    fn attachment_caption_includes_a_save_hint_for_someone_elses_file() {
+        let app = AppState::new([1; 32], vec!["general".to_string()], "general");
+        let message = file_message([2; 32], "report.pdf", 2_150_000);
+
+        let caption = attachment_caption(&app, &message).unwrap();
+
+        assert!(caption.contains("report.pdf"), "got: {caption}");
+        assert!(caption.contains("2.1 MB"), "got: {caption}");
+        assert!(caption.contains("/save"), "got: {caption}");
+    }
+
+    #[test]
+    fn attachment_caption_omits_the_save_hint_for_your_own_file() {
+        let self_id = [1; 32];
+        let app = AppState::new(self_id, vec!["general".to_string()], "general");
+        let message = file_message(self_id, "report.pdf", 10);
+
+        let caption = attachment_caption(&app, &message).unwrap();
+
+        assert!(caption.contains("report.pdf"));
+        assert!(!caption.contains("/save"), "got: {caption}");
+    }
+
+    #[test]
+    fn attachment_caption_is_none_for_a_plain_text_message() {
+        let app = AppState::new([1; 32], vec!["general".to_string()], "general");
+        let message = ChatMessage {
+            v: 2,
+            id: 1,
+            sender: [2; 32],
+            ts_unix_ms: 0,
+            text: "hello".to_string(),
+            attachment: None,
+        };
+
+        assert_eq!(attachment_caption(&app, &message), None);
     }
 }

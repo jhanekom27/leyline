@@ -123,7 +123,7 @@ fn decode_all(mut bytes: &[u8]) -> Vec<ChatMessage> {
             warn!("truncated message record in message log, ignoring remainder");
             break;
         };
-        match postcard::from_bytes::<ChatMessage>(payload) {
+        match ChatMessage::decode(payload) {
             Ok(message) => messages.push(message),
             Err(err) => {
                 warn!("dropping malformed message log entry: {err}");
@@ -146,6 +146,7 @@ mod tests {
             sender: [1; 32],
             ts_unix_ms: 0,
             text: text.to_string(),
+            attachment: None,
         }
     }
 
@@ -278,5 +279,28 @@ mod tests {
         file.write_all(&100u32.to_le_bytes()).unwrap();
 
         assert_eq!(store.load("general").unwrap(), vec![message]);
+    }
+
+    #[test]
+    fn load_still_works_for_a_record_persisted_before_attachments_existed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MessageStore::new(dir.path().to_path_buf()).unwrap();
+
+        // Byte-identical to what `append` would have written for a
+        // `ChatMessage` before `attachment` was added -- postcard encodes
+        // structs positionally, the same as a tuple of the same field
+        // types, so this stands in for a genuinely pre-upgrade record
+        // without reaching into message.rs's private `ChatMessageV1`.
+        let old_shape: (u8, u64, [u8; 32], u64, String) =
+            (1, 1, [1; 32], 0, "from before the upgrade".to_string());
+        let payload = postcard::to_stdvec(&old_shape).unwrap();
+        let mut record = Vec::new();
+        record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        record.extend_from_slice(&payload);
+        fs::write(store.path_for("general"), &record).unwrap();
+
+        let loaded = store.load("general").unwrap();
+
+        assert_eq!(loaded, vec![sample_message(1, "from before the upgrade")]);
     }
 }

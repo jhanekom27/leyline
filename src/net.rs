@@ -6,6 +6,7 @@
 //! name it came from, into the app's event loop over an `mpsc` channel.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,8 +29,16 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::backfill::BackfillStore;
-use crate::message::{ChatMessage, GossipPayload, HistoryAnnounce, IdentityAnnounce};
+use crate::message::{
+    ChatMessage, FileAttachment, GossipPayload, HistoryAnnounce, IdentityAnnounce, now_unix_ms,
+};
 use crate::ticket::{ChannelTicket, RoomSecret};
+
+/// Simple guardrail against an accidental huge `/send` (e.g. a mistyped
+/// path to a large video file): `BackfillStore::add_file` copies the file
+/// into the local blob store, so a sent file's bytes are duplicated on
+/// disk locally -- see net.rs's `send_file`.
+const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
 
 /// The channel every instance joins on startup.
 const DEFAULT_CHANNEL: &str = "general";
@@ -76,6 +85,19 @@ pub enum NetEvent {
     /// A history backfill fetch finished and decoded some messages, ready
     /// to be deduped, persisted, and merged into the transcript.
     HistoryFetched(String, Vec<ChatMessage>),
+    /// A `/send`ed file finished importing into the local blob store and
+    /// is ready to broadcast -- see `Net::send_file`. Carries the fully
+    /// composed message so the caller can broadcast, persist, and display
+    /// it exactly like an incoming one.
+    FileReady(String, ChatMessage),
+    /// A `/send`ed file failed to import -- see `Net::send_file`.
+    FileSendFailed { path: String, error: String },
+    /// A `/save`d file finished downloading and was written to disk --
+    /// see `Net::save_file`.
+    FileSaved { filename: String, path: PathBuf },
+    /// A `/save`d file failed to download or write to disk -- see
+    /// `Net::save_file`.
+    FileSaveFailed { filename: String, error: String },
 }
 
 /// A channel's gossip topic is derived from its private `RoomSecret`, not
@@ -717,6 +739,113 @@ impl Net {
                 }
                 Ok(_) => {}
                 Err(err) => warn!(%channel, "failed to sync history: {err}"),
+            }
+        });
+    }
+
+    /// Imports `path` into the shared blob store and prepares it to be
+    /// broadcast to `channel` as a `ChatMessage` with an attachment -- the
+    /// `/send` counterpart to `send`. Validates synchronously (existence,
+    /// that it's a file rather than a directory, a simple size cap, and
+    /// that a filename can be derived) so an obviously bad path is
+    /// reported immediately instead of after spawning work; the import
+    /// itself happens in a spawned task, reporting the outcome back as
+    /// `NetEvent::FileReady`/`FileSendFailed` since hashing a large file
+    /// can take a moment and must not block the caller's event loop.
+    /// Deliberately does *not* broadcast itself -- the caller (main.rs)
+    /// does that via `send` once it receives `FileReady`, the same place
+    /// every other locally-authored message is broadcast from.
+    pub fn send_file(&self, channel: String, path: String) -> Option<String> {
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) => return Some(format!("can't send {path}: {err}")),
+        };
+        if !metadata.is_file() {
+            return Some(format!("can't send {path}: not a file"));
+        }
+        if metadata.len() > MAX_FILE_SIZE {
+            return Some(format!(
+                "can't send {path}: too large ({}, max {})",
+                crate::files::human_size(metadata.len()),
+                crate::files::human_size(MAX_FILE_SIZE)
+            ));
+        }
+        let Some(filename) = Path::new(&path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+        else {
+            return Some(format!("can't send {path}: can't determine a filename"));
+        };
+
+        let backfill = self.backfill.clone();
+        let events_tx = self.events_tx.clone();
+        let our_id = self.our_id;
+        let size = metadata.len();
+        tokio::spawn(async move {
+            let hash = match backfill.add_file(Path::new(&path)).await {
+                Ok(hash) => hash,
+                Err(err) => {
+                    let _ = events_tx
+                        .send(NetEvent::FileSendFailed {
+                            path,
+                            error: err.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            let message = ChatMessage {
+                v: 2,
+                id: rand::random(),
+                sender: our_id,
+                ts_unix_ms: now_unix_ms(),
+                text: String::new(),
+                attachment: Some(FileAttachment {
+                    filename,
+                    size,
+                    hash,
+                }),
+            };
+            let _ = events_tx.send(NetEvent::FileReady(channel, message)).await;
+        });
+
+        None
+    }
+
+    /// Downloads a file previously shared in some joined channel and writes
+    /// it to `destination` -- the `/save` counterpart to `send_file`.
+    /// `destination` is already fully resolved by the caller (see
+    /// `files::resolve_destination`), so this is purely a network/blob-store
+    /// concern. Spawned like `send_file`, reporting the outcome back as
+    /// `NetEvent::FileSaved`/`FileSaveFailed` since the download can take a
+    /// while and must not block the caller's event loop. Fire-and-forget,
+    /// like `send` and `announce`.
+    pub fn save_file(&self, hash: Hash, filename: String, sender: [u8; 32], destination: PathBuf) {
+        let backfill = self.backfill.clone();
+        let endpoint = self.router.endpoint().clone();
+        let events_tx = self.events_tx.clone();
+        tokio::spawn(async move {
+            match backfill
+                .fetch_file(&endpoint, hash, sender, &destination)
+                .await
+            {
+                Ok(()) => {
+                    let _ = events_tx
+                        .send(NetEvent::FileSaved {
+                            filename,
+                            path: destination,
+                        })
+                        .await;
+                }
+                Err(err) => {
+                    let _ = events_tx
+                        .send(NetEvent::FileSaveFailed {
+                            filename,
+                            error: err.to_string(),
+                        })
+                        .await;
+                }
             }
         });
     }

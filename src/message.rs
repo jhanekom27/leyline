@@ -1,5 +1,7 @@
 //! Wire format for chat messages exchanged over gossip.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
 
 /// A single chat message, as it travels over the wire and is stored locally.
@@ -14,12 +16,87 @@ pub struct ChatMessage {
     pub id: u64,
     /// Sender's NodeId. Embedded so messages can be verified/displayed
     /// without an extra lookup, even though gossip also gives you this at
-    /// delivery.
+    /// delivery anyway.
     pub sender: [u8; 32],
     /// Unix timestamp in milliseconds.
     pub ts_unix_ms: u64,
-    /// Message body.
+    /// Message body. Empty for a captionless file share (see `attachment`).
     pub text: String,
+    /// A file shared via `/send`, if any -- see features.md's "File
+    /// sharing" idea. Added behind the `v: 2` bump; `decode` below still
+    /// loads messages persisted before this field existed.
+    pub attachment: Option<FileAttachment>,
+}
+
+impl ChatMessage {
+    /// Decodes a `ChatMessage` from postcard bytes, falling back to the
+    /// pre-attachment (`v: 1`) shape for messages persisted or backfilled
+    /// before `attachment` existed.
+    ///
+    /// postcard encodes structs positionally with no field names, so a
+    /// plain `postcard::from_bytes::<ChatMessage>` fails outright on that
+    /// older, shorter shape instead of defaulting the missing field --
+    /// `storage::MessageStore::load` and `backfill::BackfillStore::fetch`
+    /// call this instead, so a channel's history persisted before this
+    /// upgrade still loads (just without an attachment, which it never had).
+    pub fn decode(bytes: &[u8]) -> Result<ChatMessage, postcard::Error> {
+        if let Ok(message) = postcard::from_bytes::<ChatMessage>(bytes) {
+            return Ok(message);
+        }
+        postcard::from_bytes::<ChatMessageV1>(bytes).map(ChatMessageV1::into_current)
+    }
+}
+
+/// `ChatMessage`'s shape before file attachments were added -- kept only so
+/// `ChatMessage::decode` can still load messages persisted under the older,
+/// shorter format. Never constructed directly otherwise (the `Serialize`
+/// half only exists so tests can encode an old-shape record to decode).
+#[derive(Serialize, Deserialize)]
+struct ChatMessageV1 {
+    v: u8,
+    id: u64,
+    sender: [u8; 32],
+    ts_unix_ms: u64,
+    text: String,
+}
+
+impl ChatMessageV1 {
+    fn into_current(self) -> ChatMessage {
+        ChatMessage {
+            v: self.v,
+            id: self.id,
+            sender: self.sender,
+            ts_unix_ms: self.ts_unix_ms,
+            text: self.text,
+            attachment: None,
+        }
+    }
+}
+
+/// A file shared with a channel via `/send` -- see features.md's "File
+/// sharing" idea. `hash` addresses the content in the local iroh-blobs
+/// store that also backs history backfill (see backfill.rs); receiving a
+/// `ChatMessage` with an attachment never fetches the bytes automatically --
+/// that only happens on an explicit `/save`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileAttachment {
+    /// As typed in `/send <path>`, reduced to just its final path
+    /// component -- see `crate::files::sanitize_filename`, applied again
+    /// on the receiving end since a peer's filename is untrusted.
+    pub filename: String,
+    /// Size in bytes, shown before deciding whether to `/save`.
+    pub size: u64,
+    /// Content hash in the shared iroh-blobs store.
+    pub hash: iroh_blobs::Hash,
+}
+
+/// Current time as Unix milliseconds -- shared by every place that composes
+/// a new `ChatMessage` (`app::compose_message`, `net::Net::send_file`).
+pub(crate) fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Envelope for everything broadcast over a channel's gossip topic.
@@ -85,6 +162,7 @@ mod tests {
             sender: [3; 32],
             ts_unix_ms: 1000,
             text: "hi".to_string(),
+            attachment: None,
         }
     }
 
@@ -134,5 +212,53 @@ mod tests {
         .unwrap();
         let decoded: GossipPayload = postcard::from_bytes(&identity_bytes).unwrap();
         assert!(matches!(decoded, GossipPayload::Identity(_)));
+    }
+
+    #[test]
+    fn decode_round_trips_a_message_with_an_attachment() {
+        let message = ChatMessage {
+            v: 2,
+            id: 7,
+            sender: [4; 32],
+            ts_unix_ms: 2000,
+            text: String::new(),
+            attachment: Some(FileAttachment {
+                filename: "report.pdf".to_string(),
+                size: 1234,
+                hash: iroh_blobs::Hash::new(b"report contents"),
+            }),
+        };
+        let bytes = postcard::to_stdvec(&message).unwrap();
+        assert_eq!(ChatMessage::decode(&bytes).unwrap(), message);
+    }
+
+    #[test]
+    fn decode_loads_a_message_persisted_before_attachments_existed() {
+        // Simulates a record written to disk (or backfilled) before
+        // `attachment` was added to `ChatMessage` -- decode must still
+        // succeed, with `attachment` defaulting to `None`, rather than
+        // failing outright the way a plain `postcard::from_bytes` would.
+        let old = ChatMessageV1 {
+            v: 1,
+            id: 99,
+            sender: [8; 32],
+            ts_unix_ms: 500,
+            text: "from before the upgrade".to_string(),
+        };
+        let bytes = postcard::to_stdvec(&old).unwrap();
+
+        let decoded = ChatMessage::decode(&bytes).unwrap();
+
+        assert_eq!(decoded.v, 1);
+        assert_eq!(decoded.id, 99);
+        assert_eq!(decoded.sender, [8; 32]);
+        assert_eq!(decoded.ts_unix_ms, 500);
+        assert_eq!(decoded.text, "from before the upgrade");
+        assert_eq!(decoded.attachment, None);
+    }
+
+    #[test]
+    fn decode_rejects_genuinely_malformed_bytes() {
+        assert!(ChatMessage::decode(b"not a chat message").is_err());
     }
 }
