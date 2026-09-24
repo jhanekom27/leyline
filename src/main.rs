@@ -5,6 +5,7 @@ mod contacts;
 mod identity;
 mod message;
 mod net;
+mod search;
 mod storage;
 mod ticket;
 mod ui;
@@ -26,6 +27,7 @@ use backfill::BackfillStore;
 use channel_registry::ChannelRegistry;
 use contacts::Contacts;
 use net::{Net, NetEvent};
+use search::{SearchOutcome, run_on_disk_scan};
 use storage::MessageStore;
 
 #[tokio::main]
@@ -237,6 +239,11 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
     let mut term_events = EventStream::new();
     let mut tick = interval(Duration::from_millis(250));
     let mut history_heartbeat = interval(HISTORY_ANNOUNCE_INTERVAL);
+    // Reports for `/search`'s background on-disk scans (see search.rs and
+    // `InputAction::Search`) -- kept separate from `net_rx`/`NetEvent`
+    // since this isn't network activity, following the same "async work
+    // reports into the select loop" shape.
+    let (search_tx, mut search_rx) = mpsc::channel::<SearchOutcome>(8);
     let mut dirty = true;
 
     while !app.should_quit {
@@ -290,6 +297,18 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                                 }
                                 backfill.forget_channel(&channel);
                                 app.remove_channel(&channel);
+                            }
+                            Some(InputAction::Search { channel, term }) => {
+                                // A large on-disk log can't be assumed
+                                // cheap enough for the async event loop --
+                                // run it on tokio's blocking pool instead,
+                                // per search.rs's doc comment.
+                                let store = store.clone();
+                                let search_tx = search_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let outcome = run_on_disk_scan(&store, &channel, &term);
+                                    let _ = search_tx.blocking_send(outcome);
+                                });
                             }
                             None => {}
                         }
@@ -360,6 +379,10 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                         }
                     }
                 }
+                dirty = true;
+            }
+            Some(outcome) = search_rx.recv() => {
+                app.apply_search_outcome(outcome);
                 dirty = true;
             }
             _ = tick.tick() => {

@@ -13,6 +13,8 @@ use ratatui::widgets::{
 use textwrap::wrap;
 
 use crate::app::{AppState, Channel, TranscriptLine, hex_id};
+use crate::message::ChatMessage;
+use crate::search::SearchResults;
 
 /// Width of the `HH:MM` time column in a chat row.
 const TIME_WIDTH: usize = 5;
@@ -34,6 +36,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/who",
     "/alias <hex> <name>",
     "/nick <name>",
+    "/search <term>",
     "/hints",
     "/help",
 ];
@@ -153,7 +156,22 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
     let start = end.saturating_sub(visible_rows);
     let items: Vec<ListItem> = rows.drain(start..end).map(ListItem::new).collect();
 
-    let title = format!("#{} · {} peer(s)", channel.name, channel.peers.len());
+    let title = match &channel.search {
+        Some(search) => {
+            let status = if search.pending {
+                ", searching full history..."
+            } else {
+                ""
+            };
+            format!(
+                "#{} · search '{}' ({}{status})",
+                channel.name,
+                search.term,
+                search.messages.len()
+            )
+        }
+        None => format!("#{} · {} peer(s)", channel.name, channel.peers.len()),
+    };
     let list = List::new(items).block(
         Block::bordered()
             .title(title)
@@ -213,12 +231,16 @@ fn render_scroll_indicator(
 /// on a run of messages from the same person, or on a message's own
 /// word-wrapped continuation lines -- is computed here since it depends on
 /// iterating the transcript in order.
+///
+/// Delegates to `build_search_rows` when `channel` has an active `/search`
+/// (see `app::Channel::search`), rendering its results in place of the
+/// normal transcript.
 fn build_message_rows(app: &AppState, channel: &Channel, inner_width: usize) -> Vec<Line<'static>> {
-    let prefix_width = 1 + 1 + TIME_WIDTH + 1 + NAME_WIDTH + SEPARATOR.chars().count();
-    let wrap_width = inner_width.saturating_sub(prefix_width).max(10);
-    let blank_time = " ".repeat(TIME_WIDTH);
-    let blank_name = " ".repeat(NAME_WIDTH);
+    if let Some(search) = &channel.search {
+        return build_search_rows(app, search, inner_width);
+    }
 
+    let layout = row_layout(inner_width);
     let mut rows = Vec::new();
     let mut last_chat_sender: Option<[u8; 32]> = None;
     for line in &channel.messages {
@@ -233,35 +255,7 @@ fn build_message_rows(app: &AppState, channel: &Channel, inner_width: usize) -> 
                     rows.push(Line::from(""));
                 }
                 last_chat_sender = Some(message.sender);
-
-                let color = user_color(&message.sender);
-                let name = fit_name(&app.display_name(&message.sender), NAME_WIDTH);
-                let time = format_time(message.ts_unix_ms);
-
-                let mut wrapped = wrap(&message.text, wrap_width);
-                if wrapped.is_empty() {
-                    wrapped.push(std::borrow::Cow::Borrowed(""));
-                }
-                for (index, chunk) in wrapped.iter().enumerate() {
-                    let show_header = index == 0 && is_first_of_group;
-                    let (time_span, name_span) = if show_header {
-                        (time.clone(), name.clone())
-                    } else {
-                        (blank_time.clone(), blank_name.clone())
-                    };
-                    rows.push(Line::from(vec![
-                        Span::styled(" ", Style::default().bg(color)),
-                        Span::raw(" "),
-                        Span::styled(time_span, Style::default().fg(Color::DarkGray)),
-                        Span::raw(" "),
-                        Span::styled(
-                            name_span,
-                            Style::default().fg(color).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(SEPARATOR, Style::default().fg(Color::DarkGray)),
-                        Span::raw(chunk.to_string()),
-                    ]));
-                }
+                push_chat_rows(&mut rows, app, message, is_first_of_group, &layout, None);
             }
             TranscriptLine::System(text) => {
                 // A notice breaks up a run of grouped messages -- the next
@@ -283,6 +277,180 @@ fn build_message_rows(app: &AppState, channel: &Channel, inner_width: usize) -> 
         }
     }
     rows
+}
+
+/// Renders a channel's active `/search` results in place of its normal
+/// transcript -- reuses the same per-message formatting
+/// (`push_chat_rows`), grouped the same way, but with no `System` lines to
+/// interleave since a search snapshot only ever holds chat matches.
+/// Highlights the matched substring in each line (see `highlighted_spans`).
+fn build_search_rows(
+    app: &AppState,
+    search: &SearchResults,
+    inner_width: usize,
+) -> Vec<Line<'static>> {
+    let layout = row_layout(inner_width);
+    let term_lower = search.term.to_lowercase();
+
+    let mut rows = Vec::new();
+    let mut last_sender: Option<[u8; 32]> = None;
+    for message in &search.messages {
+        let is_first_of_group = last_sender != Some(message.sender);
+        if is_first_of_group && last_sender.is_some() {
+            rows.push(Line::from(""));
+        }
+        last_sender = Some(message.sender);
+        push_chat_rows(
+            &mut rows,
+            app,
+            message,
+            is_first_of_group,
+            &layout,
+            Some(&term_lower),
+        );
+    }
+    if rows.is_empty() {
+        rows.push(Line::from(Span::styled(
+            "no matches",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+    rows
+}
+
+/// Column widths/blank fillers shared by the normal transcript and
+/// search-result renderers (`build_message_rows`/`build_search_rows`) --
+/// see `push_chat_rows`.
+struct RowLayout {
+    wrap_width: usize,
+    blank_time: String,
+    blank_name: String,
+}
+
+fn row_layout(inner_width: usize) -> RowLayout {
+    let prefix_width = 1 + 1 + TIME_WIDTH + 1 + NAME_WIDTH + SEPARATOR.chars().count();
+    RowLayout {
+        wrap_width: inner_width.saturating_sub(prefix_width).max(10),
+        blank_time: " ".repeat(TIME_WIDTH),
+        blank_name: " ".repeat(NAME_WIDTH),
+    }
+}
+
+/// Appends one chat message's rendered rows (colored rail, time, sender
+/// name, separator, wrapped -- and optionally highlighted, see
+/// `highlighted_spans` -- text) to `rows`. Blanks the time/name on
+/// continuation lines and on a run of messages from the same sender
+/// (`is_first_of_group`, computed by the caller since it depends on
+/// iterating the surrounding transcript/search results in order). Shared
+/// by the normal transcript (`build_message_rows`) and search results
+/// (`build_search_rows`); `term_lower` is `None` for the former, which
+/// never highlights anything.
+fn push_chat_rows(
+    rows: &mut Vec<Line<'static>>,
+    app: &AppState,
+    message: &ChatMessage,
+    is_first_of_group: bool,
+    layout: &RowLayout,
+    term_lower: Option<&str>,
+) {
+    let color = user_color(&message.sender);
+    let name = fit_name(&app.display_name(&message.sender), NAME_WIDTH);
+    let time = format_time(message.ts_unix_ms);
+
+    let mut wrapped = wrap(&message.text, layout.wrap_width);
+    if wrapped.is_empty() {
+        wrapped.push(std::borrow::Cow::Borrowed(""));
+    }
+    for (index, chunk) in wrapped.iter().enumerate() {
+        let show_header = index == 0 && is_first_of_group;
+        let (time_span, name_span) = if show_header {
+            (time.clone(), name.clone())
+        } else {
+            (layout.blank_time.clone(), layout.blank_name.clone())
+        };
+        let mut spans = vec![
+            Span::styled(" ", Style::default().bg(color)),
+            Span::raw(" "),
+            Span::styled(time_span, Style::default().fg(Color::DarkGray)),
+            Span::raw(" "),
+            Span::styled(
+                name_span,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(SEPARATOR, Style::default().fg(Color::DarkGray)),
+        ];
+        spans.extend(highlighted_spans(chunk, term_lower));
+        rows.push(Line::from(spans));
+    }
+}
+
+/// Splits `text` into (segment, is_match) pairs around every
+/// case-insensitive occurrence of `term_lower`, preserving `text`'s
+/// original casing. Pure text logic, kept separate from `Span`
+/// construction (`highlighted_spans`) so it's easy to unit test without
+/// depending on ratatui's types.
+///
+/// Comparisons are done over `char`s, not byte offsets into a lowercased
+/// `String`, since `str::to_lowercase` can change a string's byte length
+/// for some Unicode input; if that happens here (rare), highlighting is
+/// skipped for this line entirely rather than risking misaligned spans.
+fn find_highlights(text: &str, term_lower: &str) -> Vec<(String, bool)> {
+    if term_lower.is_empty() {
+        return vec![(text.to_string(), false)];
+    }
+    let term_chars: Vec<char> = term_lower.chars().collect();
+    let chars: Vec<char> = text.chars().collect();
+    let lower_chars: Vec<char> = text.to_lowercase().chars().collect();
+    if lower_chars.len() != chars.len() {
+        return vec![(text.to_string(), false)];
+    }
+
+    let mut segments = Vec::new();
+    let mut plain_start = 0;
+    let mut i = 0;
+    while i + term_chars.len() <= lower_chars.len() {
+        if lower_chars[i..i + term_chars.len()] == term_chars[..] {
+            if i > plain_start {
+                segments.push((chars[plain_start..i].iter().collect(), false));
+            }
+            segments.push((chars[i..i + term_chars.len()].iter().collect(), true));
+            i += term_chars.len();
+            plain_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if plain_start < chars.len() || segments.is_empty() {
+        segments.push((chars[plain_start..].iter().collect(), false));
+    }
+    segments
+}
+
+/// Renders `text` as one or more spans, styling matched segments (see
+/// `find_highlights`) distinctly. `term_lower` is `None` for the normal
+/// transcript, which never highlights anything.
+fn highlighted_spans(text: &str, term_lower: Option<&str>) -> Vec<Span<'static>> {
+    let Some(term_lower) = term_lower else {
+        return vec![Span::raw(text.to_string())];
+    };
+    find_highlights(text, term_lower)
+        .into_iter()
+        .map(|(segment, is_match)| {
+            if is_match {
+                Span::styled(
+                    segment,
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw(segment)
+            }
+        })
+        .collect()
 }
 
 /// Splits `text` into `width`-wide chunks, breaking mid-word if needed.
@@ -367,7 +535,10 @@ fn peer_item(app: &AppState, id: &[u8; 32]) -> ListItem<'static> {
 /// `COMMAND_HINTS` entry, showing just the bare usage -- full
 /// descriptions still live in `/help`'s system notice and the README.
 fn render_hints(frame: &mut Frame, area: Rect) {
-    let items: Vec<ListItem> = COMMAND_HINTS.iter().map(|hint| ListItem::new(*hint)).collect();
+    let items: Vec<ListItem> = COMMAND_HINTS
+        .iter()
+        .map(|hint| ListItem::new(*hint))
+        .collect();
     let list = List::new(items).block(
         Block::bordered()
             .title("commands")
@@ -405,4 +576,55 @@ fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
 
     let cursor_col = inner.x + (prompt_width + (app.cursor - visible_start)) as u16;
     frame.set_cursor_position((cursor_col, inner.y));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_highlights_returns_one_unmatched_segment_for_empty_term() {
+        assert_eq!(
+            find_highlights("hello world", ""),
+            vec![("hello world".to_string(), false)]
+        );
+    }
+
+    #[test]
+    fn find_highlights_splits_around_a_case_insensitive_match() {
+        assert_eq!(
+            find_highlights("hello World", "world"),
+            vec![("hello ".to_string(), false), ("World".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn find_highlights_handles_multiple_occurrences() {
+        assert_eq!(
+            find_highlights("cat cat cat", "cat"),
+            vec![
+                ("cat".to_string(), true),
+                (" ".to_string(), false),
+                ("cat".to_string(), true),
+                (" ".to_string(), false),
+                ("cat".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn find_highlights_returns_one_unmatched_segment_when_nothing_matches() {
+        assert_eq!(
+            find_highlights("hello world", "xyz"),
+            vec![("hello world".to_string(), false)]
+        );
+    }
+
+    #[test]
+    fn find_highlights_matches_a_term_at_the_very_end() {
+        assert_eq!(
+            find_highlights("say hello", "hello"),
+            vec![("say ".to_string(), false), ("hello".to_string(), true)]
+        );
+    }
 }

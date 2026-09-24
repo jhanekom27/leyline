@@ -28,7 +28,10 @@ const LEN_PREFIX_BYTES: usize = 4;
 ///
 /// Stateless and open-per-call by design: message send/receive happens at
 /// human/network speed, not a hot loop, so there's no need to cache file
-/// handles.
+/// handles. Cheaply `Clone`, since it's just a `PathBuf` -- lets a
+/// background `/search` scan (search.rs) own a handle without borrowing
+/// from the caller.
+#[derive(Clone)]
 pub struct MessageStore {
     dir: PathBuf,
 }

@@ -6,13 +6,14 @@
 //! or `/invite` command, it returns an `InputAction` describing what the
 //! caller should do, rather than reaching for I/O itself.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::message::ChatMessage;
 use crate::net::NetEvent;
+use crate::search::{self, SearchOutcome, SearchResults};
 
 /// Cap on in-memory scrollback per channel, per concept.md's guidance on
 /// bounding render/memory cost in a long-lived session.
@@ -44,6 +45,11 @@ pub struct Channel {
     pub has_unread: bool,
     /// Recently-seen message ids, oldest first, for incoming-message dedupe.
     seen_ids: VecDeque<u64>,
+    /// Active `/search <term>` results, if any -- see `AppState::run_search`
+    /// and `ui::render_messages`. Transient UI state, like `scroll`: never
+    /// persisted, and not kept live as new messages arrive (re-run
+    /// `/search <term>` to refresh).
+    pub search: Option<SearchResults>,
 }
 
 impl Channel {
@@ -55,6 +61,7 @@ impl Channel {
             scroll: 0,
             has_unread: false,
             seen_ids: VecDeque::new(),
+            search: None,
         }
     }
 
@@ -90,6 +97,22 @@ impl Channel {
             }
         }
     }
+
+    /// Scans this channel's loaded transcript for `Chat` lines whose text
+    /// matches `term_lower` (already lowercased), oldest first -- the
+    /// synchronous half of `/search`. See `search::run_on_disk_scan` for
+    /// the background half covering history older than what's loaded here.
+    fn search_loaded(&self, term_lower: &str) -> Vec<ChatMessage> {
+        self.messages
+            .iter()
+            .filter_map(|line| match line {
+                TranscriptLine::Chat(message) if search::matches(&message.text, term_lower) => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// An action for the caller (`main.rs`) to perform in response to a
@@ -119,6 +142,11 @@ pub enum InputAction {
     /// `crate::channel_registry`, `crate::storage`, `crate::backfill`)
     /// and then calling `AppState::remove_channel`.
     Leave(String),
+    /// Kick off a background scan of `channel`'s full on-disk log for
+    /// `term` (already applied synchronously to the loaded scrollback by
+    /// `run_search`) -- see `search::run_on_disk_scan`,
+    /// `AppState::apply_search_outcome`, and main.rs.
+    Search { channel: String, term: String },
 }
 
 /// All state needed to render the TUI and respond to input.
@@ -250,6 +278,43 @@ impl AppState {
 
         newly_accepted.sort_by_key(|m| (m.ts_unix_ms, m.id));
         newly_accepted
+    }
+
+    /// Merges a finished background on-disk scan (`search::run_on_disk_scan`,
+    /// kicked off via `InputAction::Search`) into `outcome.channel`'s active
+    /// search -- a no-op if that channel isn't currently joined, or if its
+    /// active search has since changed (comparing `outcome.term` against
+    /// the channel's currently-active one rejects a stale result from a
+    /// `/search` that's been superseded or cleared, without needing a
+    /// separate request-id).
+    ///
+    /// Unions rather than replaces the existing snapshot, deduped by id and
+    /// re-sorted by `(ts_unix_ms, id)` (mirroring `merge_history`'s
+    /// convention above): the on-disk log is a superset of the loaded
+    /// scrollback in the overwhelmingly common case, but treating a read
+    /// failure (reported as an empty `SearchOutcome`, see
+    /// `search::run_on_disk_scan`) as "replace with nothing" would
+    /// otherwise erase the in-memory matches already shown.
+    pub fn apply_search_outcome(&mut self, outcome: SearchOutcome) {
+        let Some(channel) = self.channel_mut(&outcome.channel) else {
+            return;
+        };
+        let Some(search) = &mut channel.search else {
+            return;
+        };
+        if search.term != outcome.term {
+            return;
+        }
+        let mut seen: HashSet<u64> = search.messages.iter().map(|message| message.id).collect();
+        for message in outcome.messages {
+            if seen.insert(message.id) {
+                search.messages.push(message);
+            }
+        }
+        search
+            .messages
+            .sort_by_key(|message| (message.ts_unix_ms, message.id));
+        search.pending = false;
     }
 
     pub fn active(&self) -> &Channel {
@@ -488,6 +553,7 @@ impl AppState {
             "nick" => self.run_nick(arg.trim()),
             "leave" => self.run_leave(arg.trim()),
             "who" => self.run_who(),
+            "search" => self.run_search(arg.trim()),
             "hints" => self.run_hints(),
             "help" => self.run_help(),
             _ => {
@@ -504,8 +570,9 @@ impl AppState {
     fn run_help(&mut self) -> Option<InputAction> {
         self.push_system(
             "commands: /join <name|ticket>, /invite, /leave [channel], /who, \
-             /alias <hex-prefix> <name>, /nick <name>, /hints, /help -- \
-             keys: Tab/Shift+Tab switch channels, Up/Down scroll, Esc/Ctrl+C quit",
+             /alias <hex-prefix> <name>, /nick <name>, /search <term>, /hints, \
+             /help -- keys: Tab/Shift+Tab switch channels, Up/Down scroll, \
+             Esc/Ctrl+C quit",
         );
         None
     }
@@ -637,6 +704,41 @@ impl AppState {
         } else {
             format!("{} ({})", hex_id(id), details.join(", "))
         }
+    }
+
+    /// Handles `/search <term>`: `arg` is everything after `/search `
+    /// (already trimmed). With no argument, clears an active search filter
+    /// -- or shows a usage hint if none is active -- mirroring `/hints`'s
+    /// toggle shape. Otherwise scans the active channel's loaded transcript
+    /// synchronously for an instant result (`Channel::search_loaded`),
+    /// stores it as the channel's active search, and returns an
+    /// `InputAction::Search` so the caller can extend it with a background
+    /// scan of history older than what's loaded (see
+    /// `search::run_on_disk_scan` and `AppState::apply_search_outcome`).
+    fn run_search(&mut self, arg: &str) -> Option<InputAction> {
+        if arg.is_empty() {
+            if self.active_mut().search.take().is_some() {
+                self.push_system("search cleared");
+            } else {
+                self.push_system("usage: /search <term>");
+            }
+            return None;
+        }
+        let term_lower = arg.to_lowercase();
+        let messages = self.active().search_loaded(&term_lower);
+        let count = messages.len();
+        self.active_mut().search = Some(SearchResults {
+            term: arg.to_string(),
+            messages,
+            pending: true,
+        });
+        self.push_system(format!(
+            "search: {count} match(es) so far for '{arg}' (scanning full history...)"
+        ));
+        Some(InputAction::Search {
+            channel: self.active().name.clone(),
+            term: arg.to_string(),
+        })
     }
 
     /// Resolves a hex-prefix (case-insensitive, as typed after `/alias`)
@@ -1728,5 +1830,161 @@ mod tests {
             oldest_remaining.id, 10,
             "the 10 oldest messages must have been evicted to stay within the cap"
         );
+    }
+
+    #[test]
+    fn slash_search_without_arg_and_no_active_filter_shows_usage() {
+        let mut app = app();
+        let action = submit(&mut app, "/search");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.starts_with("usage:"), "got: {last}");
+    }
+
+    #[test]
+    fn slash_search_finds_matches_in_loaded_history_and_returns_an_action() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::Received(
+            "general".to_string(),
+            compose_message(PEER_ID, "hello world"),
+        ));
+        app.handle_net_event(NetEvent::Received(
+            "general".to_string(),
+            compose_message(PEER_ID, "goodbye"),
+        ));
+
+        let action = submit(&mut app, "/search world");
+
+        match action.expect("a successful /search returns an action") {
+            InputAction::Search { channel, term } => {
+                assert_eq!(channel, "general");
+                assert_eq!(term, "world");
+            }
+            _ => panic!("expected InputAction::Search"),
+        }
+        let search = app
+            .active()
+            .search
+            .as_ref()
+            .expect("search should be active");
+        assert_eq!(search.messages.len(), 1);
+        assert_eq!(search.messages[0].text, "hello world");
+        assert!(search.pending, "the on-disk scan hasn't reported back yet");
+    }
+
+    #[test]
+    fn slash_search_is_case_insensitive() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::Received(
+            "general".to_string(),
+            compose_message(PEER_ID, "Hello World"),
+        ));
+
+        submit(&mut app, "/search WORLD");
+
+        let search = app
+            .active()
+            .search
+            .as_ref()
+            .expect("search should be active");
+        assert_eq!(search.messages.len(), 1);
+    }
+
+    #[test]
+    fn slash_search_with_no_matches_still_activates_an_empty_search() {
+        let mut app = app();
+        let action = submit(&mut app, "/search nonexistent");
+        assert!(action.is_some());
+        let search = app
+            .active()
+            .search
+            .as_ref()
+            .expect("search should be active");
+        assert!(search.messages.is_empty());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("0 match"), "got: {last}");
+    }
+
+    #[test]
+    fn slash_search_with_no_arg_clears_an_active_filter() {
+        let mut app = app();
+        submit(&mut app, "/search hello");
+        assert!(app.active().search.is_some());
+
+        let action = submit(&mut app, "/search");
+
+        assert!(action.is_none());
+        assert!(app.active().search.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "search cleared");
+    }
+
+    #[test]
+    fn apply_search_outcome_merges_on_disk_matches_into_existing_results() {
+        let mut app = app();
+        submit(&mut app, "/search hello");
+        let older = dated_message(50, 99, PEER_ID, "hello from the past");
+
+        app.apply_search_outcome(SearchOutcome {
+            channel: "general".to_string(),
+            term: "hello".to_string(),
+            messages: vec![older.clone()],
+        });
+
+        let search = app.active().search.as_ref().unwrap();
+        assert_eq!(search.messages, vec![older]);
+        assert!(!search.pending);
+    }
+
+    #[test]
+    fn apply_search_outcome_deduplicates_messages_already_in_the_snapshot() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::Received(
+            "general".to_string(),
+            compose_message(PEER_ID, "hello there"),
+        ));
+        let action = submit(&mut app, "/search hello");
+        let term = match action.expect("search returns an action") {
+            InputAction::Search { term, .. } => term,
+            _ => panic!("expected InputAction::Search"),
+        };
+        let already_shown = app.active().search.as_ref().unwrap().messages[0].clone();
+
+        app.apply_search_outcome(SearchOutcome {
+            channel: "general".to_string(),
+            term,
+            messages: vec![already_shown.clone()],
+        });
+
+        let search = app.active().search.as_ref().unwrap();
+        assert_eq!(search.messages, vec![already_shown]);
+    }
+
+    #[test]
+    fn apply_search_outcome_ignores_a_stale_result_from_a_superseded_search() {
+        let mut app = app();
+        submit(&mut app, "/search first");
+        submit(&mut app, "/search second");
+
+        app.apply_search_outcome(SearchOutcome {
+            channel: "general".to_string(),
+            term: "first".to_string(),
+            messages: vec![dated_message(1, 1, PEER_ID, "first match")],
+        });
+
+        let search = app.active().search.as_ref().unwrap();
+        assert_eq!(search.term, "second");
+        assert!(search.messages.is_empty());
+    }
+
+    #[test]
+    fn apply_search_outcome_is_a_no_op_for_an_unknown_channel() {
+        let mut app = app();
+        app.apply_search_outcome(SearchOutcome {
+            channel: "nonexistent".to_string(),
+            term: "hello".to_string(),
+            messages: vec![dated_message(1, 1, PEER_ID, "hello")],
+        });
+        assert!(app.active().search.is_none());
     }
 }

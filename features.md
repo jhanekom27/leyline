@@ -46,9 +46,12 @@ mechanisms, not one, since they trade off differently:
 - [ ] **@mentions** -- highlight your own name when it appears in a
   message, plus a bell/notification when that happens on a tab that isn't
   active.
-- [ ] **Local search** -- `/search <term>` to filter/jump within a loaded
-  channel's scrollback; a stretch version re-scans `storage.rs`'s on-disk
-  log for history older than what's currently loaded.
+- [x] **Local search** -- `/search <term>` filters the active channel down
+  to matches (with the matched text highlighted), instantly for whatever's
+  loaded; a `tokio::task::spawn_blocking` scan of `storage.rs`'s full
+  on-disk log then extends the result with history older than what's
+  loaded, without ever blocking input/render. `/search` with no argument
+  clears it.
 
 ## Channels & presence
 

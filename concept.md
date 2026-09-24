@@ -222,5 +222,6 @@ src/
   channel_registry.rs // persisted channel list, room secrets, known peers
   contacts.rs         // persisted local pet names for peers
   storage.rs          // local per-channel message log persistence
+  search.rs           // shared match predicate + on-disk scan for /search
   backfill.rs         // iroh-blobs history manifests for offline backfill
 ```
