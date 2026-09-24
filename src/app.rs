@@ -553,7 +553,7 @@ impl AppState {
             "nick" => self.run_nick(arg.trim()),
             "leave" => self.run_leave(arg.trim()),
             "who" => self.run_who(),
-            "search" => self.run_search(arg.trim()),
+            "search" | "s" => self.run_search(arg.trim()),
             "hints" => self.run_hints(),
             "help" => self.run_help(),
             _ => {
@@ -570,9 +570,9 @@ impl AppState {
     fn run_help(&mut self) -> Option<InputAction> {
         self.push_system(
             "commands: /join <name|ticket>, /invite, /leave [channel], /who, \
-             /alias <hex-prefix> <name>, /nick <name>, /search <term>, /hints, \
-             /help -- keys: Tab/Shift+Tab switch channels, Up/Down scroll, \
-             Esc/Ctrl+C quit",
+             /alias <hex-prefix> <name>, /nick <name>, /search <term> (or \
+             /s), /hints, /help -- keys: Tab/Shift+Tab switch channels, \
+             Up/Down scroll, Esc/Ctrl+C quit",
         );
         None
     }
@@ -706,21 +706,25 @@ impl AppState {
         }
     }
 
-    /// Handles `/search <term>`: `arg` is everything after `/search `
-    /// (already trimmed). With no argument, clears an active search filter
-    /// -- or shows a usage hint if none is active -- mirroring `/hints`'s
-    /// toggle shape. Otherwise scans the active channel's loaded transcript
+    /// Handles `/search <term>` (`/s` is a shorthand alias, see
+    /// `run_command`): `arg` is everything after the command name (already
+    /// trimmed). With no argument, clears an active search filter -- or
+    /// shows a usage hint if none is active -- mirroring `/hints`'s toggle
+    /// shape. Otherwise scans the active channel's loaded transcript
     /// synchronously for an instant result (`Channel::search_loaded`),
     /// stores it as the channel's active search, and returns an
     /// `InputAction::Search` so the caller can extend it with a background
     /// scan of history older than what's loaded (see
     /// `search::run_on_disk_scan` and `AppState::apply_search_outcome`).
+    /// The pane title (`ui::render_messages`) reminds you a search is
+    /// active and how to clear it for as long as it stays active, since
+    /// this system notice will otherwise scroll out of view.
     fn run_search(&mut self, arg: &str) -> Option<InputAction> {
         if arg.is_empty() {
             if self.active_mut().search.take().is_some() {
                 self.push_system("search cleared");
             } else {
-                self.push_system("usage: /search <term>");
+                self.push_system("usage: /search <term> (or /s <term>)");
             }
             return None;
         }
@@ -733,7 +737,7 @@ impl AppState {
             pending: true,
         });
         self.push_system(format!(
-            "search: {count} match(es) so far for '{arg}' (scanning full history...)"
+            "search: {count} match(es) so far for '{arg}' (scanning full history...) -- /s to clear"
         ));
         Some(InputAction::Search {
             channel: self.active().name.clone(),
@@ -1986,5 +1990,44 @@ mod tests {
             messages: vec![dated_message(1, 1, PEER_ID, "hello")],
         });
         assert!(app.active().search.is_none());
+    }
+
+    #[test]
+    fn slash_s_is_a_shorthand_for_search() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::Received(
+            "general".to_string(),
+            compose_message(PEER_ID, "hello world"),
+        ));
+
+        let action = submit(&mut app, "/s world");
+
+        match action.expect("a successful /s returns an action") {
+            InputAction::Search { channel, term } => {
+                assert_eq!(channel, "general");
+                assert_eq!(term, "world");
+            }
+            _ => panic!("expected InputAction::Search"),
+        }
+        let search = app
+            .active()
+            .search
+            .as_ref()
+            .expect("search should be active");
+        assert_eq!(search.messages.len(), 1);
+    }
+
+    #[test]
+    fn slash_s_with_no_arg_clears_an_active_filter() {
+        let mut app = app();
+        submit(&mut app, "/search hello");
+        assert!(app.active().search.is_some());
+
+        let action = submit(&mut app, "/s");
+
+        assert!(action.is_none());
+        assert!(app.active().search.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "search cleared");
     }
 }

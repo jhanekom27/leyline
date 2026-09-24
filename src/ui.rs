@@ -36,7 +36,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/who",
     "/alias <hex> <name>",
     "/nick <name>",
-    "/search <term>",
+    "/search <term> (/s)",
     "/hints",
     "/help",
 ];
@@ -164,7 +164,7 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
                 ""
             };
             format!(
-                "#{} · search '{}' ({}{status})",
+                "#{} · search '{}' ({}{status}) · /s to clear",
                 channel.name,
                 search.term,
                 search.messages.len()

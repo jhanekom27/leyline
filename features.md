@@ -46,12 +46,13 @@ mechanisms, not one, since they trade off differently:
 - [ ] **@mentions** -- highlight your own name when it appears in a
   message, plus a bell/notification when that happens on a tab that isn't
   active.
-- [x] **Local search** -- `/search <term>` filters the active channel down
-  to matches (with the matched text highlighted), instantly for whatever's
-  loaded; a `tokio::task::spawn_blocking` scan of `storage.rs`'s full
-  on-disk log then extends the result with history older than what's
-  loaded, without ever blocking input/render. `/search` with no argument
-  clears it.
+- [x] **Local search** -- `/search <term>` (or its `/s` shorthand) filters
+  the active channel down to matches (with the matched text highlighted),
+  instantly for whatever's loaded; a `tokio::task::spawn_blocking` scan of
+  `storage.rs`'s full on-disk log then extends the result with history
+  older than what's loaded, without ever blocking input/render. The pane
+  title reminds you a search is active and that `/search`/`/s` with no
+  argument clears it.
 
 ## Channels & presence
 
