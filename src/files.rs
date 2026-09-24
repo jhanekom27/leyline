@@ -49,7 +49,22 @@ pub fn sanitize_filename(name: &str) -> String {
 /// `name (1).ext`, `name (2).ext`, etc. -- the browser convention -- until
 /// a free path is found.
 pub fn resolve_destination(dir: &Path, filename: &str) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
+    if let Err(err) = std::fs::create_dir_all(dir) {
+        // The one case worth a clearer message than the raw OS error:
+        // `dir` (or one of its ancestors) is already a plain file rather
+        // than a folder -- e.g. a `leyline` binary sitting directly in
+        // Downloads, colliding with the `leyline/` subfolder `downloads_dir`
+        // always asks for -- so `create_dir_all` can never succeed there
+        // no matter how many times it's retried. Confirmed in the wild:
+        // this is exactly what "File exists (os error 17)" meant here.
+        if dir.is_file() {
+            return Err(std::io::Error::other(format!(
+                "{} already exists and isn't a folder -- rename it, remove it, or move it elsewhere so leyline can create its downloads folder there",
+                dir.display()
+            )));
+        }
+        return Err(err);
+    }
 
     let safe_name = sanitize_filename(filename);
     if let Some(path) = try_claim(dir, &safe_name)? {
@@ -202,6 +217,30 @@ mod tests {
         let path = resolve_destination(dir.path(), "../../etc/passwd").unwrap();
 
         assert_eq!(path, dir.path().join("passwd"));
+    }
+
+    #[test]
+    fn resolve_destination_gives_a_clear_error_when_the_folder_path_is_a_file() {
+        // Reproduces a real report: a `leyline` binary already sitting
+        // directly in Downloads collides with the `leyline/` subfolder
+        // `downloads_dir` always asks for, so `create_dir_all` fails with
+        // a bare "File exists (os error 17)" -- this should be replaced
+        // with a message that actually says what's wrong and how to fix it.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("leyline");
+        std::fs::write(&blocked, b"not a folder").unwrap();
+
+        let err = resolve_destination(&blocked, "report.pdf").unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains(&blocked.display().to_string()),
+            "got: {message}"
+        );
+        assert!(
+            !message.contains("os error 17"),
+            "should replace the cryptic OS error, got: {message}"
+        );
     }
 
     #[test]
