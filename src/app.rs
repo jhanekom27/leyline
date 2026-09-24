@@ -802,9 +802,11 @@ impl AppState {
 
     /// Handles `/send <path>`: `arg` is everything after `/send ` (already
     /// trimmed), naming a local file to share with the active channel.
-    /// Only checks that a path was given -- app.rs never touches the
-    /// filesystem (see this module's doc comment), so the path itself is
-    /// validated by the caller (`net::Net::send_file`) once this returns.
+    /// Strips one layer of surrounding quotes (see `strip_quotes`) and
+    /// otherwise only checks that a path was given -- app.rs never
+    /// touches the filesystem (see this module's doc comment), so the
+    /// path itself (existence, `~`-expansion, etc.) is validated and
+    /// resolved by the caller (`net::Net::send_file`) once this returns.
     /// Pushes an immediate breadcrumb since importing and broadcasting a
     /// file happens in the background and may take a moment.
     fn run_send(&mut self, arg: &str) -> Option<InputAction> {
@@ -812,14 +814,15 @@ impl AppState {
             self.push_system("usage: /send <path>");
             return None;
         }
-        let name = Path::new(arg)
+        let path = strip_quotes(arg);
+        let name = Path::new(path)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| arg.to_string());
+            .unwrap_or_else(|| path.to_string());
         self.push_system(format!("sending {name}..."));
         Some(InputAction::SendFile {
             channel: self.active().name.clone(),
-            path: arg.to_string(),
+            path: path.to_string(),
         })
     }
 
@@ -1043,6 +1046,19 @@ fn hex_prefix(bytes: &[u8; 32]) -> String {
 /// another instance's `--connect` flag.
 pub fn hex_id(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Strips one layer of matching leading/trailing quotes from a `/send`
+/// argument, e.g. `"~/Downloads/file.png"` -- there's no shell here to do
+/// that for us, and some copy/paste or drag-and-drop sources wrap a path
+/// in quotes out of habit. Left as-is if the quotes don't match (or
+/// there's only one).
+fn strip_quotes(arg: &str) -> &str {
+    let bytes = arg.as_bytes();
+    let quoted = bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''));
+    if quoted { &arg[1..arg.len() - 1] } else { arg }
 }
 
 fn compose_message(sender: [u8; 32], text: &str) -> ChatMessage {
@@ -2210,6 +2226,34 @@ mod tests {
         assert!(action.is_none());
         let last = as_system(app.active().messages.back().unwrap());
         assert!(last.starts_with("usage:"), "got: {last}");
+    }
+
+    #[test]
+    fn slash_send_strips_surrounding_double_quotes() {
+        let mut app = app();
+        let action = submit(&mut app, "/send \"~/Downloads/tilemap.png\"");
+        match action.expect("non-empty /send returns an action") {
+            InputAction::SendFile { path, .. } => {
+                assert_eq!(path, "~/Downloads/tilemap.png");
+            }
+            _ => panic!("expected InputAction::SendFile"),
+        }
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "sending tilemap.png...");
+    }
+
+    #[test]
+    fn strip_quotes_strips_matching_double_or_single_quotes() {
+        assert_eq!(strip_quotes("\"foo\""), "foo");
+        assert_eq!(strip_quotes("'foo'"), "foo");
+    }
+
+    #[test]
+    fn strip_quotes_leaves_unquoted_or_mismatched_input_alone() {
+        assert_eq!(strip_quotes("foo"), "foo");
+        assert_eq!(strip_quotes("\"foo"), "\"foo");
+        assert_eq!(strip_quotes("'foo\""), "'foo\"");
+        assert_eq!(strip_quotes("\""), "\"");
     }
 
     #[test]

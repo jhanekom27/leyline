@@ -6,7 +6,7 @@
 //! name it came from, into the app's event loop over an `mpsc` channel.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -145,6 +145,27 @@ fn parse_join_arg(arg: &str) -> Result<(String, Option<(RoomSecret, EndpointAddr
 /// outcome.
 fn is_self(addr: &EndpointAddr, our_id: [u8; 32]) -> bool {
     *addr.id.as_bytes() == our_id
+}
+
+/// Expands a `/send`-typed path for the local filesystem: a leading `~`
+/// (bare, or `~/...`) to the user's home directory, and any relative path
+/// to absolute. Both matter because the path is typed directly into
+/// leyline's own input box, not a shell -- nothing else expands `~`
+/// here -- and because iroh-blobs' importer (`BackfillStore::add_file`)
+/// hard-requires an absolute path, rejecting a relative one outright.
+/// Falls back to the path as typed if the home or current directory can't
+/// be determined.
+fn expand_path(path: &str) -> PathBuf {
+    let expanded = if path == "~" {
+        directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(rest))
+    } else {
+        None
+    }
+    .unwrap_or_else(|| PathBuf::from(path));
+
+    std::path::absolute(&expanded).unwrap_or(expanded)
 }
 
 /// A joined channel's live gossip sender plus the room secret that put us
@@ -756,26 +777,31 @@ impl Net {
     /// does that via `send` once it receives `FileReady`, the same place
     /// every other locally-authored message is broadcast from.
     pub fn send_file(&self, channel: String, path: String) -> Option<String> {
+        let path = expand_path(&path);
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
-            Err(err) => return Some(format!("can't send {path}: {err}")),
+            Err(err) => return Some(format!("can't send {}: {err}", path.display())),
         };
         if !metadata.is_file() {
-            return Some(format!("can't send {path}: not a file"));
+            return Some(format!("can't send {}: not a file", path.display()));
         }
         if metadata.len() > MAX_FILE_SIZE {
             return Some(format!(
-                "can't send {path}: too large ({}, max {})",
+                "can't send {}: too large ({}, max {})",
+                path.display(),
                 crate::files::human_size(metadata.len()),
                 crate::files::human_size(MAX_FILE_SIZE)
             ));
         }
-        let Some(filename) = Path::new(&path)
+        let Some(filename) = path
             .file_name()
             .and_then(|name| name.to_str())
             .map(str::to_string)
         else {
-            return Some(format!("can't send {path}: can't determine a filename"));
+            return Some(format!(
+                "can't send {}: can't determine a filename",
+                path.display()
+            ));
         };
 
         let backfill = self.backfill.clone();
@@ -783,12 +809,12 @@ impl Net {
         let our_id = self.our_id;
         let size = metadata.len();
         tokio::spawn(async move {
-            let hash = match backfill.add_file(Path::new(&path)).await {
+            let hash = match backfill.add_file(&path).await {
                 Ok(hash) => hash,
                 Err(err) => {
                     let _ = events_tx
                         .send(NetEvent::FileSendFailed {
-                            path,
+                            path: path.display().to_string(),
                             error: err.to_string(),
                         })
                         .await;
@@ -1060,5 +1086,44 @@ mod tests {
     fn topic_for_secret_is_deterministic_for_the_same_secret() {
         let secret = RoomSecret::generate();
         assert_eq!(topic_for_secret(&secret), topic_for_secret(&secret));
+    }
+
+    fn home_dir() -> PathBuf {
+        directories::BaseDirs::new()
+            .unwrap()
+            .home_dir()
+            .to_path_buf()
+    }
+
+    #[test]
+    fn expand_path_expands_a_bare_tilde_to_the_home_directory() {
+        assert_eq!(expand_path("~"), home_dir());
+    }
+
+    #[test]
+    fn expand_path_expands_a_tilde_prefixed_path() {
+        assert_eq!(
+            expand_path("~/Downloads/tilemap.png"),
+            home_dir().join("Downloads/tilemap.png")
+        );
+    }
+
+    #[test]
+    fn expand_path_makes_a_relative_path_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(expand_path("README.md"), cwd.join("README.md"));
+    }
+
+    #[test]
+    fn expand_path_leaves_an_already_absolute_path_alone() {
+        assert_eq!(expand_path("/tmp/foo.txt"), PathBuf::from("/tmp/foo.txt"));
+    }
+
+    #[test]
+    fn expand_path_does_not_expand_a_tilde_in_the_middle_of_a_path() {
+        // Only a leading `~` is special, mirroring shell tilde expansion --
+        // `foo/~/bar` is just a literal (if unusual) relative path.
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(expand_path("foo/~/bar"), cwd.join("foo/~/bar"));
     }
 }
