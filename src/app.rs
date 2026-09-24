@@ -114,6 +114,51 @@ impl Channel {
             })
             .collect()
     }
+
+    /// Ids of chat messages currently visible in this channel, oldest
+    /// first: its active `/search` results if one is running (mirroring
+    /// what's actually on screen), else its full loaded transcript
+    /// (skipping `System` lines, which aren't reply targets). Shared by
+    /// reply-pick navigation (`AppState::start_reply_pick`/
+    /// `move_reply_pick`/`run_reply`), so picking only ever lands on a
+    /// message the user can currently see.
+    fn visible_chat_ids(&self) -> Vec<u64> {
+        if let Some(search) = &self.search {
+            return search.messages.iter().map(|message| message.id).collect();
+        }
+        self.messages
+            .iter()
+            .filter_map(|line| match line {
+                TranscriptLine::Chat(message) => Some(message.id),
+                TranscriptLine::System(_) => None,
+            })
+            .collect()
+    }
+
+    /// Finds a chat message by id in this channel, checking its active
+    /// search results first (if any -- `search.messages` can hold matches
+    /// from `search::run_on_disk_scan` that are older than what
+    /// `self.messages` keeps under `MAX_SCROLLBACK`) and then falling back
+    /// to the full loaded transcript. The fallback matters even with a
+    /// search active: a reply's quoted parent (`ui::reply_preview_spans`)
+    /// should still resolve when it simply doesn't match the current
+    /// filter, unlike `visible_chat_ids`, which deliberately only offers
+    /// up messages the user can currently see to *pick* a reply target
+    /// from. Also used to describe what `/reply` just armed
+    /// (`AppState::run_reply`). `None` covers a dangling `reply_to` just
+    /// as much as an outright-unknown id -- see `ChatMessage::reply_to`'s
+    /// doc comment.
+    pub fn find_message(&self, id: u64) -> Option<&ChatMessage> {
+        if let Some(search) = &self.search
+            && let Some(message) = search.messages.iter().find(|message| message.id == id)
+        {
+            return Some(message);
+        }
+        self.messages.iter().find_map(|line| match line {
+            TranscriptLine::Chat(message) if message.id == id => Some(message),
+            _ => None,
+        })
+    }
 }
 
 /// An action for the caller (`main.rs`) to perform in response to a
@@ -195,6 +240,18 @@ pub struct AppState {
     /// `petnames`: a broadcast nickname isn't ours to persist, and its
     /// owner re-announces it on every reconnect anyway.
     nicknames: HashMap<[u8; 32], String>,
+    /// The in-progress candidate while picking a reply target with
+    /// `Ctrl+R` (see `start_reply_pick`/`move_reply_pick`), by message id.
+    /// `None` when not picking -- `handle_key` checks this first, before
+    /// normal typing/editing, to dispatch into `handle_picking_key`.
+    pub picking_reply: Option<u64>,
+    /// The armed reply target for the next sent message (confirmed via
+    /// `Enter` while picking, or `/reply`), by message id. Attached to the
+    /// next `Send`-ed `ChatMessage` and cleared on send (`send_text`), on
+    /// `Esc` (`handle_key`), or whenever the active channel changes
+    /// (`switch_channel`, `remove_channel`, `NetEvent::Joined`) -- a reply
+    /// id only makes sense against the channel it was picked in.
+    pub replying_to: Option<u64>,
 }
 
 impl AppState {
@@ -228,6 +285,8 @@ impl AppState {
             show_hints: true,
             petnames: HashMap::new(),
             nicknames: HashMap::new(),
+            picking_reply: None,
+            replying_to: None,
         }
     }
 
@@ -351,13 +410,33 @@ impl AppState {
     }
 
     /// Pure key handling: no I/O, no network. Returns the action to
-    /// perform when `Enter` sends a message or runs a command, so the
-    /// caller can talk to the network layer.
+    /// perform when `Enter` sends a message or runs a `/join`
+    /// or `/invite` command, so the caller can talk to the network layer.
+    ///
+    /// Delegates to `handle_picking_key` first, before any of the normal
+    /// typing/editing arms below, whenever a reply pick is in progress
+    /// (`picking_reply.is_some()`, see `start_reply_pick`) -- keeps that
+    /// transient mode's key handling (`Up`/`Down`/`Enter`/`Esc` all mean
+    /// something different while picking) from having to be threaded
+    /// through every arm of the match below.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<InputAction> {
+        if self.picking_reply.is_some() {
+            self.handle_picking_key(key);
+            return None;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc => self.should_quit = true,
+            // Backs out one level at a time: cancel an armed reply first
+            // (mirroring `handle_picking_key`'s own Esc, which cancels a
+            // pick-in-progress instead of confirming it), only quitting
+            // once nothing is armed.
+            KeyCode::Esc => {
+                if self.replying_to.take().is_none() {
+                    self.should_quit = true;
+                }
+            }
             KeyCode::Char('c') if ctrl => self.should_quit = true,
+            KeyCode::Char('r') if ctrl => self.start_reply_pick(),
             KeyCode::Char('a') if ctrl => self.move_home(),
             KeyCode::Char('e') if ctrl => self.move_end(),
             KeyCode::Char('u') if ctrl => self.delete_to_start(),
@@ -393,6 +472,27 @@ impl AppState {
             _ => {}
         }
         None
+    }
+
+    /// Handles a keypress while picking a reply target (`Ctrl+R`, see
+    /// `start_reply_pick`): `Up`/`Down` move the highlighted candidate
+    /// (`move_reply_pick`), `Enter` arms it as `replying_to`, `Esc`
+    /// cancels back to normal typing. `Ctrl+C` still force-quits, since
+    /// `Esc` no longer does while picking. Every other key is ignored --
+    /// picking is a dedicated mode, not an overlay on normal editing, so a
+    /// stray keystroke can't leak into the input box.
+    fn handle_picking_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
+            return;
+        }
+        match key.code {
+            KeyCode::Up => self.move_reply_pick(-1),
+            KeyCode::Down => self.move_reply_pick(1),
+            KeyCode::Enter => self.replying_to = self.picking_reply.take(),
+            KeyCode::Esc => self.picking_reply = None,
+            _ => {}
+        }
     }
 
     /// Applies a network event: updates presence, pushes a deduped incoming
@@ -447,6 +547,8 @@ impl AppState {
                     }
                 }
                 self.active_mut().has_unread = false;
+                self.picking_reply = None;
+                self.replying_to = None;
                 None
             }
             NetEvent::JoinFailed(name, error) => {
@@ -521,6 +623,12 @@ impl AppState {
             self.active -= 1;
         } else if self.active == index {
             self.active = self.active.min(self.channels.len().saturating_sub(1));
+            // Only this branch actually switches to a different channel
+            // (the other one just re-numbers the same channel after an
+            // earlier tab's removal) -- a reply id only makes sense
+            // against the channel it was picked in.
+            self.picking_reply = None;
+            self.replying_to = None;
         }
         self.push_system(format!("left #{channel}"));
     }
@@ -548,9 +656,10 @@ impl AppState {
     /// the background clipboard read rather than through
     /// `handle_key`/`submit_input`. The caller still needs to broadcast,
     /// persist, and display the result exactly like any other
-    /// locally-authored message (see `record_sent_message`).
+    /// locally-authored message (see `record_sent_message`). Never a
+    /// reply -- this flow doesn't go through the reply-picking UI.
     pub fn compose_own_message(&self, text: &str) -> ChatMessage {
-        compose_message(self.self_id, text)
+        compose_message(self.self_id, text, None)
     }
 
     /// Displays a sender as "you" for our own id; their pet name if one
@@ -579,7 +688,8 @@ impl AppState {
 
     /// Moves `active` forward (`step = 1`) or backward (`step = -1`)
     /// through `channels`, wrapping, and clears the new active channel's
-    /// unread flag.
+    /// unread flag. Also clears any in-progress reply pick or armed reply
+    /// -- both are only meaningful against the channel they were made in.
     fn switch_channel(&mut self, step: isize) {
         if self.channels.len() <= 1 {
             return;
@@ -588,6 +698,8 @@ impl AppState {
         let next = (self.active as isize + step).rem_euclid(len) as usize;
         self.active = next;
         self.active_mut().has_unread = false;
+        self.picking_reply = None;
+        self.replying_to = None;
     }
 
     fn submit_input(&mut self) -> Option<InputAction> {
@@ -602,12 +714,23 @@ impl AppState {
             return self.run_command(rest.trim());
         }
 
+        let reply_to = self.replying_to.take();
+        Some(self.send_text(&text, reply_to))
+    }
+
+    /// Composes `text` as a message from us -- replying to `reply_to` if
+    /// given -- records it in the active channel's transcript, and
+    /// returns the `InputAction` for the caller to broadcast/persist. The
+    /// shared tail end of sending a plain typed message (`submit_input`,
+    /// which passes the armed `replying_to` if any) and `/reply <text>`'s
+    /// one-shot send (`run_reply`).
+    fn send_text(&mut self, text: &str, reply_to: Option<u64>) -> InputAction {
         let channel = self.active().name.clone();
-        let message = compose_message(self.self_id, &text);
+        let message = compose_message(self.self_id, text, reply_to);
         self.active_mut().remember_seen(message.id);
         self.active_mut()
             .push(TranscriptLine::Chat(message.clone()));
-        Some(InputAction::Send(channel, message))
+        InputAction::Send(channel, message)
     }
 
     /// Parses a `/command [args]` line (the text after the leading `/`,
@@ -636,6 +759,7 @@ impl AppState {
             "save" => self.run_save(arg.trim()),
             "paste" => self.run_paste(),
             "search" | "s" => self.run_search(arg.trim()),
+            "reply" => self.run_reply(arg.trim()),
             "hints" => self.run_hints(),
             "help" => self.run_help(),
             _ => {
@@ -653,9 +777,9 @@ impl AppState {
         self.push_system(
             "commands: /join <name|ticket>, /invite, /leave [channel], /who, \
              /send <path>, /save <hash-prefix>, /paste, /alias <hex-prefix> <name>, \
-             /nick <name>, /search <term> (or /s), /hints, /help -- keys: \
-             Tab/Shift+Tab switch channels, Ctrl+V paste, Up/Down scroll, \
-             Esc/Ctrl+C quit",
+             /nick <name>, /search <term> (or /s), /reply [text], /hints, /help -- keys: \
+             Tab/Shift+Tab switch channels, Ctrl+V paste, Ctrl+R reply (\u{2191}/\u{2193} pick, \
+             Enter confirm), Up/Down scroll, Esc/Ctrl+C quit",
         );
         None
     }
@@ -826,6 +950,76 @@ impl AppState {
             channel: self.active().name.clone(),
             term: arg.to_string(),
         })
+    }
+
+    /// Finds the newest message currently visible in the active channel
+    /// to use as a reply target -- shared by `Ctrl+R` (`start_reply_pick`)
+    /// and `/reply` (`run_reply`). Reports an error and returns `None` if
+    /// the channel has no messages to reply to, mirroring `/who`'s
+    /// empty-channel notice.
+    fn newest_reply_candidate(&mut self) -> Option<u64> {
+        match self.active().visible_chat_ids().last().copied() {
+            Some(id) => Some(id),
+            None => {
+                self.push_system("no messages to reply to");
+                None
+            }
+        }
+    }
+
+    /// Handles `Ctrl+R`: begins picking a reply target by highlighting the
+    /// newest message currently visible in the active channel -- confirm
+    /// with `Enter`, move with `Up`/`Down`, cancel with `Esc` (see
+    /// `handle_picking_key`).
+    fn start_reply_pick(&mut self) {
+        if let Some(id) = self.newest_reply_candidate() {
+            self.picking_reply = Some(id);
+        }
+    }
+
+    /// Moves an in-progress reply pick (`picking_reply`) by `delta`
+    /// through the active channel's currently visible chat messages
+    /// (`Channel::visible_chat_ids`), oldest to newest. Clamps at both
+    /// ends rather than wrapping -- "past the newest" and "before the
+    /// oldest" aren't meaningful positions to cycle from. A no-op if
+    /// nothing is being picked, or if the picked id has since fallen out
+    /// of `visible_chat_ids` (shouldn't normally happen, since
+    /// `start_reply_pick` always seeds it from that same list).
+    fn move_reply_pick(&mut self, delta: isize) {
+        let Some(current) = self.picking_reply else {
+            return;
+        };
+        let ids = self.active().visible_chat_ids();
+        let Some(pos) = ids.iter().position(|&id| id == current) else {
+            return;
+        };
+        let new_pos = (pos as isize + delta).clamp(0, ids.len() as isize - 1) as usize;
+        self.picking_reply = Some(ids[new_pos]);
+    }
+
+    /// Handles `/reply [text]`: `arg` is everything after `/reply `
+    /// (already trimmed). Arms a reply to the newest message in the
+    /// active channel -- equivalent to `Ctrl+R` then `Enter` without
+    /// moving the selection -- scoped to the most recent message overall,
+    /// not per-sender; `Ctrl+R` picking is the way to target an older or
+    /// specific-sender message. With no `arg`, leaves the user to type the
+    /// reply normally afterward; with one, immediately composes and sends
+    /// it as that reply, the same way a normal `Enter` send would once
+    /// armed (see `send_text`).
+    fn run_reply(&mut self, arg: &str) -> Option<InputAction> {
+        let id = self.newest_reply_candidate()?;
+        let sender = self
+            .active()
+            .find_message(id)
+            .expect("id just came from this channel's own visible_chat_ids")
+            .sender;
+        self.push_system(format!("replying to {}", self.display_name(&sender)));
+        self.replying_to = Some(id);
+        if arg.is_empty() {
+            return None;
+        }
+        let reply_to = self.replying_to.take();
+        Some(self.send_text(arg, reply_to))
     }
 
     /// Handles `/send <path>`: `arg` is everything after `/send ` (already
@@ -1134,14 +1328,15 @@ fn strip_quotes(arg: &str) -> &str {
     if quoted { &arg[1..arg.len() - 1] } else { arg }
 }
 
-fn compose_message(sender: [u8; 32], text: &str) -> ChatMessage {
+fn compose_message(sender: [u8; 32], text: &str, reply_to: Option<u64>) -> ChatMessage {
     ChatMessage {
-        v: 2,
+        v: 3,
         id: rand::random(),
         sender,
         ts_unix_ms: now_unix_ms(),
         text: text.to_string(),
         attachment: None,
+        reply_to,
     }
 }
 
@@ -1388,7 +1583,7 @@ mod tests {
         let mut app = app();
         app.handle_net_event(NetEvent::Received(
             "general".to_string(),
-            compose_message(PEER_ID, "hi"),
+            compose_message(PEER_ID, "hi", None),
         ));
 
         let full_id = hex_id(&PEER_ID);
@@ -1584,7 +1779,7 @@ mod tests {
     #[test]
     fn received_message_is_deduped_by_id() {
         let mut app = app();
-        let message = compose_message(PEER_ID, "hi from a peer");
+        let message = compose_message(PEER_ID, "hi from a peer", None);
         let before = app.active().messages.len();
         app.handle_net_event(NetEvent::Received("general".to_string(), message.clone()));
         assert_eq!(app.active().messages.len(), before + 1);
@@ -1626,7 +1821,7 @@ mod tests {
         let mut app = multi_channel_app();
         app.active = 1; // "random" is active; "general" is not
 
-        let message = compose_message(PEER_ID, "hello");
+        let message = compose_message(PEER_ID, "hello", None);
         app.handle_net_event(NetEvent::Received("general".to_string(), message));
 
         assert!(app.channels[0].has_unread, "inactive channel gets flagged");
@@ -1636,7 +1831,7 @@ mod tests {
     #[test]
     fn received_message_on_active_channel_does_not_mark_unread() {
         let mut app = app();
-        let message = compose_message(PEER_ID, "hello");
+        let message = compose_message(PEER_ID, "hello", None);
         app.handle_net_event(NetEvent::Received("general".to_string(), message));
         assert!(!app.active().has_unread);
     }
@@ -1647,7 +1842,7 @@ mod tests {
         app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
         app.handle_net_event(NetEvent::Received(
             "general".to_string(),
-            compose_message(PEER_ID, "only in general"),
+            compose_message(PEER_ID, "only in general", None),
         ));
 
         assert_eq!(app.channels[0].peers, vec![PEER_ID]);
@@ -2002,7 +2197,7 @@ mod tests {
     #[test]
     fn handle_net_event_returns_channel_and_message_for_a_new_received_message() {
         let mut app = app();
-        let message = compose_message(PEER_ID, "hello");
+        let message = compose_message(PEER_ID, "hello", None);
         let result =
             app.handle_net_event(NetEvent::Received("general".to_string(), message.clone()));
         match result {
@@ -2017,7 +2212,7 @@ mod tests {
     #[test]
     fn handle_net_event_returns_none_for_a_duplicate_received_message() {
         let mut app = app();
-        let message = compose_message(PEER_ID, "hello");
+        let message = compose_message(PEER_ID, "hello", None);
         app.handle_net_event(NetEvent::Received("general".to_string(), message.clone()));
         let result = app.handle_net_event(NetEvent::Received("general".to_string(), message));
         assert!(result.is_none());
@@ -2033,7 +2228,7 @@ mod tests {
     #[test]
     fn load_history_seeds_transcript_and_dedupes_like_live_messages() {
         let mut app = app();
-        let message = compose_message(PEER_ID, "from before restart");
+        let message = compose_message(PEER_ID, "from before restart", None);
         app.load_history("general", vec![message.clone()]);
 
         assert_eq!(app.active().messages.len(), 1);
@@ -2048,7 +2243,7 @@ mod tests {
     #[test]
     fn load_history_on_an_unjoined_channel_is_a_no_op() {
         let mut app = app();
-        app.load_history("nonexistent", vec![compose_message(PEER_ID, "hi")]);
+        app.load_history("nonexistent", vec![compose_message(PEER_ID, "hi", None)]);
         assert_eq!(app.active().messages.len(), 0);
     }
 
@@ -2060,6 +2255,20 @@ mod tests {
             ts_unix_ms,
             text: text.to_string(),
             attachment: None,
+            reply_to: None,
+        }
+    }
+
+    fn reply_message(
+        ts_unix_ms: u64,
+        id: u64,
+        sender: [u8; 32],
+        text: &str,
+        reply_to: u64,
+    ) -> ChatMessage {
+        ChatMessage {
+            reply_to: Some(reply_to),
+            ..dated_message(ts_unix_ms, id, sender, text)
         }
     }
 
@@ -2075,6 +2284,7 @@ mod tests {
                 size: content.len() as u64,
                 hash: iroh_blobs::Hash::new(content),
             }),
+            reply_to: None,
         }
     }
 
@@ -2171,11 +2381,11 @@ mod tests {
         let mut app = app();
         app.handle_net_event(NetEvent::Received(
             "general".to_string(),
-            compose_message(PEER_ID, "hello world"),
+            compose_message(PEER_ID, "hello world", None),
         ));
         app.handle_net_event(NetEvent::Received(
             "general".to_string(),
-            compose_message(PEER_ID, "goodbye"),
+            compose_message(PEER_ID, "goodbye", None),
         ));
 
         let action = submit(&mut app, "/search world");
@@ -2202,7 +2412,7 @@ mod tests {
         let mut app = app();
         app.handle_net_event(NetEvent::Received(
             "general".to_string(),
-            compose_message(PEER_ID, "Hello World"),
+            compose_message(PEER_ID, "Hello World", None),
         ));
 
         submit(&mut app, "/search WORLD");
@@ -2266,7 +2476,7 @@ mod tests {
         let mut app = app();
         app.handle_net_event(NetEvent::Received(
             "general".to_string(),
-            compose_message(PEER_ID, "hello there"),
+            compose_message(PEER_ID, "hello there", None),
         ));
         let action = submit(&mut app, "/search hello");
         let term = match action.expect("search returns an action") {
@@ -2318,7 +2528,7 @@ mod tests {
         let mut app = app();
         app.handle_net_event(NetEvent::Received(
             "general".to_string(),
-            compose_message(PEER_ID, "hello world"),
+            compose_message(PEER_ID, "hello world", None),
         ));
 
         let action = submit(&mut app, "/s world");
@@ -2551,5 +2761,320 @@ mod tests {
             .as_ref()
             .expect("search should be active");
         assert_eq!(search.messages.len(), 1);
+    }
+
+    fn ctrl_r(app: &mut AppState) -> Option<InputAction> {
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+    }
+
+    #[test]
+    fn find_message_resolves_a_message_still_in_the_transcript() {
+        let mut app = app();
+        let parent = compose_message(PEER_ID, "original", None);
+        let parent_id = parent.id;
+        app.handle_net_event(NetEvent::Received("general".to_string(), parent));
+        let reply = reply_message(1, 999, PEER_ID_2, "sounds good", parent_id);
+        app.handle_net_event(NetEvent::Received("general".to_string(), reply));
+
+        let found = app
+            .active()
+            .find_message(parent_id)
+            .expect("parent must resolve");
+        assert_eq!(found.text, "original");
+    }
+
+    #[test]
+    fn find_message_returns_none_for_an_unknown_id() {
+        let app = app();
+        assert!(app.active().find_message(12345).is_none());
+    }
+
+    #[test]
+    fn ctrl_r_with_no_messages_pushes_a_notice_and_does_not_enter_picking() {
+        let mut app = app();
+        ctrl_r(&mut app);
+        assert!(app.picking_reply.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "no messages to reply to");
+    }
+
+    #[test]
+    fn ctrl_r_selects_the_newest_message() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::Received(
+            "general".to_string(),
+            compose_message(PEER_ID, "first", None),
+        ));
+        let newest = compose_message(PEER_ID, "second", None);
+        let newest_id = newest.id;
+        app.handle_net_event(NetEvent::Received("general".to_string(), newest));
+
+        ctrl_r(&mut app);
+
+        assert_eq!(app.picking_reply, Some(newest_id));
+    }
+
+    #[test]
+    fn ctrl_r_picks_from_active_search_results_when_a_search_is_running() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::Received(
+            "general".to_string(),
+            compose_message(PEER_ID, "apple", None),
+        ));
+        let matching = compose_message(PEER_ID, "banana split", None);
+        let matching_id = matching.id;
+        app.handle_net_event(NetEvent::Received("general".to_string(), matching));
+        app.handle_net_event(NetEvent::Received(
+            "general".to_string(),
+            compose_message(PEER_ID, "cherry", None),
+        ));
+
+        submit(&mut app, "/search banana");
+        ctrl_r(&mut app);
+
+        assert_eq!(
+            app.picking_reply,
+            Some(matching_id),
+            "picking must be scoped to the active search's results"
+        );
+    }
+
+    #[test]
+    fn up_and_down_move_the_pick_older_and_newer_and_clamp_at_both_ends() {
+        let mut app = app();
+        let first = compose_message(PEER_ID, "first", None);
+        let second = compose_message(PEER_ID, "second", None);
+        let (first_id, second_id) = (first.id, second.id);
+        app.handle_net_event(NetEvent::Received("general".to_string(), first));
+        app.handle_net_event(NetEvent::Received("general".to_string(), second));
+
+        ctrl_r(&mut app);
+        assert_eq!(app.picking_reply, Some(second_id));
+
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.picking_reply, Some(first_id));
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(
+            app.picking_reply,
+            Some(first_id),
+            "must clamp at the oldest message"
+        );
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.picking_reply, Some(second_id));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            app.picking_reply,
+            Some(second_id),
+            "must clamp at the newest message"
+        );
+    }
+
+    #[test]
+    fn enter_confirms_the_pick_and_exits_picking() {
+        let mut app = app();
+        let message = compose_message(PEER_ID, "hi", None);
+        let id = message.id;
+        app.handle_net_event(NetEvent::Received("general".to_string(), message));
+
+        ctrl_r(&mut app);
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.picking_reply.is_none());
+        assert_eq!(app.replying_to, Some(id));
+    }
+
+    #[test]
+    fn esc_while_picking_cancels_without_quitting() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::Received(
+            "general".to_string(),
+            compose_message(PEER_ID, "hi", None),
+        ));
+        ctrl_r(&mut app);
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.picking_reply.is_none());
+        assert!(app.replying_to.is_none());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_while_picking_still_quits() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::Received(
+            "general".to_string(),
+            compose_message(PEER_ID, "hi", None),
+        ));
+        ctrl_r(&mut app);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn esc_with_an_armed_reply_clears_it_without_quitting() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::Received(
+            "general".to_string(),
+            compose_message(PEER_ID, "hi", None),
+        ));
+        ctrl_r(&mut app);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.replying_to.is_some());
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.replying_to.is_none());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn sending_while_armed_attaches_reply_to_and_clears_armed_state() {
+        let mut app = app();
+        let parent = compose_message(PEER_ID, "original", None);
+        let parent_id = parent.id;
+        app.handle_net_event(NetEvent::Received("general".to_string(), parent));
+        app.replying_to = Some(parent_id);
+
+        let action = submit(&mut app, "sounds good");
+
+        match action.expect("a non-empty send returns an action") {
+            InputAction::Send(_, message) => assert_eq!(message.reply_to, Some(parent_id)),
+            _ => panic!("expected InputAction::Send"),
+        }
+        assert!(app.replying_to.is_none());
+    }
+
+    #[test]
+    fn running_a_command_while_armed_does_not_clear_it() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::Received(
+            "general".to_string(),
+            compose_message(PEER_ID, "hi", None),
+        ));
+        ctrl_r(&mut app);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.replying_to.is_some());
+
+        submit(&mut app, "/hints");
+
+        assert!(
+            app.replying_to.is_some(),
+            "an unrelated command must not clear an armed reply"
+        );
+    }
+
+    #[test]
+    fn switch_channel_clears_an_armed_reply() {
+        let mut app = multi_channel_app();
+        app.replying_to = Some(2);
+
+        app.handle_key(key(KeyCode::Tab));
+
+        assert!(app.replying_to.is_none());
+    }
+
+    #[test]
+    fn switch_channel_directly_clears_picking_and_armed_reply() {
+        // `switch_channel` itself must clear both, even though `Tab` can't
+        // actually reach it while picking in practice -- `handle_key`
+        // routes every key through `handle_picking_key` first in that
+        // state (see `esc_while_picking_cancels_without_quitting` and
+        // friends), which has no `Tab` arm of its own. Calling the method
+        // directly still documents/guards the invariant.
+        let mut app = multi_channel_app();
+        app.picking_reply = Some(1);
+        app.replying_to = Some(2);
+
+        app.switch_channel(1);
+
+        assert!(app.picking_reply.is_none());
+        assert!(app.replying_to.is_none());
+    }
+
+    #[test]
+    fn remove_channel_of_the_active_one_clears_picking_and_armed_reply() {
+        let mut app = multi_channel_app();
+        assert_eq!(app.active().name, "random");
+        app.picking_reply = Some(1);
+        app.replying_to = Some(2);
+
+        app.remove_channel("random");
+
+        assert!(app.picking_reply.is_none());
+        assert!(app.replying_to.is_none());
+    }
+
+    #[test]
+    fn remove_channel_of_a_different_tab_preserves_picking_and_armed_reply() {
+        let mut app = multi_channel_app();
+        assert_eq!(app.active().name, "random");
+        app.picking_reply = Some(1);
+        app.replying_to = Some(2);
+
+        app.remove_channel("general");
+
+        assert_eq!(app.picking_reply, Some(1));
+        assert_eq!(app.replying_to, Some(2));
+    }
+
+    #[test]
+    fn joined_event_clears_picking_and_armed_reply() {
+        let mut app = app();
+        app.picking_reply = Some(1);
+        app.replying_to = Some(2);
+
+        app.handle_net_event(NetEvent::Joined("project-x".to_string()));
+
+        assert!(app.picking_reply.is_none());
+        assert!(app.replying_to.is_none());
+    }
+
+    #[test]
+    fn slash_reply_with_no_messages_reports_an_error() {
+        let mut app = app();
+        let action = submit(&mut app, "/reply");
+        assert!(action.is_none());
+        assert!(app.replying_to.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "no messages to reply to");
+    }
+
+    #[test]
+    fn slash_reply_with_no_text_arms_the_most_recent_message_and_pushes_a_notice() {
+        let mut app = app();
+        let message = compose_message(PEER_ID, "original", None);
+        let id = message.id;
+        app.handle_net_event(NetEvent::Received("general".to_string(), message));
+
+        let action = submit(&mut app, "/reply");
+
+        assert!(action.is_none());
+        assert_eq!(app.replying_to, Some(id));
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.starts_with("replying to"), "got: {last}");
+    }
+
+    #[test]
+    fn slash_reply_with_text_arms_and_sends_in_one_step() {
+        let mut app = app();
+        let message = compose_message(PEER_ID, "original", None);
+        let id = message.id;
+        app.handle_net_event(NetEvent::Received("general".to_string(), message));
+
+        let action = submit(&mut app, "/reply sounds good");
+
+        match action.expect("/reply <text> returns a send action") {
+            InputAction::Send(channel, sent) => {
+                assert_eq!(channel, "general");
+                assert_eq!(sent.text, "sounds good");
+                assert_eq!(sent.reply_to, Some(id));
+            }
+            _ => panic!("expected InputAction::Send"),
+        }
+        assert!(app.replying_to.is_none());
     }
 }

@@ -147,6 +147,7 @@ mod tests {
             ts_unix_ms: 0,
             text: text.to_string(),
             attachment: None,
+            reply_to: None,
         }
     }
 
@@ -302,5 +303,37 @@ mod tests {
         let loaded = store.load("general").unwrap();
 
         assert_eq!(loaded, vec![sample_message(1, "from before the upgrade")]);
+    }
+
+    #[test]
+    fn load_still_works_for_a_record_persisted_before_replies_existed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MessageStore::new(dir.path().to_path_buf()).unwrap();
+
+        // Byte-identical to what `append` would have written for a
+        // `ChatMessage` before `reply_to` was added -- mirrors
+        // `load_still_works_for_a_record_persisted_before_attachments_existed`
+        // above, one field shape newer (includes `attachment`, not yet
+        // `reply_to`).
+        let old_shape: (
+            u8,
+            u64,
+            [u8; 32],
+            u64,
+            String,
+            Option<crate::message::FileAttachment>,
+        ) = (2, 5, [2; 32], 10, "from before replies".to_string(), None);
+        let payload = postcard::to_stdvec(&old_shape).unwrap();
+        let mut record = Vec::new();
+        record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        record.extend_from_slice(&payload);
+        fs::write(store.path_for("general"), &record).unwrap();
+
+        let loaded = store.load("general").unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, 5);
+        assert_eq!(loaded[0].text, "from before replies");
+        assert_eq!(loaded[0].reply_to, None);
     }
 }

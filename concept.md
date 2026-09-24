@@ -111,6 +111,7 @@ pub struct ChatMessage {
     pub ts_unix_ms: u64,
     pub text: String,
     pub attachment: Option<FileAttachment>, // a /send'd file, if any
+    pub reply_to: Option<u64>, // id of the message being replied to, if any
 }
 ```
 

@@ -26,31 +26,73 @@ pub struct ChatMessage {
     /// sharing" idea. Added behind the `v: 2` bump; `decode` below still
     /// loads messages persisted before this field existed.
     pub attachment: Option<FileAttachment>,
+    /// The id of the message this one is replying to, if any -- see
+    /// features.md's "Replies" idea. Added behind the `v: 3` bump;
+    /// `decode` below still loads messages persisted before this field
+    /// existed. Never verified to actually resolve -- the replied-to
+    /// message may have expired from scrollback, never arrived, or never
+    /// existed at all, so renderers (see `ui::reply_preview_spans`) must
+    /// handle a dangling id gracefully rather than assuming it resolves.
+    pub reply_to: Option<u64>,
 }
 
 impl ChatMessage {
-    /// Decodes a `ChatMessage` from postcard bytes, falling back to the
-    /// pre-attachment (`v: 1`) shape for messages persisted or backfilled
-    /// before `attachment` existed.
+    /// Decodes a `ChatMessage` from postcard bytes, falling back to older
+    /// shapes for messages persisted or backfilled before this build's
+    /// fields existed: `v: 2` (pre-`reply_to`) then `v: 1` (pre-`attachment`
+    /// too).
     ///
     /// postcard encodes structs positionally with no field names, so a
-    /// plain `postcard::from_bytes::<ChatMessage>` fails outright on that
-    /// older, shorter shape instead of defaulting the missing field --
+    /// plain `postcard::from_bytes::<ChatMessage>` fails outright on an
+    /// older, shorter shape instead of defaulting the missing field(s) --
     /// `storage::MessageStore::load` and `backfill::BackfillStore::fetch`
-    /// call this instead, so a channel's history persisted before this
-    /// upgrade still loads (just without an attachment, which it never had).
+    /// call this instead, so a channel's history persisted before either
+    /// upgrade still loads (just without whatever field it predates).
     pub fn decode(bytes: &[u8]) -> Result<ChatMessage, postcard::Error> {
         if let Ok(message) = postcard::from_bytes::<ChatMessage>(bytes) {
             return Ok(message);
+        }
+        if let Ok(message) = postcard::from_bytes::<ChatMessageV2>(bytes) {
+            return Ok(message.into_current());
         }
         postcard::from_bytes::<ChatMessageV1>(bytes).map(ChatMessageV1::into_current)
     }
 }
 
-/// `ChatMessage`'s shape before file attachments were added -- kept only so
-/// `ChatMessage::decode` can still load messages persisted under the older,
-/// shorter format. Never constructed directly otherwise (the `Serialize`
-/// half only exists so tests can encode an old-shape record to decode).
+/// `ChatMessage`'s shape before replies were added -- kept only so
+/// `ChatMessage::decode` can still load messages persisted under this
+/// older, shorter format. Never constructed directly otherwise (the
+/// `Serialize` half only exists so tests can encode an old-shape record to
+/// decode).
+#[derive(Serialize, Deserialize)]
+struct ChatMessageV2 {
+    v: u8,
+    id: u64,
+    sender: [u8; 32],
+    ts_unix_ms: u64,
+    text: String,
+    attachment: Option<FileAttachment>,
+}
+
+impl ChatMessageV2 {
+    fn into_current(self) -> ChatMessage {
+        ChatMessage {
+            v: self.v,
+            id: self.id,
+            sender: self.sender,
+            ts_unix_ms: self.ts_unix_ms,
+            text: self.text,
+            attachment: self.attachment,
+            reply_to: None,
+        }
+    }
+}
+
+/// `ChatMessage`'s shape before file attachments (or replies) were added --
+/// kept only so `ChatMessage::decode` can still load messages persisted
+/// under the oldest, shortest format. Never constructed directly otherwise
+/// (the `Serialize` half only exists so tests can encode an old-shape
+/// record to decode).
 #[derive(Serialize, Deserialize)]
 struct ChatMessageV1 {
     v: u8,
@@ -69,6 +111,7 @@ impl ChatMessageV1 {
             ts_unix_ms: self.ts_unix_ms,
             text: self.text,
             attachment: None,
+            reply_to: None,
         }
     }
 }
@@ -163,6 +206,7 @@ mod tests {
             ts_unix_ms: 1000,
             text: "hi".to_string(),
             attachment: None,
+            reply_to: None,
         }
     }
 
@@ -227,6 +271,22 @@ mod tests {
                 size: 1234,
                 hash: iroh_blobs::Hash::new(b"report contents"),
             }),
+            reply_to: None,
+        };
+        let bytes = postcard::to_stdvec(&message).unwrap();
+        assert_eq!(ChatMessage::decode(&bytes).unwrap(), message);
+    }
+
+    #[test]
+    fn decode_round_trips_a_message_with_a_reply() {
+        let message = ChatMessage {
+            v: 3,
+            id: 8,
+            sender: [4; 32],
+            ts_unix_ms: 2001,
+            text: "sounds good".to_string(),
+            attachment: None,
+            reply_to: Some(7),
         };
         let bytes = postcard::to_stdvec(&message).unwrap();
         assert_eq!(ChatMessage::decode(&bytes).unwrap(), message);
@@ -236,8 +296,9 @@ mod tests {
     fn decode_loads_a_message_persisted_before_attachments_existed() {
         // Simulates a record written to disk (or backfilled) before
         // `attachment` was added to `ChatMessage` -- decode must still
-        // succeed, with `attachment` defaulting to `None`, rather than
-        // failing outright the way a plain `postcard::from_bytes` would.
+        // succeed, with `attachment` (and `reply_to`) defaulting to `None`,
+        // rather than failing outright the way a plain `postcard::from_bytes`
+        // would.
         let old = ChatMessageV1 {
             v: 1,
             id: 99,
@@ -255,6 +316,39 @@ mod tests {
         assert_eq!(decoded.ts_unix_ms, 500);
         assert_eq!(decoded.text, "from before the upgrade");
         assert_eq!(decoded.attachment, None);
+        assert_eq!(decoded.reply_to, None);
+    }
+
+    #[test]
+    fn decode_loads_a_message_persisted_before_replies_existed() {
+        // Simulates a record written to disk (or backfilled) before
+        // `reply_to` was added to `ChatMessage` -- decode must still
+        // succeed, with `reply_to` defaulting to `None`, rather than falling
+        // all the way back to the even-older `ChatMessageV1` shape (which
+        // would also incorrectly drop the attachment).
+        let old = ChatMessageV2 {
+            v: 2,
+            id: 100,
+            sender: [9; 32],
+            ts_unix_ms: 600,
+            text: String::new(),
+            attachment: Some(FileAttachment {
+                filename: "notes.txt".to_string(),
+                size: 42,
+                hash: iroh_blobs::Hash::new(b"notes"),
+            }),
+        };
+        let bytes = postcard::to_stdvec(&old).unwrap();
+
+        let decoded = ChatMessage::decode(&bytes).unwrap();
+
+        assert_eq!(decoded.v, 2);
+        assert_eq!(decoded.id, 100);
+        assert_eq!(decoded.reply_to, None);
+        assert!(
+            decoded.attachment.is_some(),
+            "attachment must survive this fallback tier"
+        );
     }
 
     #[test]

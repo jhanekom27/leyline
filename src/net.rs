@@ -867,7 +867,7 @@ impl Net {
                 }
             };
             let message = ChatMessage {
-                v: 2,
+                v: 3,
                 id: rand::random(),
                 sender: our_id,
                 ts_unix_ms: now_unix_ms(),
@@ -877,6 +877,7 @@ impl Net {
                     size,
                     hash,
                 }),
+                reply_to: None,
             };
             let _ = events_tx.send(NetEvent::FileReady(channel, message)).await;
         });
@@ -998,7 +999,7 @@ impl Net {
                 }
             };
             let message = ChatMessage {
-                v: 2,
+                v: 3,
                 id: rand::random(),
                 sender: our_id,
                 ts_unix_ms: now_unix_ms(),
@@ -1008,6 +1009,7 @@ impl Net {
                     size,
                     hash,
                 }),
+                reply_to: None,
             };
             let _ = events_tx.send(NetEvent::FileReady(channel, message)).await;
         });

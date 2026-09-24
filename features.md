@@ -32,10 +32,15 @@ mechanisms, not one, since they trade off differently:
 
 ## Messaging
 
-- [ ] **Replies** -- optional `reply_to: Option<u64>` on `ChatMessage`,
+- [x] **Replies** -- optional `reply_to: Option<u64>` on `ChatMessage`,
   rendered as a quoted snippet. Message ids are already random/unique
   (concept.md's wire format section), so this is a small,
-  backward-compatible addition behind a `v` bump.
+  backward-compatible addition behind a `v` bump. Since the transcript has
+  no existing per-message selection UI, picking a target is a dedicated
+  `Ctrl+R` mode: `Up`/`Down` highlight a candidate message (by id, not row,
+  so it survives rewrapping), `Enter` arms it, `Esc` cancels. A `/reply
+  [text]` command covers the common "reply to the most recent message"
+  case without picking.
 - [ ] **Edit / delete own messages** -- a new envelope variant referencing
   the original `id`, accepted only if `sender` matches. Tombstone as
   "(deleted)" rather than actually removing, so dedupe/backfill never have

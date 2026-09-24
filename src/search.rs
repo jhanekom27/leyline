@@ -103,6 +103,7 @@ mod tests {
             ts_unix_ms: id,
             text: text.to_string(),
             attachment: None,
+            reply_to: None,
         }
     }
 
@@ -118,6 +119,7 @@ mod tests {
                 size: 0,
                 hash: iroh_blobs::Hash::new(filename.as_bytes()),
             }),
+            reply_to: None,
         }
     }
 

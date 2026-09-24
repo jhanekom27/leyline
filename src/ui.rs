@@ -41,6 +41,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/alias <hex> <name>",
     "/nick <name>",
     "/search <term> (/s)",
+    "/reply [text]",
     "/hints",
     "/help",
 ];
@@ -145,8 +146,10 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
 
     // Flattened one-`Line`-per-terminal-row, not one per `TranscriptLine`
     // -- a wrapped message now spans several rows, so the scroll window
-    // below has to work in rows to stay accurate.
-    let mut rows = build_message_rows(app, channel, inner_width);
+    // below has to work in rows to stay accurate. `picked_row` is the
+    // header row of whichever message matches `app.picking_reply`, if
+    // any -- see the window adjustment below.
+    let (mut rows, picked_row) = build_message_rows(app, channel, inner_width);
     let total = rows.len();
     // `channel.scroll` grows unboundedly while `Up` is held (see
     // `AppState::handle_key`) since it has no way to know how many rows
@@ -156,25 +159,44 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
     // off-screen.
     let max_scroll = total.saturating_sub(visible_rows);
     let scroll = channel.scroll.min(max_scroll);
-    let end = total.saturating_sub(scroll);
-    let start = end.saturating_sub(visible_rows);
+    let mut end = total.saturating_sub(scroll);
+    let mut start = end.saturating_sub(visible_rows);
+    // While picking a reply target, the highlighted message always wins
+    // over `channel.scroll` -- widen/shift the window (local variables
+    // only; `channel.scroll` itself is never touched, since ui.rs stays
+    // read-only) just enough to bring it into view, rather than leaving
+    // the user to scroll manually to find whatever `Up`/`Down` just
+    // selected.
+    if let Some(picked) = picked_row {
+        if picked < start {
+            start = picked;
+            end = (start + visible_rows).min(total);
+        } else if picked >= end {
+            end = (picked + 1).min(total);
+            start = end.saturating_sub(visible_rows);
+        }
+    }
     let items: Vec<ListItem> = rows.drain(start..end).map(ListItem::new).collect();
 
-    let title = match &channel.search {
-        Some(search) => {
-            let status = if search.pending {
-                ", searching full history..."
-            } else {
-                ""
-            };
-            format!(
-                "#{} · search '{}' ({}{status}) · /s to clear",
-                channel.name,
-                search.term,
-                search.messages.len()
-            )
+    let title = if app.picking_reply.is_some() {
+        "pick a message to reply to: ↑/↓ move · Enter confirm · Esc cancel".to_string()
+    } else {
+        match &channel.search {
+            Some(search) => {
+                let status = if search.pending {
+                    ", searching full history..."
+                } else {
+                    ""
+                };
+                format!(
+                    "#{} · search '{}' ({}{status}) · /s to clear",
+                    channel.name,
+                    search.term,
+                    search.messages.len()
+                )
+            }
+            None => format!("#{} · {} peer(s)", channel.name, channel.peers.len()),
         }
-        None => format!("#{} · {} peer(s)", channel.name, channel.peers.len()),
     };
     let list = List::new(items).block(
         Block::bordered()
@@ -239,13 +261,18 @@ fn render_scroll_indicator(
 /// Delegates to `build_search_rows` when `channel` has an active `/search`
 /// (see `app::Channel::search`), rendering its results in place of the
 /// normal transcript.
-fn build_message_rows(app: &AppState, channel: &Channel, inner_width: usize) -> Vec<Line<'static>> {
+fn build_message_rows(
+    app: &AppState,
+    channel: &Channel,
+    inner_width: usize,
+) -> (Vec<Line<'static>>, Option<usize>) {
     if let Some(search) = &channel.search {
         return build_search_rows(app, search, inner_width);
     }
 
     let layout = row_layout(inner_width);
     let mut rows = Vec::new();
+    let mut picked_row = None;
     let mut last_chat_sender: Option<[u8; 32]> = None;
     for line in &channel.messages {
         match line {
@@ -259,7 +286,19 @@ fn build_message_rows(app: &AppState, channel: &Channel, inner_width: usize) -> 
                     rows.push(Line::from(""));
                 }
                 last_chat_sender = Some(message.sender);
-                push_chat_rows(&mut rows, app, message, is_first_of_group, &layout, None);
+                let is_picked = app.picking_reply == Some(message.id);
+                if is_picked {
+                    picked_row = Some(rows.len());
+                }
+                push_chat_rows(
+                    &mut rows,
+                    app,
+                    message,
+                    is_first_of_group,
+                    &layout,
+                    None,
+                    is_picked,
+                );
             }
             TranscriptLine::System(text) => {
                 // A notice breaks up a run of grouped messages -- the next
@@ -280,7 +319,7 @@ fn build_message_rows(app: &AppState, channel: &Channel, inner_width: usize) -> 
             }
         }
     }
-    rows
+    (rows, picked_row)
 }
 
 /// Renders a channel's active `/search` results in place of its normal
@@ -292,11 +331,12 @@ fn build_search_rows(
     app: &AppState,
     search: &SearchResults,
     inner_width: usize,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Option<usize>) {
     let layout = row_layout(inner_width);
     let term_lower = search.term.to_lowercase();
 
     let mut rows = Vec::new();
+    let mut picked_row = None;
     let mut last_sender: Option<[u8; 32]> = None;
     for message in &search.messages {
         let is_first_of_group = last_sender != Some(message.sender);
@@ -304,6 +344,10 @@ fn build_search_rows(
             rows.push(Line::from(""));
         }
         last_sender = Some(message.sender);
+        let is_picked = app.picking_reply == Some(message.id);
+        if is_picked {
+            picked_row = Some(rows.len());
+        }
         push_chat_rows(
             &mut rows,
             app,
@@ -311,6 +355,7 @@ fn build_search_rows(
             is_first_of_group,
             &layout,
             Some(&term_lower),
+            is_picked,
         );
     }
     if rows.is_empty() {
@@ -321,7 +366,7 @@ fn build_search_rows(
                 .add_modifier(Modifier::ITALIC),
         )));
     }
-    rows
+    (rows, picked_row)
 }
 
 /// Column widths/blank fillers shared by the normal transcript and
@@ -358,6 +403,7 @@ fn push_chat_rows(
     is_first_of_group: bool,
     layout: &RowLayout,
     term_lower: Option<&str>,
+    is_picked: bool,
 ) {
     let color = user_color(&message.sender);
     let name = fit_name(&app.display_name(&message.sender), NAME_WIDTH);
@@ -369,7 +415,24 @@ fn push_chat_rows(
     if wrapped.is_empty() {
         wrapped.push(std::borrow::Cow::Borrowed(""));
     }
-    for (index, chunk) in wrapped.iter().enumerate() {
+
+    // A reply's quoted preview (`reply_preview_spans`), if any, renders as
+    // its own single, unwrapped row ahead of the message's own text -- it
+    // takes this group's header (time/name) exactly like the text's own
+    // first line would otherwise (via the `index == 0` check below), and
+    // the real text always starts on a "continuation" row instead, the
+    // same as any second wrapped line already does.
+    let mut bodies: Vec<Vec<Span<'static>>> = Vec::with_capacity(1 + wrapped.len());
+    if let Some(reply_to) = message.reply_to {
+        bodies.push(reply_preview_spans(app, reply_to));
+    }
+    bodies.extend(
+        wrapped
+            .iter()
+            .map(|chunk| highlighted_spans(chunk, term_lower)),
+    );
+
+    for (index, body) in bodies.into_iter().enumerate() {
         let show_header = index == 0 && is_first_of_group;
         let (time_span, name_span) = if show_header {
             (time.clone(), name.clone())
@@ -387,7 +450,10 @@ fn push_chat_rows(
             ),
             Span::styled(SEPARATOR, Style::default().fg(Color::DarkGray)),
         ];
-        spans.extend(highlighted_spans(chunk, term_lower));
+        spans.extend(body);
+        if is_picked {
+            spans = spans.into_iter().map(reversed_span).collect();
+        }
         rows.push(Line::from(spans));
     }
 }
@@ -476,6 +542,72 @@ fn highlighted_spans(text: &str, term_lower: Option<&str>) -> Vec<Span<'static>>
             }
         })
         .collect()
+}
+
+/// Maximum length (in characters) of the quoted snippet shown for a reply
+/// -- both above the reply itself (`reply_preview_spans`) and in the input
+/// box's title while one is armed (`reply_banner_title`). Longer text is
+/// truncated with an ellipsis (`truncate_chars`) so the preview always
+/// stays a single, unwrapped row.
+const REPLY_SNIPPET_MAX: usize = 40;
+
+/// Builds a reply's quoted-preview row: the parent message's sender and a
+/// truncated snippet of its text (see `reply_snippet`), styled dim/italic
+/// so it reads as context rather than part of the reply itself. Looked up
+/// in the active channel (`Channel::find_message`) -- if the parent isn't
+/// found there (evicted from scrollback, not yet backfilled, or simply
+/// unknown -- see `ChatMessage::reply_to`'s doc comment), renders an
+/// explicit "unavailable" fallback instead of silently dropping the
+/// relationship.
+fn reply_preview_spans(app: &AppState, reply_to: u64) -> Vec<Span<'static>> {
+    let style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+    let text = match app.active().find_message(reply_to) {
+        Some(parent) => format!(
+            "↳ {}: {}",
+            app.display_name(&parent.sender),
+            reply_snippet(parent)
+        ),
+        None => "↳ replying to a message that's no longer available".to_string(),
+    };
+    vec![Span::styled(text, style)]
+}
+
+/// A short, single-line, quoted excerpt of `message`'s text (or its
+/// attachment's filename, for a captionless file share) -- used for a
+/// reply's quoted preview (`reply_preview_spans`) and the input box's
+/// title while a reply is armed (`reply_banner_title`). Truncated to
+/// `REPLY_SNIPPET_MAX` characters with an ellipsis so it can never wrap.
+fn reply_snippet(message: &ChatMessage) -> String {
+    let text = match &message.attachment {
+        Some(attachment) if message.text.is_empty() => attachment.filename.as_str(),
+        _ => message.text.as_str(),
+    };
+    format!("\"{}\"", truncate_chars(text, REPLY_SNIPPET_MAX))
+}
+
+/// Truncates `text` to at most `max_chars` characters, appending `…` if it
+/// was longer. Unlike `fit_name`, never pads a shorter string -- this is
+/// for prose (a reply's quoted snippet), not a fixed-width column.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{truncated}…")
+}
+
+/// Adds a reversed-video modifier to `span`, preserving its existing
+/// colors -- used to highlight the currently-picked message's row(s)
+/// while choosing a reply target (`push_chat_rows`'s `is_picked`). Patched
+/// per-span (rather than once on the whole `Line`) so it always takes
+/// effect regardless of each span's own explicit styling.
+fn reversed_span(span: Span<'static>) -> Span<'static> {
+    Span {
+        style: span.style.add_modifier(Modifier::REVERSED),
+        ..span
+    }
 }
 
 /// Splits `text` into `width`-wide chunks, breaking mid-word if needed.
@@ -574,8 +706,12 @@ fn render_hints(frame: &mut Frame, area: Rect) {
 
 fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
     let prompt = format!("{} › ", app.display_name(&app.self_id));
+    let title = match app.replying_to {
+        Some(reply_to) => reply_banner_title(app, reply_to),
+        None => " type a message · /help for commands ".to_string(),
+    };
     let block = Block::bordered()
-        .title(" type a message · /help for commands ")
+        .title(title)
         .border_type(BorderType::Rounded);
     let inner = block.inner(area);
     let prompt_width = prompt.chars().count();
@@ -601,6 +737,22 @@ fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
 
     let cursor_col = inner.x + (prompt_width + (app.cursor - visible_start)) as u16;
     frame.set_cursor_position((cursor_col, inner.y));
+}
+
+/// Builds the input box's title while a reply is armed
+/// (`AppState::replying_to`): the parent's sender and a truncated snippet
+/// (see `reply_snippet`), so it's obvious what you're replying to for as
+/// long as it stays armed. Mirrors `reply_preview_spans`'s fallback if the
+/// parent isn't currently resolvable.
+fn reply_banner_title(app: &AppState, reply_to: u64) -> String {
+    match app.active().find_message(reply_to) {
+        Some(parent) => format!(
+            " replying to {}: {} · Esc to cancel ",
+            app.display_name(&parent.sender),
+            reply_snippet(parent)
+        ),
+        None => " replying to a message that's no longer available · Esc to cancel ".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -667,6 +819,19 @@ mod tests {
                 size,
                 hash: iroh_blobs::Hash::new(filename.as_bytes()),
             }),
+            reply_to: None,
+        }
+    }
+
+    fn text_message(id: u64, sender: [u8; 32], text: &str) -> ChatMessage {
+        ChatMessage {
+            v: 3,
+            id,
+            sender,
+            ts_unix_ms: 0,
+            text: text.to_string(),
+            attachment: None,
+            reply_to: None,
         }
     }
 
@@ -704,8 +869,67 @@ mod tests {
             ts_unix_ms: 0,
             text: "hello".to_string(),
             attachment: None,
+            reply_to: None,
         };
 
         assert_eq!(attachment_caption(&app, &message), None);
+    }
+
+    #[test]
+    fn truncate_chars_leaves_short_text_untouched() {
+        assert_eq!(truncate_chars("hi", 10), "hi");
+    }
+
+    #[test]
+    fn truncate_chars_shortens_long_text_with_an_ellipsis() {
+        let truncated = truncate_chars("hello world", 5);
+        assert_eq!(truncated.chars().count(), 5);
+        assert!(truncated.ends_with('…'), "got: {truncated}");
+        assert!(truncated.starts_with("hell"), "got: {truncated}");
+    }
+
+    #[test]
+    fn reply_snippet_quotes_the_parents_text() {
+        let parent = text_message(1, [1; 32], "see you there");
+        assert_eq!(reply_snippet(&parent), "\"see you there\"");
+    }
+
+    #[test]
+    fn reply_snippet_falls_back_to_a_captionless_files_name() {
+        let parent = file_message([1; 32], "map.png", 10);
+        assert_eq!(reply_snippet(&parent), "\"map.png\"");
+    }
+
+    #[test]
+    fn reply_preview_spans_quotes_a_resolvable_parent() {
+        let mut app = AppState::new([9; 32], vec!["general".to_string()], "general");
+        let parent = text_message(1, [1; 32], "are you around later");
+        app.load_history("general", vec![parent]);
+
+        let spans = reply_preview_spans(&app, 1);
+
+        assert_eq!(spans.len(), 1);
+        let text = spans[0].content.to_string();
+        assert!(text.contains("are you around later"), "got: {text}");
+    }
+
+    #[test]
+    fn reply_preview_spans_falls_back_when_the_parent_is_unavailable() {
+        let app = AppState::new([9; 32], vec!["general".to_string()], "general");
+
+        let spans = reply_preview_spans(&app, 999);
+
+        assert_eq!(spans.len(), 1);
+        let text = spans[0].content.to_string();
+        assert!(text.contains("no longer available"), "got: {text}");
+    }
+
+    #[test]
+    fn reversed_span_preserves_content_and_adds_the_modifier() {
+        let span = Span::styled("hi", Style::default().fg(Color::Red));
+        let reversed = reversed_span(span);
+        assert_eq!(reversed.content, "hi");
+        assert!(reversed.style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(reversed.style.fg, Some(Color::Red));
     }
 }

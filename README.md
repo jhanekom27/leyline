@@ -132,9 +132,10 @@ HOME=/tmp/leyline-b CARGO_HOME="$REAL_CARGO_HOME" cargo run
 | `Enter` | Send the composed message, or run a `/` command |
 | (paste, e.g. `Cmd+V`/`Ctrl+V`) | Paste text from the terminal as one atomic edit, so a multi-line paste can't prematurely send a partial line or trigger a stray `/command` |
 | `Ctrl+V` | Share whatever's on the OS clipboard (a file, an image, or text) with the active channel -- same as `/paste`. `Cmd+V` also works if your terminal forwards it, but most (including this one) reserve it for their own text-paste above |
-| `Up` / `Down` | Scroll the message history |
+| `Ctrl+R` | Pick a message to reply to -- `Up`/`Down` move the highlight, `Enter` confirms, `Esc` cancels |
+| `Up` / `Down` | Scroll the message history (or move the highlight while picking a reply, see `Ctrl+R`) |
 | `Tab` / `Shift+Tab` | Switch to the next / previous joined channel |
-| `Esc` / `Ctrl+C` | Quit |
+| `Esc` / `Ctrl+C` | Cancel an in-progress reply pick or armed reply first, if any; otherwise quit |
 
 ## Commands
 
@@ -154,6 +155,8 @@ Typed into the message box and submitted with `Enter`:
 | `/alias <hex-prefix> <name>` | Assign a local pet name to the peer whose endpoint id starts with `<hex-prefix>`, shown in place of their hex id from then on (local only, never sent to peers) |
 | `/nick <name>` | Broadcast a chosen display name to every joined channel (spoofable -- shown as `name (hex-prefix)` until you `/alias` that peer) |
 | `/search <term>` (alias `/s`) | Filter the active channel's messages down to ones containing `<term>` (instant for what's loaded, extended in the background with a scan of the full on-disk history); the pane title reminds you it's active and that `/search`/`/s` with no argument clears it |
+| `/reply` | Arm a reply to the most recent message in the active channel -- type normally afterward to send it as a reply (or press `Ctrl+R` instead to pick an older or specific-sender message) |
+| `/reply <text>` | Arm and immediately send `<text>` as a reply to the most recent message, in one step |
 | `/hints` | Toggle the sidebar's command hints panel on or off |
 | `/help` | Show the full list of commands and keybindings |
 

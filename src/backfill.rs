@@ -304,6 +304,7 @@ mod tests {
             ts_unix_ms,
             text: text.to_string(),
             attachment: None,
+            reply_to: None,
         }
     }
 
