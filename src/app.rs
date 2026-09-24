@@ -162,6 +162,12 @@ pub enum InputAction {
         filename: String,
         sender: [u8; 32],
     },
+    /// Share whatever's on the OS clipboard with `channel` -- from `/paste`
+    /// or the `Ctrl+V`/`Cmd+V` keybinding (see `run_paste`). The caller
+    /// (`net::Net::paste`) reads the clipboard and decides what it found;
+    /// app.rs never touches the clipboard directly, matching this module's
+    /// doc comment.
+    Paste(String),
 }
 
 /// All state needed to render the TUI and respond to input.
@@ -357,6 +363,15 @@ impl AppState {
             KeyCode::Char('u') if ctrl => self.delete_to_start(),
             KeyCode::Char('k') if ctrl => self.delete_to_end(),
             KeyCode::Char('w') if ctrl => self.delete_word_backward(),
+            // Cmd on macOS -- reported as `KeyModifiers::SUPER` by
+            // crossterm, if the terminal forwards it at all. Plain Ctrl+V
+            // is the dependable cross-platform trigger, since terminals
+            // (Warp included) conventionally reserve their own paste
+            // shortcut as Ctrl+Shift+V/Cmd+V and consume it before it ever
+            // reaches a foreground app -- see `run_paste`'s doc comment.
+            KeyCode::Char('v') if ctrl || key.modifiers.contains(KeyModifiers::SUPER) => {
+                return self.run_paste();
+            }
             KeyCode::Enter => return self.submit_input(),
             KeyCode::Backspace => self.delete_backward(),
             KeyCode::Delete => self.delete_forward(),
@@ -456,11 +471,14 @@ impl AppState {
             // `Net::sync_history`, `HistoryFetched`'s payload goes through
             // `merge_history` above, `PeerAddressLearned` is persisted to
             // the channel registry (see channel_registry.rs), `FileReady`
-            // broadcasts and persists a finished `/send` before placing it
-            // in the transcript via `record_sent_message`, and
+            // broadcasts and persists a finished `/send` (or `/paste`)
+            // before placing it in the transcript via `record_sent_message`,
             // `FileSendFailed`/`FileSaveFailed` are also logged there via
             // `tracing::warn!` (unlike the other system notices here, a
-            // failed file transfer is worth a trace in leyline.log too).
+            // failed file transfer is worth a trace in leyline.log too),
+            // and `ClipboardFiles`/`ClipboardImage`/`ClipboardText`/
+            // `PasteFailed` (see `net::Net::paste`) are turned into the
+            // same `FileReady`/plain-`Send` treatment or a logged error.
             // None of these are transcript or presence state handled here
             // directly.
             NetEvent::Announce(..)
@@ -468,7 +486,11 @@ impl AppState {
             | NetEvent::PeerAddressLearned(..)
             | NetEvent::FileReady(..)
             | NetEvent::FileSendFailed { .. }
-            | NetEvent::FileSaveFailed { .. } => None,
+            | NetEvent::FileSaveFailed { .. }
+            | NetEvent::ClipboardFiles(..)
+            | NetEvent::ClipboardImage(..)
+            | NetEvent::ClipboardText(..)
+            | NetEvent::PasteFailed(..) => None,
         }
     }
 
@@ -518,6 +540,17 @@ impl AppState {
         {
             channel.push(TranscriptLine::Chat(message));
         }
+    }
+
+    /// Composes a `ChatMessage` as if `text` had been typed and sent by us
+    /// -- used for `/paste`'s clipboard-text fallback (see
+    /// `net::NetEvent::ClipboardText`), which arrives asynchronously from
+    /// the background clipboard read rather than through
+    /// `handle_key`/`submit_input`. The caller still needs to broadcast,
+    /// persist, and display the result exactly like any other
+    /// locally-authored message (see `record_sent_message`).
+    pub fn compose_own_message(&self, text: &str) -> ChatMessage {
+        compose_message(self.self_id, text)
     }
 
     /// Displays a sender as "you" for our own id; their pet name if one
@@ -601,6 +634,7 @@ impl AppState {
             "who" => self.run_who(),
             "send" => self.run_send(arg.trim()),
             "save" => self.run_save(arg.trim()),
+            "paste" => self.run_paste(),
             "search" | "s" => self.run_search(arg.trim()),
             "hints" => self.run_hints(),
             "help" => self.run_help(),
@@ -618,9 +652,10 @@ impl AppState {
     fn run_help(&mut self) -> Option<InputAction> {
         self.push_system(
             "commands: /join <name|ticket>, /invite, /leave [channel], /who, \
-             /send <path>, /save <hash-prefix>, /alias <hex-prefix> <name>, \
+             /send <path>, /save <hash-prefix>, /paste, /alias <hex-prefix> <name>, \
              /nick <name>, /search <term> (or /s), /hints, /help -- keys: \
-             Tab/Shift+Tab switch channels, Up/Down scroll, Esc/Ctrl+C quit",
+             Tab/Shift+Tab switch channels, Ctrl+V paste, Up/Down scroll, \
+             Esc/Ctrl+C quit",
         );
         None
     }
@@ -844,6 +879,21 @@ impl AppState {
         }
     }
 
+    /// Handles `/paste` (and the `Ctrl+V`/`Cmd+V` keybinding in
+    /// `handle_key`): shares whatever's currently on the OS clipboard with
+    /// the active channel. Takes no argument -- like `/invite`, it always
+    /// acts on the active channel. app.rs never touches the clipboard
+    /// itself (see this module's doc comment); the caller
+    /// (`net::Net::paste`) reads it and reports back what it found (a
+    /// file, an image, or plain text) as a `NetEvent`. Pushes an immediate
+    /// breadcrumb since reading the clipboard and importing its contents
+    /// happens in the background and may take a moment, mirroring
+    /// `run_send`.
+    fn run_paste(&mut self) -> Option<InputAction> {
+        self.push_system("pasting from clipboard...");
+        Some(InputAction::Paste(self.active().name.clone()))
+    }
+
     /// Resolves a hex-prefix (case-insensitive, as typed after `/alias`)
     /// to exactly one id in `known_ids`. Errors with a user-facing message
     /// if the prefix isn't valid hex, matches no known id, or matches more
@@ -977,6 +1027,33 @@ impl AppState {
         let idx = self.byte_index(self.cursor);
         self.input.insert(idx, c);
         self.cursor += 1;
+    }
+
+    /// Inserts a terminal bracketed-paste's full text at the cursor as one
+    /// atomic edit (see main.rs's `Event::Paste` handling, enabled via
+    /// `EnableBracketedPaste`). Without bracketed paste, a multi-line
+    /// paste instead arrives as a fast burst of ordinary key events, so an
+    /// embedded newline mid-paste hits `submit_input` partway through --
+    /// prematurely sending a partial line or running a stray `/command`.
+    /// Embedded newlines are flattened to spaces since the input box is a
+    /// single line by construction (`ui::render_input` never wraps it).
+    pub fn paste_text(&mut self, text: &str) {
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                // `\r\n` counts as a single line break, not two -- without
+                // this, a Windows-style multi-line paste would flatten to
+                // double spaces between lines.
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    self.insert_char(' ');
+                }
+                '\n' => self.insert_char(' '),
+                c => self.insert_char(c),
+            }
+        }
     }
 
     /// Backspace: deletes the character before the cursor.
@@ -1138,6 +1215,35 @@ mod tests {
         app.handle_key(key(KeyCode::Char('i')));
         app.handle_key(key(KeyCode::Backspace));
         assert_eq!(app.input, "h");
+    }
+
+    #[test]
+    fn paste_text_inserts_the_whole_string_at_once() {
+        let mut app = app();
+        app.handle_key(key(KeyCode::Char('h')));
+        app.paste_text("i there");
+        assert_eq!(app.input, "hi there");
+        assert_eq!(app.cursor, "hi there".chars().count());
+    }
+
+    #[test]
+    fn paste_text_flattens_embedded_newlines_to_spaces() {
+        // Without bracketed paste, a multi-line paste's embedded `Enter`
+        // keystrokes would submit partway through -- `paste_text` is the
+        // atomic alternative, so a pasted newline must never become a
+        // literal line break in the (single-line) input box.
+        let mut app = app();
+        app.paste_text("line one\nline two\r\nline three");
+        assert_eq!(app.input, "line one line two line three");
+    }
+
+    #[test]
+    fn paste_text_does_not_submit_even_when_it_contains_a_slash_command() {
+        let mut app = app();
+        let before = app.active().messages.len();
+        app.paste_text("/join sneaky\nrest of paste");
+        assert_eq!(app.active().messages.len(), before, "paste must not submit");
+        assert_eq!(app.input, "/join sneaky rest of paste");
     }
 
     #[test]
@@ -1628,6 +1734,52 @@ mod tests {
             InputAction::Invite(channel) => assert_eq!(channel, "random"),
             _ => panic!("expected InputAction::Invite"),
         }
+    }
+
+    #[test]
+    fn slash_paste_returns_paste_action_for_active_channel() {
+        let mut app = multi_channel_app();
+        let action = submit(&mut app, "/paste");
+        match action.expect("/paste returns an action") {
+            InputAction::Paste(channel) => assert_eq!(channel, "random"),
+            _ => panic!("expected InputAction::Paste"),
+        }
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("clipboard"), "got: {last}");
+    }
+
+    #[test]
+    fn ctrl_v_triggers_the_same_paste_action_as_the_slash_command() {
+        let mut app = app();
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        match action.expect("Ctrl+V returns an action") {
+            InputAction::Paste(channel) => assert_eq!(channel, "general"),
+            _ => panic!("expected InputAction::Paste"),
+        }
+    }
+
+    #[test]
+    fn super_v_also_triggers_paste_best_effort_for_macos() {
+        let mut app = app();
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER));
+        assert!(matches!(action, Some(InputAction::Paste(_))));
+    }
+
+    #[test]
+    fn plain_v_without_a_modifier_just_types_the_character() {
+        let mut app = app();
+        let action = app.handle_key(key(KeyCode::Char('v')));
+        assert!(action.is_none());
+        assert_eq!(app.input, "v");
+    }
+
+    #[test]
+    fn compose_own_message_matches_the_calling_apps_identity() {
+        let app = app();
+        let message = app.compose_own_message("hello from clipboard");
+        assert_eq!(message.sender, SELF_ID);
+        assert_eq!(message.text, "hello from clipboard");
+        assert!(message.attachment.is_none());
     }
 
     #[test]

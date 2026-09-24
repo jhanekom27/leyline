@@ -130,6 +130,8 @@ HOME=/tmp/leyline-b CARGO_HOME="$REAL_CARGO_HOME" cargo run
 | `Ctrl+K` | Delete from the cursor to the end of the line |
 | `Ctrl+W` | Delete the word before the cursor |
 | `Enter` | Send the composed message, or run a `/` command |
+| (paste, e.g. `Cmd+V`/`Ctrl+V`) | Paste text from the terminal as one atomic edit, so a multi-line paste can't prematurely send a partial line or trigger a stray `/command` |
+| `Ctrl+V` | Share whatever's on the OS clipboard (a file, an image, or text) with the active channel -- same as `/paste`. `Cmd+V` also works if your terminal forwards it, but most (including this one) reserve it for their own text-paste above |
 | `Up` / `Down` | Scroll the message history |
 | `Tab` / `Shift+Tab` | Switch to the next / previous joined channel |
 | `Esc` / `Ctrl+C` | Quit |
@@ -148,6 +150,7 @@ Typed into the message box and submitted with `Enter`:
 | `/who` | List the active channel's peers, showing each one's full endpoint id, broadcast nickname (if any), and local alias (if any) |
 | `/send <path>` | Share a local file with the active channel; peers see its name and size and can fetch it with `/save`, never automatically |
 | `/save <hash-prefix>` | Download a file previously shared in any joined channel to your Downloads folder (in a `leyline` subfolder) |
+| `/paste` | Share whatever's on the OS clipboard with the active channel: a real file (e.g. copied in Finder/Explorer, including an animated GIF, byte-for-byte) if there is one, else a screenshot or other copied image (always shared as a single static PNG frame -- no OS clipboard format carries multi-frame/animation data), else plain copied text as a chat message. Same as the `Ctrl+V` keybinding |
 | `/alias <hex-prefix> <name>` | Assign a local pet name to the peer whose endpoint id starts with `<hex-prefix>`, shown in place of their hex id from then on (local only, never sent to peers) |
 | `/nick <name>` | Broadcast a chosen display name to every joined channel (spoofable -- shown as `name (hex-prefix)` until you `/alias` that peer) |
 | `/search <term>` (alias `/s`) | Filter the active channel's messages down to ones containing `<term>` (instant for what's loaded, extended in the background with a scan of the full on-disk history); the pane title reminds you it's active and that `/search`/`/s` with no argument clears it |

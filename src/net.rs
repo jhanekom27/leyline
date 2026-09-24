@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
+use arboard::{Clipboard, ImageData};
 use futures::StreamExt;
+use image::{ImageFormat, RgbaImage};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, NET_REPORT_TIMEOUT, SecretKey,
     address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router,
@@ -98,6 +100,28 @@ pub enum NetEvent {
     /// A `/save`d file failed to download or write to disk -- see
     /// `Net::save_file`.
     FileSaveFailed { filename: String, error: String },
+    /// `/paste` found one or more real files on the OS clipboard (e.g. a
+    /// Finder/Explorer copy) -- see `Net::paste`. Reported as paths, not
+    /// already-imported attachments, so the caller can share each one via
+    /// the exact same `Net::send_file` path `/send` uses -- this is what
+    /// keeps a copied file's original bytes (including a real animated
+    /// GIF) intact.
+    ClipboardFiles(String, Vec<PathBuf>),
+    /// `/paste` found rendered image pixels on the OS clipboard (e.g. a
+    /// screenshot, or a browser's "Copy Image") and re-encoded them as PNG
+    /// -- see `Net::paste` and `encode_png`. Always a single static frame:
+    /// no OS clipboard image format carries multi-frame/animation data, so
+    /// this is never a real animated GIF even if the source image was one
+    /// -- only `ClipboardFiles` preserves that.
+    ClipboardImage(String, String, Vec<u8>),
+    /// `/paste` found no file or image on the clipboard, but did find
+    /// plain text -- shared as an ordinary chat message, the same as if it
+    /// had been typed and sent.
+    ClipboardText(String, String),
+    /// `/paste` couldn't find anything to share (an empty or unreadable
+    /// clipboard, or the clipboard itself was unavailable) -- see
+    /// `Net::paste`.
+    PasteFailed(String),
 }
 
 /// A channel's gossip topic is derived from its private `RoomSecret`, not
@@ -166,6 +190,27 @@ fn expand_path(path: &str) -> PathBuf {
     .unwrap_or_else(|| PathBuf::from(path));
 
     std::path::absolute(&expanded).unwrap_or(expanded)
+}
+
+/// Encodes clipboard pixel data (`ImageData`'s raw RGBA8 buffer, row-major,
+/// no padding -- see `Net::paste`) as a PNG, the `/paste` counterpart to
+/// `expand_path`'s filesystem handling: clipboard image data has no
+/// filename or original file format to preserve, so PNG (lossless,
+/// universally viewable) is what actually gets shared, not the raw pixel
+/// buffer itself. Always produces a single static frame -- `ImageData` has
+/// no concept of multiple frames, so an animated image copied as rendered
+/// pixels (as opposed to a file -- see `Net::paste`'s file-list check) can
+/// never round-trip as a GIF through this path.
+fn encode_png(image: ImageData) -> anyhow::Result<Vec<u8>> {
+    let width = u32::try_from(image.width).context("clipboard image width overflowed u32")?;
+    let height = u32::try_from(image.height).context("clipboard image height overflowed u32")?;
+    let buffer = RgbaImage::from_raw(width, height, image.bytes.into_owned())
+        .context("clipboard image dimensions didn't match its pixel buffer")?;
+    let mut png_bytes = Vec::new();
+    buffer
+        .write_to(&mut std::io::Cursor::new(&mut png_bytes), ImageFormat::Png)
+        .context("failed to encode clipboard image as PNG")?;
+    Ok(png_bytes)
 }
 
 /// A joined channel's live gossip sender plus the room secret that put us
@@ -839,6 +884,137 @@ impl Net {
         None
     }
 
+    /// Reads the OS clipboard and reports back what it found -- for
+    /// `/paste` (or the `Ctrl+V`/`Cmd+V` keybinding), see
+    /// `app::InputAction::Paste`. Fire-and-forget, like `announce` and
+    /// `save_file`: unlike `send_file`, there's no cheap synchronous check
+    /// to do first (we don't know what's on the clipboard until we ask),
+    /// so the whole thing runs in a spawned task, reporting exactly one of
+    /// `NetEvent::ClipboardFiles`/`ClipboardImage`/`ClipboardText`/
+    /// `PasteFailed`.
+    ///
+    /// Opens a brand-new `Clipboard` rather than reusing main.rs's
+    /// long-lived one (which stays dedicated to `/invite`'s writes): a
+    /// clipboard read can block on a slow clipboard-owner round-trip
+    /// (notably on X11), and arboard explicitly supports any number of
+    /// `Clipboard` instances existing at once, so there's no need to share
+    /// one just to read from it here.
+    ///
+    /// Tries, in priority order: a real file list (so a Finder/Explorer
+    /// copy -- including an actual animated GIF -- shares its exact
+    /// original bytes via the same path `/send` uses), then rendered image
+    /// pixels (always a single static frame once re-encoded, see
+    /// `encode_png`), then plain text (shared as an ordinary chat message).
+    pub fn paste(&self, channel: String) {
+        let events_tx = self.events_tx.clone();
+        tokio::spawn(async move {
+            let mut clipboard = match Clipboard::new() {
+                Ok(clipboard) => clipboard,
+                Err(err) => {
+                    let _ = events_tx
+                        .send(NetEvent::PasteFailed(format!(
+                            "clipboard unavailable: {err}"
+                        )))
+                        .await;
+                    return;
+                }
+            };
+
+            if let Ok(paths) = clipboard.get().file_list()
+                && !paths.is_empty()
+            {
+                let _ = events_tx
+                    .send(NetEvent::ClipboardFiles(channel, paths))
+                    .await;
+                return;
+            }
+
+            if let Ok(image) = clipboard.get_image() {
+                match encode_png(image) {
+                    Ok(bytes) => {
+                        let filename = format!("clipboard-{}.png", now_unix_ms());
+                        let _ = events_tx
+                            .send(NetEvent::ClipboardImage(channel, filename, bytes))
+                            .await;
+                    }
+                    Err(err) => {
+                        let _ = events_tx
+                            .send(NetEvent::PasteFailed(format!(
+                                "failed to encode clipboard image: {err}"
+                            )))
+                            .await;
+                    }
+                }
+                return;
+            }
+
+            if let Ok(text) = clipboard.get_text()
+                && !text.is_empty()
+            {
+                let _ = events_tx.send(NetEvent::ClipboardText(channel, text)).await;
+                return;
+            }
+
+            let _ = events_tx
+                .send(NetEvent::PasteFailed("clipboard is empty".to_string()))
+                .await;
+        });
+    }
+
+    /// Imports already-in-hand bytes (a clipboard image re-encoded as PNG
+    /// by `paste`/`encode_png`) into the shared blob store and prepares
+    /// them to broadcast to `channel` as a `ChatMessage` with an
+    /// attachment -- mirrors `send_file`, minus the path-stat step, since
+    /// there's no real path to check; `bytes.len()` is checked against the
+    /// same `MAX_FILE_SIZE` cap instead.
+    pub fn send_clipboard_image(
+        &self,
+        channel: String,
+        filename: String,
+        bytes: Vec<u8>,
+    ) -> Option<String> {
+        let size = bytes.len() as u64;
+        if size > MAX_FILE_SIZE {
+            return Some(format!(
+                "can't paste image: too large ({}, max {})",
+                crate::files::human_size(size),
+                crate::files::human_size(MAX_FILE_SIZE)
+            ));
+        }
+
+        let backfill = self.backfill.clone();
+        let events_tx = self.events_tx.clone();
+        let our_id = self.our_id;
+        tokio::spawn(async move {
+            let hash = match backfill.add_bytes(bytes).await {
+                Ok(hash) => hash,
+                Err(err) => {
+                    let _ = events_tx
+                        .send(NetEvent::PasteFailed(format!(
+                            "failed to import clipboard image: {err}"
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            let message = ChatMessage {
+                v: 2,
+                id: rand::random(),
+                sender: our_id,
+                ts_unix_ms: now_unix_ms(),
+                text: String::new(),
+                attachment: Some(FileAttachment {
+                    filename,
+                    size,
+                    hash,
+                }),
+            };
+            let _ = events_tx.send(NetEvent::FileReady(channel, message)).await;
+        });
+
+        None
+    }
+
     /// Downloads a file previously shared in some joined channel and writes
     /// it to `destination` -- the `/save` counterpart to `send_file`.
     /// `destination` is already fully resolved by the caller (see
@@ -1131,5 +1307,36 @@ mod tests {
         // `foo/~/bar` is just a literal (if unusual) relative path.
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(expand_path("foo/~/bar"), cwd.join("foo/~/bar"));
+    }
+
+    #[test]
+    fn encode_png_round_trips_known_pixel_data() {
+        // A 2x1 image: one red, one green pixel (RGBA8, row-major -- see
+        // `ImageData`'s doc comment).
+        let image = ImageData {
+            width: 2,
+            height: 1,
+            bytes: std::borrow::Cow::Owned(vec![255, 0, 0, 255, 0, 255, 0, 255]),
+        };
+
+        let png_bytes = encode_png(image).unwrap();
+
+        let decoded = image::load_from_memory_with_format(&png_bytes, ImageFormat::Png)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(decoded.dimensions(), (2, 1));
+        assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(decoded.get_pixel(1, 0).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn encode_png_rejects_a_buffer_that_does_not_match_its_dimensions() {
+        let image = ImageData {
+            width: 4,
+            height: 4,
+            bytes: std::borrow::Cow::Owned(vec![0; 4]), // far too few bytes for 4x4 RGBA8
+        };
+
+        assert!(encode_png(image).is_err());
     }
 }

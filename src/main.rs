@@ -18,7 +18,10 @@ use std::time::Duration;
 
 use anyhow::Context;
 use arboard::Clipboard;
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
+};
+use crossterm::execute;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio::time::interval;
@@ -97,7 +100,14 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut terminal = ratatui::init();
+    // Bracketed paste lets a terminal paste arrive as one `Event::Paste`
+    // instead of a burst of individual key events -- see
+    // `AppState::paste_text` for why that matters. Best-effort: if the
+    // terminal doesn't understand the enabling sequence, pastes just fall
+    // back to today's character-by-character key events.
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let result = run(&mut terminal, session).await;
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -338,11 +348,18 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                                     }
                                 }
                             }
+                            Some(InputAction::Paste(channel)) => {
+                                net.paste(channel);
+                            }
                             None => {}
                         }
                         dirty = true;
                     }
                     Event::Resize(_, _) => dirty = true,
+                    Event::Paste(text) => {
+                        app.paste_text(&text);
+                        dirty = true;
+                    }
                     _ => {}
                 }
             }
@@ -427,6 +444,54 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                             warn!(%channel, "failed to record sent file for backfill: {err}");
                         }
                         app.record_sent_message(&channel, message);
+                    }
+                    // `/paste` found real file(s) on the clipboard (e.g. a
+                    // Finder/Explorer copy) -- see `net::Net::paste`.
+                    // Shared exactly like `/send`, one message per path,
+                    // so a multi-file clipboard copy lands as one message
+                    // each.
+                    NetEvent::ClipboardFiles(channel, paths) => {
+                        for path in paths {
+                            if let Some(message) = net.send_file(channel.clone(), path.display().to_string()) {
+                                app.push_system(message);
+                            }
+                        }
+                    }
+                    // `/paste` found rendered image pixels (e.g. a
+                    // screenshot) and already re-encoded them as PNG --
+                    // see `net::Net::paste`/`net::encode_png`. Any
+                    // synchronous error (e.g. too large) is reported
+                    // immediately, mirroring `InputAction::SendFile`;
+                    // success eventually arrives back as `FileReady`,
+                    // handled above like any other locally-authored file.
+                    NetEvent::ClipboardImage(channel, filename, bytes) => {
+                        if let Some(message) = net.send_clipboard_image(channel, filename, bytes) {
+                            app.push_system(message);
+                        }
+                    }
+                    // `/paste` found no file or image, but did find plain
+                    // text -- share it exactly like a typed-and-sent
+                    // message (see `NetEvent::FileReady` above for why
+                    // broadcast/persist/backfill/display always happen
+                    // together for a locally-authored message).
+                    NetEvent::ClipboardText(channel, text) => {
+                        let message = app.compose_own_message(&text);
+                        net.send(&channel, message.clone());
+                        if let Err(err) = store.append(&channel, &message) {
+                            warn!(%channel, "failed to persist pasted message: {err}");
+                        }
+                        if let Err(err) = backfill.record_message(&channel, &message).await {
+                            warn!(%channel, "failed to record pasted message for backfill: {err}");
+                        }
+                        app.record_sent_message(&channel, message);
+                    }
+                    // `/paste` found nothing to share -- see
+                    // `net::Net::paste`. Logged like `FileSendFailed`
+                    // above, since it's a user-triggered action worth a
+                    // trace in leyline.log for later debugging.
+                    NetEvent::PasteFailed(error) => {
+                        warn!("paste failed: {error}");
+                        app.push_system(format!("paste failed: {error}"));
                     }
                     other => {
                         if let Some((channel, message)) = app.handle_net_event(other) {

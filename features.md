@@ -82,9 +82,18 @@ mechanisms, not one, since they trade off differently:
   on demand (`/save <hash-prefix>`), the same way a history manifest is
   fetched today. Receiving never downloads anything automatically; a saved
   file always lands in the OS Downloads folder (`files.rs`).
-- [ ] **Clipboard paste-to-share** -- extend the existing `arboard`
-  integration (currently only used to copy outgoing invite tickets) to
-  accept incoming paste too, e.g. pasting an image shares it as a blob.
+- [x] **Clipboard paste-to-share** -- `/paste` (or the `Ctrl+V` keybinding)
+  extends `arboard` (previously write-only, for `/invite`'s copy) to read
+  the clipboard too: a real file (e.g. a Finder/Explorer copy, sharing its
+  exact original bytes via the same path as `/send` -- the only way an
+  animated GIF survives intact) if there is one, else rendered image
+  pixels re-encoded as PNG (a screenshot, or a browser's "Copy Image" --
+  always a single static frame, since no OS clipboard image format
+  carries multi-frame/animation data), else plain text shared as a chat
+  message. Also enables crossterm's bracketed paste mode so an ordinary
+  terminal text-paste is inserted as one atomic edit instead of a burst of
+  key events, fixing a premature-submit bug on multi-line pastes
+  (`AppState::paste_text`).
 
 ## Trust & safety
 

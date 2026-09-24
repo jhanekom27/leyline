@@ -37,6 +37,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/who",
     "/send <path>",
     "/save <hash>",
+    "/paste (or Ctrl+V)",
     "/alias <hex> <name>",
     "/nick <name>",
     "/search <term> (/s)",

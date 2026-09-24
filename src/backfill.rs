@@ -247,6 +247,22 @@ impl BackfillStore {
         Ok(tag.hash)
     }
 
+    /// Imports in-memory bytes into the shared blob store -- the `/paste`
+    /// counterpart to `add_file`, for content that only ever exists as
+    /// bytes (a clipboard image re-encoded to PNG, see `net::encode_png`),
+    /// never a real path on disk. A thin public twin of
+    /// `add_message_blob` above, which already wraps the same
+    /// `store.blobs().add_bytes` call for message/manifest blobs.
+    pub async fn add_bytes(&self, bytes: Vec<u8>) -> anyhow::Result<Hash> {
+        let tag = self
+            .store
+            .blobs()
+            .add_bytes(bytes)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to import clipboard content: {err}"))?;
+        Ok(tag.hash)
+    }
+
     /// Fetches a single file blob from `sender` and writes it straight to
     /// `destination` -- the `/save` counterpart to `add_file`, using the
     /// same pull-on-demand downloader as `fetch` above, just for one raw
@@ -400,5 +416,30 @@ mod tests {
              built from the same messages all at once (a fresh peer's startup \
              seed or a backfill merge)"
         );
+    }
+
+    #[tokio::test]
+    async fn add_bytes_imports_in_memory_content_and_returns_its_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let backfill = BackfillStore::new(dir.path()).await.unwrap();
+
+        let hash = backfill
+            .add_bytes(b"fake png bytes".to_vec())
+            .await
+            .unwrap();
+
+        let bytes = backfill.store.blobs().get_bytes(hash).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"fake png bytes");
+    }
+
+    #[tokio::test]
+    async fn add_bytes_is_content_addressed_like_add_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let backfill = BackfillStore::new(dir.path()).await.unwrap();
+
+        let first = backfill.add_bytes(b"same content".to_vec()).await.unwrap();
+        let second = backfill.add_bytes(b"same content".to_vec()).await.unwrap();
+
+        assert_eq!(first, second, "identical bytes must hash identically");
     }
 }
