@@ -2,6 +2,7 @@ mod app;
 mod backfill;
 mod channel_registry;
 mod contacts;
+mod dm_registry;
 mod files;
 mod identity;
 mod markdown;
@@ -13,6 +14,7 @@ mod storage;
 mod ticket;
 mod ui;
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -34,6 +36,7 @@ use app::{AppState, InputAction};
 use backfill::BackfillStore;
 use channel_registry::ChannelRegistry;
 use contacts::Contacts;
+use dm_registry::DmRegistry;
 use files::{downloads_dir, resolve_destination};
 use net::{Net, NetEvent};
 use search::{SearchOutcome, run_on_disk_scan};
@@ -55,6 +58,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize channel registry")?;
     let contacts = Contacts::load(dirs.data_dir().join("contacts"))
         .context("failed to initialize contacts")?;
+    let dm_registry = DmRegistry::load(dirs.data_dir().join("dms"))
+        .context("failed to initialize DM registry")?;
     let settings = Settings::load(dirs.data_dir().join("settings"))
         .context("failed to initialize settings")?;
 
@@ -88,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
     .context("failed to start networking")?;
     println!("invite tickets (paste into another instance's message box with /join <ticket>):");
     for name in &joined_channels {
-        let ticket = net.ticket_for(name);
+        let ticket = net.ticket_for(name, dm_registry.is_dm_channel(name));
         info!(channel = %name, %ticket, "ready");
         println!("  #{name}: {ticket}");
     }
@@ -102,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
         backfill,
         registry,
         contacts,
+        dm_registry,
         settings,
         data_dir,
     };
@@ -180,11 +186,25 @@ struct Session {
     backfill: BackfillStore,
     registry: ChannelRegistry,
     contacts: Contacts,
+    dm_registry: DmRegistry,
     settings: Settings,
     /// leyline's own data directory (`dirs.data_dir()`), needed so a
     /// `/save` with no resolvable OS Downloads folder still has somewhere
     /// to fall back to -- see `files::downloads_dir`.
     data_dir: PathBuf,
+}
+
+/// A `/msg`-initiated DM channel creation in flight: who it's for, and any
+/// message text to send once it's ready -- stashed when
+/// `app::InputAction::StartDm` is handled, and consumed once the
+/// corresponding `net::NetEvent::Joined` confirms the channel actually
+/// subscribed (see `run`'s main select loop). Keyed by channel name in the
+/// `pending_dms` map, since that's the only handle `Net::join` gives back
+/// to us -- a freshly created channel has no ticket to carry a peer id
+/// through the way `net::NetEvent::DmJoined` does for the recipient side.
+struct PendingDm {
+    peer: [u8; 32],
+    text: Option<String>,
 }
 
 /// How often each joined channel with any recorded history re-announces its
@@ -235,6 +255,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
         backfill,
         mut registry,
         mut contacts,
+        mut dm_registry,
         mut settings,
         data_dir,
     } = session;
@@ -242,6 +263,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
     let mut app = AppState::new(net.our_id, joined_channels.clone(), &active_channel);
     app.load_contacts(contacts.all());
     app.load_settings(settings.bell_enabled());
+    app.load_dm_registry(dm_registry.all());
     for name in &joined_channels {
         // Ensures a brand-new channel ("general" on a first run, or a
         // `--join` ticket's channel) lands in the registry, so it's
@@ -279,6 +301,11 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
         }
     };
 
+    // `/msg`-initiated DM channel creations awaiting their `NetEvent::Joined`
+    // confirmation, keyed by the freshly chosen channel name -- see
+    // `PendingDm` and `InputAction::StartDm`'s handling below.
+    let mut pending_dms: HashMap<String, PendingDm> = HashMap::new();
+
     let mut term_events = EventStream::new();
     let mut tick = interval(Duration::from_millis(250));
     let mut history_heartbeat = interval(HISTORY_ANNOUNCE_INTERVAL);
@@ -314,8 +341,15 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                                     app.push_system(message);
                                 }
                             }
+                            Some(InputAction::StartDm { peer, channel, text }) => {
+                                pending_dms.insert(channel.clone(), PendingDm { peer, text });
+                                if let Some(message) = net.join(channel) {
+                                    app.push_system(message);
+                                }
+                            }
                             Some(InputAction::Invite(channel)) => {
-                                let ticket = net.ticket_for(&channel);
+                                let ticket =
+                                    net.ticket_for(&channel, dm_registry.is_dm_channel(&channel));
                                 let copied = clipboard.as_mut().is_some_and(|clipboard| {
                                     clipboard.set_text(ticket.clone()).is_ok()
                                 });
@@ -334,6 +368,9 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                                 net.leave(&channel);
                                 if let Err(err) = registry.forget_channel(&channel) {
                                     warn!(%channel, "failed to remove channel from registry: {err}");
+                                }
+                                if let Err(err) = dm_registry.forget_channel(&channel) {
+                                    warn!(%channel, "failed to remove DM registry entry: {err}");
                                 }
                                 if let Err(err) = store.delete(&channel) {
                                     warn!(%channel, "failed to delete channel history: {err}");
@@ -409,14 +446,57 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                 // channel_registry.rs -- and rejoined automatically on a
                 // future restart. Channels joined at startup are already
                 // in the registry (see the loop above), so this only
-                // matters for new ones joined during this session.
-                if let NetEvent::Joined(name) = &net_event {
+                // matters for new ones joined during this session. Covers
+                // both an ordinary `Joined` and the DM-ticket recipient's
+                // `DmJoined` (see `ticket::ChannelTicket::dm`) -- both
+                // represent a channel finishing its join.
+                let joined_name = match &net_event {
+                    NetEvent::Joined(name) => Some(name.as_str()),
+                    NetEvent::DmJoined { channel, .. } => Some(channel.as_str()),
+                    _ => None,
+                };
+                if let Some(name) = joined_name {
                     let secret = net
                         .secret_for(name)
                         .expect("just-joined channel must have a recorded secret");
                     if let Err(err) = registry.record_channel(name, secret) {
                         warn!(channel = %name, "failed to persist joined channel: {err}");
                     }
+                }
+
+                // Peek for the recipient side of a `/msg`-initiated DM (a
+                // ticket-join that decoded with `dm: true`) -- persists the
+                // peer<->channel association `dm_registry.rs` remembers
+                // across restarts; `app.handle_net_event`'s own `DmJoined`
+                // arm records the same association in `AppState` itself.
+                if let NetEvent::DmJoined { channel, peer } = &net_event
+                    && let Err(err) = dm_registry.record(*peer, channel.clone())
+                {
+                    warn!(channel = %channel, "failed to persist DM registry entry: {err}");
+                }
+
+                // Peek for the *initiator* side of a `/msg`-initiated DM
+                // finishing its join instead -- a plain `Joined`, since a
+                // freshly created channel has no ticket to carry a peer id
+                // through (see `Net::join`'s doc comment) -- correlated
+                // back to who it was for via `pending_dms` (populated when
+                // `InputAction::StartDm` was handled above). `AppState`
+                // doesn't learn the association from `handle_net_event` in
+                // this case (a plain `Joined` carries no peer), so it's
+                // told directly (`record_dm_channel`) once persisted here;
+                // the queued text and invite ticket are handled after the
+                // match below, once the channel is actually active.
+                let finished_dm: Option<(String, PendingDm)> = match &net_event {
+                    NetEvent::Joined(name) => {
+                        pending_dms.remove(name).map(|pending| (name.clone(), pending))
+                    }
+                    _ => None,
+                };
+                if let Some((name, pending)) = &finished_dm {
+                    if let Err(err) = dm_registry.record(pending.peer, name.clone()) {
+                        warn!(channel = %name, "failed to persist DM registry entry: {err}");
+                    }
+                    app.record_dm_channel(pending.peer, name.clone());
                 }
 
                 match net_event {
@@ -533,6 +613,31 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                                 ring_bell();
                             }
                         }
+                    }
+                }
+
+                // Now that a finished creator-side DM (see `finished_dm`
+                // above) is actually active (`app.handle_net_event` just ran
+                // for its plain `Joined`), send any text queued by `/msg`
+                // and surface the invite ticket the other party still needs
+                // out-of-band, mirroring `/invite`.
+                if let Some((channel, pending)) = finished_dm {
+                    let ticket = net.ticket_for(&channel, true);
+                    let copied = clipboard
+                        .as_mut()
+                        .is_some_and(|clipboard| clipboard.set_text(ticket.clone()).is_ok());
+                    let suffix = if copied { " (copied to clipboard)" } else { "" };
+                    app.push_system(format!("started #{channel} -- invite: {ticket}{suffix}"));
+                    if let Some(text) = pending.text {
+                        let message = app.compose_own_message(&text);
+                        net.send(&channel, message.clone());
+                        if let Err(err) = store.append(&channel, &message) {
+                            warn!(%channel, "failed to persist sent message: {err}");
+                        }
+                        if let Err(err) = backfill.record_message(&channel, &message).await {
+                            warn!(%channel, "failed to record sent message for backfill: {err}");
+                        }
+                        app.record_sent_message(&channel, message);
                     }
                 }
                 dirty = true;

@@ -76,6 +76,20 @@ pub enum NetEvent {
     Lagged(String),
     /// A channel finished subscribing and is ready to send/receive on.
     Joined(String),
+    /// A channel finished subscribing via a DM-flagged invite ticket
+    /// (`ticket::ChannelTicket::dm`) and is ready to send/receive on --
+    /// the recipient side of a `/msg`-initiated DM (see
+    /// `app::InputAction::StartDm`), so this side can also record the
+    /// ticket's sharer as its DM partner for this channel
+    /// (`crate::dm_registry`) and converge on reusing it, the same
+    /// channel the initiator is already using for this pair. The
+    /// initiator's own side never sees this variant -- a freshly created
+    /// channel is joined by bare name, with no ticket to read a `dm` flag
+    /// from, so it reports back as a plain `Joined` and main.rs correlates
+    /// that back to a peer itself (see its `pending_dms` map). Carries the
+    /// same activation responsibility `Joined` does
+    /// (`app::AppState::handle_net_event`).
+    DmJoined { channel: String, peer: [u8; 32] },
     /// A channel failed to join.
     JoinFailed(String, String),
     /// A peer announced its current history root hash for a channel -- see
@@ -138,6 +152,11 @@ fn topic_for_secret(secret: &RoomSecret) -> TopicId {
     hasher.finalize().into()
 }
 
+/// A decoded ticket's payload, as returned by `parse_join_arg`: its room
+/// secret, the sharer's address, and whether it's DM-flagged (see
+/// `ticket::ChannelTicket::dm`).
+type ParsedTicket = (RoomSecret, EndpointAddr, bool);
+
 /// Interprets a `/join` argument as either a bare channel name or an
 /// invite ticket.
 ///
@@ -147,10 +166,12 @@ fn topic_for_secret(secret: &RoomSecret) -> TopicId {
 /// have the prefix but still fails to decode -- e.g. because it was
 /// truncated when copied out of a narrow terminal -- that's reported as an
 /// error instead of silently joining a bogus channel named after the
-/// mangled string.
-fn parse_join_arg(arg: &str) -> Result<(String, Option<(RoomSecret, EndpointAddr)>), String> {
+/// mangled string. The ticket's `dm` marker rides along too, so `Net::join`
+/// can tell a DM invite apart from an ordinary one (see
+/// `NetEvent::DmJoined`).
+fn parse_join_arg(arg: &str) -> Result<(String, Option<ParsedTicket>), String> {
     match ChannelTicket::decode_string(arg) {
-        Ok(ticket) => Ok((ticket.name, Some((ticket.secret, ticket.addr)))),
+        Ok(ticket) => Ok((ticket.name, Some((ticket.secret, ticket.addr, ticket.dm)))),
         Err(ParseError::Kind { .. }) => Ok((arg.trim().to_string(), None)),
         Err(err) => Err(format!(
             "that looks like an invite ticket but it won't decode (maybe it got truncated when copied?): {err}"
@@ -511,8 +532,13 @@ impl Net {
     /// since a self-referential one is useless) so the channel is
     /// created/switched to regardless. Otherwise this is fire-and-forget:
     /// spawns its own task and reports the outcome back as a
-    /// `NetEvent::Joined`/`JoinFailed`, so the caller's event loop never
-    /// awaits network I/O directly.
+    /// `NetEvent::Joined`/`DmJoined`/`JoinFailed`, so the caller's event
+    /// loop never awaits network I/O directly. Reports `DmJoined` instead
+    /// of `Joined` when `arg` decoded to a DM-flagged ticket (see
+    /// `ticket::ChannelTicket::dm`) -- never for a bare name, since a
+    /// brand-new channel created that way has no ticket to read a `dm`
+    /// flag from (see `app::InputAction::StartDm` and `NetEvent::DmJoined`
+    /// for how the creator's own side is handled instead).
     pub fn join(&self, arg: String) -> Option<String> {
         let (name, ticket) = match parse_join_arg(&arg) {
             Ok(parsed) => parsed,
@@ -528,7 +554,7 @@ impl Net {
             .expect("channels lock poisoned")
             .get(&name)
             .map(|c| c.secret);
-        let ticket_secret = ticket.as_ref().map(|(secret, _)| *secret);
+        let ticket_secret = ticket.as_ref().map(|(secret, _, _)| *secret);
         if let (Some(existing), Some(from_ticket)) = (existing_secret, ticket_secret)
             && existing != from_ticket
         {
@@ -536,16 +562,31 @@ impl Net {
                 "that ticket is for a different channel also named #{name} -- pick a new local name to join it"
             ));
         }
+
+        let self_ticket = ticket
+            .as_ref()
+            .is_some_and(|(_, addr, _)| is_self(addr, self.our_id));
+        // The peer a DM-flagged ticket names as its sharer, so this side
+        // can record them as our DM partner for `name` too (see
+        // `crate::dm_registry`) -- `None` for a bare name (nothing to read
+        // a `dm` flag from), an ordinary ticket (`dm: false`), or a
+        // self-referential one (can't DM yourself).
+        let dm_peer = ticket
+            .as_ref()
+            .filter(|(_, _, dm)| *dm)
+            .filter(|_| !self_ticket)
+            .map(|(_, addr, _)| *addr.id.as_bytes());
+
         if existing_secret.is_some() {
-            let _ = self.events_tx.try_send(NetEvent::Joined(name));
+            let event = match dm_peer {
+                Some(peer) => NetEvent::DmJoined { channel: name, peer },
+                None => NetEvent::Joined(name),
+            };
+            let _ = self.events_tx.try_send(event);
             return None;
         }
         let secret = ticket_secret.unwrap_or_else(RoomSecret::generate);
-        let bootstrap = ticket.map(|(_, addr)| addr);
-
-        let self_ticket = bootstrap
-            .as_ref()
-            .is_some_and(|addr| is_self(addr, self.our_id));
+        let bootstrap = ticket.map(|(_, addr, _)| addr);
         let bootstrap = if self_ticket { None } else { bootstrap };
         let message = self_ticket.then(|| {
             format!(
@@ -586,7 +627,11 @@ impl Net {
                             tasks,
                         },
                     );
-                    let _ = events_tx.send(NetEvent::Joined(name)).await;
+                    let event = match dm_peer {
+                        Some(peer) => NetEvent::DmJoined { channel: name, peer },
+                        None => NetEvent::Joined(name),
+                    };
+                    let _ = events_tx.send(event).await;
                 }
                 Err(err) => {
                     let _ = events_tx
@@ -1063,14 +1108,17 @@ impl Net {
     /// Builds this instance's invite ticket string for `channel`: our
     /// current address, the channel's room secret, and its display name,
     /// ready to be pasted into another instance's `--join` flag or `/join`
-    /// command. Synchronous -- `Endpoint::addr` doesn't need to await
-    /// anything.
+    /// command. `dm` marks it as a 1:1 DM invite rather than an ordinary
+    /// group one (see `ticket::ChannelTicket::dm` and `NetEvent::DmJoined`)
+    /// -- callers decide this by checking `crate::dm_registry` themselves,
+    /// since `Net` has no notion of a channel's "kind" of its own.
+    /// Synchronous -- `Endpoint::addr` doesn't need to await anything.
     ///
     /// # Panics
     /// Panics if `channel` isn't currently joined -- every call site
     /// (startup's own just-joined list, and `/invite`'s active channel)
     /// only ever names a channel we're already in.
-    pub fn ticket_for(&self, channel: &str) -> String {
+    pub fn ticket_for(&self, channel: &str, dm: bool) -> String {
         let secret = self
             .secret_for(channel)
             .expect("ticket_for called for an unjoined channel");
@@ -1078,6 +1126,7 @@ impl Net {
             name: channel.to_string(),
             secret,
             addr: self.router.endpoint().addr(),
+            dm,
         }
         .encode_string()
     }
@@ -1210,12 +1259,30 @@ mod tests {
             name: "general".to_string(),
             secret,
             addr: addr.clone(),
+            dm: false,
         }
         .encode_string();
 
         let (name, ticket) = parse_join_arg(&encoded).unwrap();
         assert_eq!(name, "general");
-        assert_eq!(ticket, Some((secret, addr)));
+        assert_eq!(ticket, Some((secret, addr, false)));
+    }
+
+    #[test]
+    fn parse_join_arg_carries_the_dm_flag_through() {
+        let addr = sample_addr();
+        let secret = RoomSecret::generate();
+        let encoded = ChannelTicket {
+            name: "dm-alice".to_string(),
+            secret,
+            addr: addr.clone(),
+            dm: true,
+        }
+        .encode_string();
+
+        let (name, ticket) = parse_join_arg(&encoded).unwrap();
+        assert_eq!(name, "dm-alice");
+        assert_eq!(ticket, Some((secret, addr, true)));
     }
 
     #[test]
@@ -1224,6 +1291,7 @@ mod tests {
             name: "general".to_string(),
             secret: RoomSecret::generate(),
             addr: sample_addr(),
+            dm: false,
         }
         .encode_string();
         // Simulate a ticket cut off partway through, e.g. by a terminal

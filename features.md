@@ -169,12 +169,31 @@ mechanisms, not one, since they trade off differently:
 
 ## Networking & sharing
 
-- [ ] **Direct 1:1 DMs** -- either (a) auto-provision a private 2-person
-  channel through the existing ticket flow behind a friendlier
-  `/msg <alias>` command, or (b) a true direct QUIC stream to a known
-  `EndpointId` that bypasses gossip entirely. (b) is a bigger departure
-  from today's "one gossip task per channel" model, worth prototyping
-  separately.
+- [x] **Direct 1:1 DMs** -- `/msg <alias-or-hex-prefix> [text]` (option
+  (a) from this idea's original framing): auto-provisions a private
+  2-person channel through the existing ticket flow, rather than
+  requiring a bare `/join <new-name>` + remembering which tab is "the
+  DM with Alice". A small new `dm_registry.rs` (mirrors
+  `channel_registry.rs`'s pattern) persists peer id -> DM channel name,
+  consulted by `/msg` to switch to an already-joined DM instead of
+  creating a second one. `ChannelTicket` gained a `dm` marker (versioned
+  decode, like `ChatMessage`) so the *recipient* of a `/msg`-created
+  invite also records the association on their side, keeping both
+  parties converged on one channel. First contact with a brand-new peer
+  still needs one manual out-of-band ticket share, same as any new
+  channel -- inherent to concept.md's "Room privacy" guarantee that a
+  topic must never be derivable from public info alone.
+- [ ] **True direct 1:1 messaging** -- option (b) from the original
+  "Direct 1:1 DMs" idea above: a real point-to-point QUIC stream to a
+  known `EndpointId` (a new ALPN + protocol handler on the existing
+  `Router`), bypassing gossip/`RoomSecret`/tickets entirely for peers
+  you already know. Removes the one remaining manual invite step for an
+  already-met peer, and avoids gossip-mesh overhead for a 2-node swarm,
+  but needs its own connection lifecycle/retry management, message
+  framing over a raw byte stream, presence semantics, and point-to-point
+  history sync to replace what a channel gets for free from gossip today
+  -- a bigger departure from the "one gossip task per channel" model,
+  worth prototyping separately.
 - [ ] **QR-code invite tickets** -- render a ticket as an in-terminal ASCII
   QR code for scanning from a phone, instead of copy/pasting a long base32
   string.

@@ -66,6 +66,15 @@ comes down to in a TUI.
   name, it's spoofable and not persisted, so `display_name` only falls
   back to it after a local pet name, and shows it alongside the sender's
   hex id rather than in place of it.
+- `/msg <alias-or-hex-prefix> [text]` messages one peer 1:1: it's just an
+  ordinary channel, auto-provisioned and auto-named (`dm-<label>`)
+  through the same ticket flow as any other, so it inherits privacy,
+  persistence, and backfill for free. `dm_registry.rs` persists which
+  channel is "the DM" for a given peer id, and `ChannelTicket`'s `dm`
+  marker (see "Message wire format" below for the versioning pattern this
+  follows) lets the invited side record the same association, so both
+  parties converge on reusing one channel per pair instead of drifting
+  onto separate ones.
 
 ## Room privacy
 
@@ -223,6 +232,7 @@ src/
   ticket.rs           // RoomSecret + invite ticket encode/decode
   channel_registry.rs // persisted channel list, room secrets, known peers
   contacts.rs         // persisted local pet names for peers
+  dm_registry.rs      // persisted peer id <-> 1:1 DM channel name, for /msg
   settings.rs         // persisted local preference for the message bell
   storage.rs          // local per-channel message log persistence
   search.rs           // shared match predicate + on-disk scan for /search

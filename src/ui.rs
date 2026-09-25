@@ -39,6 +39,7 @@ const MAX_INPUT_VISIBLE_LINES: usize = 6;
 const COMMAND_HINTS: &[&str] = &[
     "/join <name|ticket>",
     "/invite",
+    "/msg <alias|hex> [text]",
     "/leave [channel]",
     "/who",
     "/send <path>",

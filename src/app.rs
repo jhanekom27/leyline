@@ -169,6 +169,18 @@ pub enum InputAction {
     /// Join (or create) a channel from a bare name or an invite ticket
     /// string, exactly as the user typed it after `/join `.
     Join(String),
+    /// Starts a brand-new private 2-person channel for `/msg`ing a peer
+    /// we don't already have a joined DM channel with (see `run_msg`):
+    /// `channel` is the freshly chosen, not-yet-joined local name, and
+    /// `peer` is who it's for, so the caller can record the association
+    /// in `crate::dm_registry` once the join actually succeeds (see
+    /// `net::NetEvent::Joined`). `text`, if given, is sent once the
+    /// channel is ready.
+    StartDm {
+        peer: [u8; 32],
+        channel: String,
+        text: Option<String>,
+    },
     /// Build an invite ticket for the named channel and report it back
     /// (via `AppState::push_system`) once built.
     Invite(String),
@@ -252,6 +264,13 @@ pub struct AppState {
     /// `petnames`: a broadcast nickname isn't ours to persist, and its
     /// owner re-announces it on every reconnect anyway.
     nicknames: HashMap<[u8; 32], String>,
+    /// Peer id -> local DM channel name, so `/msg` can tell whether a peer
+    /// already has a private 1:1 channel to reuse -- see `run_msg` and
+    /// `crate::dm_registry`. Seeded once at startup from
+    /// `crate::dm_registry::DmRegistry` (see `load_dm_registry`), then kept
+    /// current as new DMs are started or accepted this session (see
+    /// `NetEvent::DmJoined` and `run_msg`'s creation path).
+    dm_channels: HashMap<[u8; 32], String>,
     /// The in-progress candidate while picking a reply target with
     /// `Ctrl+R` (see `start_reply_pick`/`move_reply_pick`), by message id.
     /// `None` when not picking -- `handle_key` checks this first, before
@@ -298,6 +317,7 @@ impl AppState {
             bell_enabled: true,
             petnames: HashMap::new(),
             nicknames: HashMap::new(),
+            dm_channels: HashMap::new(),
             picking_reply: None,
             replying_to: None,
         }
@@ -326,6 +346,14 @@ impl AppState {
     /// `load_contacts`.
     pub fn load_settings(&mut self, bell_enabled: bool) {
         self.bell_enabled = bell_enabled;
+    }
+
+    /// Seeds known peer <-> DM channel associations persisted by the
+    /// caller (see `crate::dm_registry`). Intended to be called once,
+    /// right after `AppState::new`, before the event loop starts --
+    /// mirrors `load_contacts`.
+    pub fn load_dm_registry(&mut self, dm_channels: HashMap<[u8; 32], String>) {
+        self.dm_channels = dm_channels;
     }
 
     /// Merges a batch of possibly-historical messages fetched via backfill
@@ -428,6 +456,55 @@ impl AppState {
 
     fn channel_mut(&mut self, name: &str) -> Option<&mut Channel> {
         self.channels.iter_mut().find(|c| c.name == name)
+    }
+
+    /// Clears the newly-active channel's unread flag and any in-progress
+    /// reply pick or armed reply -- both are only meaningful against the
+    /// channel they were made in. The shared tail end of every place that
+    /// changes `active`: `switch_channel` (`Tab`/`Shift+Tab`),
+    /// `activate_existing_channel`, and `activate_or_create_channel`.
+    fn finish_activating_channel(&mut self) {
+        self.active_mut().has_unread = false;
+        self.picking_reply = None;
+        self.replying_to = None;
+    }
+
+    /// Switches to `name` if it's currently joined, via
+    /// `finish_activating_channel`. Returns whether `name` was found --
+    /// `/msg`'s reuse path (`run_msg`) uses this to fall back to creating
+    /// a brand-new DM channel when the one `crate::dm_registry` remembers
+    /// isn't (or is no longer) actually joined.
+    fn activate_existing_channel(&mut self, name: &str) -> bool {
+        let Some(index) = self.channels.iter().position(|c| c.name == name) else {
+            return false;
+        };
+        self.active = index;
+        self.finish_activating_channel();
+        true
+    }
+
+    /// Switches to `name`, creating a new tab for it first if it isn't
+    /// already joined -- shared by `NetEvent::Joined` and
+    /// `NetEvent::DmJoined`, both of which report a channel (new or
+    /// already-known) finishing its join.
+    fn activate_or_create_channel(&mut self, name: String) {
+        if !self.activate_existing_channel(&name) {
+            self.channels.push(Channel::new(name));
+            self.active = self.channels.len() - 1;
+            self.finish_activating_channel();
+        }
+    }
+
+    /// Records `peer` <-> `channel` in `dm_channels` -- called by main.rs
+    /// once a `/msg`-initiated `InputAction::StartDm` actually finishes
+    /// joining (a plain `NetEvent::Joined`, correlated back to `peer` via
+    /// main.rs's own `pending_dms` map, since a freshly created channel's
+    /// `Joined` event has no ticket to carry `peer` through the way
+    /// `NetEvent::DmJoined` does for the recipient side -- see that
+    /// variant's arm in `handle_net_event`, which updates `dm_channels`
+    /// itself instead of needing this).
+    pub fn record_dm_channel(&mut self, peer: [u8; 32], channel: String) {
+        self.dm_channels.insert(peer, channel);
     }
 
     /// Pure key handling: no I/O, no network. Returns the action to
@@ -571,16 +648,20 @@ impl AppState {
                 None
             }
             NetEvent::Joined(name) => {
-                match self.channels.iter().position(|c| c.name == name) {
-                    Some(index) => self.active = index,
-                    None => {
-                        self.channels.push(Channel::new(name));
-                        self.active = self.channels.len() - 1;
-                    }
-                }
-                self.active_mut().has_unread = false;
-                self.picking_reply = None;
-                self.replying_to = None;
+                self.activate_or_create_channel(name);
+                None
+            }
+            // The recipient side of a `/msg`-initiated DM (see
+            // `ticket::ChannelTicket::dm` and `net::NetEvent::DmJoined`):
+            // activate it exactly like a plain `Joined` would, and also
+            // record the ticket's sharer as our DM partner for this
+            // channel, so a later `/msg` to them reuses it instead of
+            // creating a second, separate room. The initiator's own side
+            // never sees this variant -- see main.rs's `pending_dms` for
+            // how it records the same association from a plain `Joined`.
+            NetEvent::DmJoined { channel, peer } => {
+                self.activate_or_create_channel(channel.clone());
+                self.dm_channels.insert(peer, channel);
                 None
             }
             NetEvent::JoinFailed(name, error) => {
@@ -729,9 +810,7 @@ impl AppState {
         let len = self.channels.len() as isize;
         let next = (self.active as isize + step).rem_euclid(len) as usize;
         self.active = next;
-        self.active_mut().has_unread = false;
-        self.picking_reply = None;
-        self.replying_to = None;
+        self.finish_activating_channel();
     }
 
     fn submit_input(&mut self) -> Option<InputAction> {
@@ -783,6 +862,7 @@ impl AppState {
                 }
             }
             "invite" => Some(InputAction::Invite(self.active().name.clone())),
+            "msg" => self.run_msg(arg.trim()),
             "alias" => self.run_alias(arg.trim()),
             "nick" => self.run_nick(arg.trim()),
             "leave" => self.run_leave(arg.trim()),
@@ -808,11 +888,12 @@ impl AppState {
     /// detail actually lives.
     fn run_help(&mut self) -> Option<InputAction> {
         self.push_system(
-            "commands: /join <name|ticket>, /invite, /leave [channel], /who, \
-             /send <path>, /save <hash-prefix>, /paste, /alias <hex-prefix> <name>, \
-             /nick <name>, /search <term> (or /s), /reply [text], /hints, /bell, /help -- keys: \
-             Tab/Shift+Tab switch channels, Alt+Enter/Ctrl+J newline, Ctrl+V paste, Ctrl+R reply \
-             (\u{2191}/\u{2193} pick, Enter confirm), Up/Down scroll, Esc/Ctrl+C quit",
+            "commands: /join <name|ticket>, /invite, /msg <alias|hex-prefix> [text], \
+             /leave [channel], /who, /send <path>, /save <hash-prefix>, /paste, \
+             /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
+             /hints, /bell, /help -- keys: Tab/Shift+Tab switch channels, Alt+Enter/Ctrl+J \
+             newline, Ctrl+V paste, Ctrl+R reply (\u{2191}/\u{2193} pick, Enter confirm), \
+             Up/Down scroll, Esc/Ctrl+C quit",
         );
         None
     }
@@ -1132,6 +1213,97 @@ impl AppState {
     fn run_paste(&mut self) -> Option<InputAction> {
         self.push_system("pasting from clipboard...");
         Some(InputAction::Paste(self.active().name.clone()))
+    }
+
+    /// Handles `/msg <alias-or-hex-prefix> [text]`: `arg` is everything
+    /// after `/msg ` (already trimmed), split on the first space into a
+    /// target (resolved via `resolve_msg_target`) and an optional message
+    /// to send immediately, mirroring `/reply [text]`'s shape. If a DM
+    /// channel is already joined for that peer (`dm_channels`, see
+    /// `crate::dm_registry`), just switches to it -- else picks a fresh
+    /// local name (`unique_dm_channel_name`) and returns an
+    /// `InputAction::StartDm` for the caller to create it (see
+    /// `net::Net::join` and `NetEvent::Joined`/`DmJoined`). A recorded DM
+    /// channel that isn't currently joined (e.g. left outside of `/leave`)
+    /// is treated the same as none at all -- `activate_existing_channel`
+    /// returning `false` falls through to creating a new one.
+    fn run_msg(&mut self, arg: &str) -> Option<InputAction> {
+        if arg.is_empty() {
+            self.push_system("usage: /msg <alias-or-hex-prefix> [text]");
+            return None;
+        }
+        let (target, text) = match arg.split_once(' ') {
+            Some((target, rest)) => (target, Some(rest.trim()).filter(|s| !s.is_empty())),
+            None => (arg, None),
+        };
+        let id = match self.resolve_msg_target(target) {
+            Ok(id) => id,
+            Err(err) => {
+                self.push_system(err);
+                return None;
+            }
+        };
+
+        if let Some(name) = self.dm_channels.get(&id).cloned()
+            && self.activate_existing_channel(&name)
+        {
+            self.push_system(format!("switched to your DM with {}", self.display_name(&id)));
+            return text.map(|text| self.send_text(text, None));
+        }
+
+        let channel = self.unique_dm_channel_name(&id);
+        self.push_system(format!(
+            "starting a DM with {} in #{channel} -- share the invite once it's ready",
+            self.display_name(&id)
+        ));
+        Some(InputAction::StartDm {
+            peer: id,
+            channel,
+            text: text.map(str::to_string),
+        })
+    }
+
+    /// Resolves a `/msg` target: an exact (case-insensitive) local pet
+    /// name first -- checked against every saved pet name, not just
+    /// `known_ids()`, since you should be able to `/msg` someone you've
+    /// aliased even if they aren't observed anywhere right now -- else a
+    /// hex-prefix via `resolve_id` (which _is_ scoped to `known_ids()`,
+    /// since there's nothing else to match a raw prefix against). Errors
+    /// mirror `resolve_id`'s for a consistent UX.
+    fn resolve_msg_target(&self, target: &str) -> Result<[u8; 32], String> {
+        let matches: Vec<[u8; 32]> = self
+            .petnames
+            .iter()
+            .filter(|(_, name)| name.eq_ignore_ascii_case(target))
+            .map(|(id, _)| *id)
+            .collect();
+        match matches.as_slice() {
+            [id] => Ok(*id),
+            [] => self.resolve_id(target),
+            _ => Err(format!(
+                "'{target}' matches multiple aliased peers, use a hex prefix instead"
+            )),
+        }
+    }
+
+    /// Picks a not-currently-joined local channel name for a new DM with
+    /// `id`: `dm-<label>` (their pet name if set, else their hex prefix),
+    /// suffixed with `-2`, `-3`, ... on the rare chance that's already
+    /// taken by an unrelated channel.
+    fn unique_dm_channel_name(&self, id: &[u8; 32]) -> String {
+        let label = self
+            .petnames
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| hex_prefix(id));
+        let base = format!("dm-{label}");
+        if !self.channels.iter().any(|c| c.name == base) {
+            return base;
+        }
+        (2..)
+            .map(|n| format!("{base}-{n}"))
+            .find(|name| !self.channels.iter().any(|c| &c.name == name))
+            .expect("an unbounded suffix sequence always finds a free name")
     }
 
     /// Resolves a hex-prefix (case-insensitive, as typed after `/alias`)
@@ -3305,5 +3477,218 @@ mod tests {
             _ => panic!("expected InputAction::Send"),
         }
         assert!(app.replying_to.is_none());
+    }
+
+    #[test]
+    fn msg_usage_error_when_target_is_missing() {
+        let mut app = app();
+        let action = submit(&mut app, "/msg");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.starts_with("usage:"));
+    }
+
+    #[test]
+    fn msg_reports_invalid_hex_for_a_non_hex_unaliased_target() {
+        let mut app = app();
+        let action = submit(&mut app, "/msg carol");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("invalid hex prefix"), "got: {last}");
+    }
+
+    #[test]
+    fn msg_reports_no_known_peer_for_an_unknown_hex_prefix() {
+        let mut app = app();
+        let action = submit(&mut app, "/msg ffffffff");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("no known peer"), "got: {last}");
+    }
+
+    #[test]
+    fn msg_reports_an_error_for_an_ambiguous_alias() {
+        let mut app = app();
+        app.load_contacts(HashMap::from([
+            (PEER_ID, "Alice".to_string()),
+            (PEER_ID_2, "Alice".to_string()),
+        ]));
+
+        let action = submit(&mut app, "/msg alice");
+
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("multiple aliased peers"), "got: {last}");
+    }
+
+    #[test]
+    fn msg_by_alias_starts_a_new_dm_when_none_exists() {
+        let mut app = app();
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+
+        let action = submit(&mut app, "/msg alice");
+
+        match action.expect("/msg with no existing DM returns an action") {
+            InputAction::StartDm {
+                peer,
+                channel,
+                text,
+            } => {
+                assert_eq!(peer, PEER_ID);
+                assert_eq!(channel, "dm-Alice");
+                assert!(text.is_none());
+            }
+            _ => panic!("expected InputAction::StartDm"),
+        }
+    }
+
+    #[test]
+    fn msg_target_matching_is_case_insensitive() {
+        let mut app = app();
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+
+        let action = submit(&mut app, "/msg ALICE");
+
+        match action.expect("a case-insensitive alias match should still work") {
+            InputAction::StartDm { peer, .. } => assert_eq!(peer, PEER_ID),
+            _ => panic!("expected InputAction::StartDm"),
+        }
+    }
+
+    #[test]
+    fn msg_by_hex_prefix_starts_a_new_dm_named_from_the_hex_prefix() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+
+        let full_id = hex_id(&PEER_ID);
+        let action = submit(&mut app, &format!("/msg {}", &full_id[..8]));
+
+        match action.expect("/msg with a hex prefix returns an action") {
+            InputAction::StartDm { peer, channel, .. } => {
+                assert_eq!(peer, PEER_ID);
+                assert_eq!(channel, format!("dm-{}", hex_prefix(&PEER_ID)));
+            }
+            _ => panic!("expected InputAction::StartDm"),
+        }
+    }
+
+    #[test]
+    fn msg_with_inline_text_queues_it_on_the_new_dm_action() {
+        let mut app = app();
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+
+        let action = submit(&mut app, "/msg alice hey there");
+
+        match action.expect("a successful /msg returns an action") {
+            InputAction::StartDm { text, .. } => {
+                assert_eq!(text, Some("hey there".to_string()));
+            }
+            _ => panic!("expected InputAction::StartDm"),
+        }
+    }
+
+    #[test]
+    fn msg_disambiguates_the_channel_name_when_already_taken() {
+        let mut app = AppState::new(
+            SELF_ID,
+            vec!["general".to_string(), "dm-Alice".to_string()],
+            "general",
+        );
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+
+        let action = submit(&mut app, "/msg alice");
+
+        match action.expect("a successful /msg returns an action") {
+            InputAction::StartDm { channel, .. } => assert_eq!(channel, "dm-Alice-2"),
+            _ => panic!("expected InputAction::StartDm"),
+        }
+    }
+
+    #[test]
+    fn msg_switches_to_an_already_joined_dm_channel_instead_of_creating_another() {
+        let mut app = AppState::new(
+            SELF_ID,
+            vec!["general".to_string(), "dm-Alice".to_string()],
+            "general",
+        );
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+        app.load_dm_registry(HashMap::from([(PEER_ID, "dm-Alice".to_string())]));
+
+        let action = submit(&mut app, "/msg alice");
+
+        assert!(action.is_none(), "no inline text means nothing to send");
+        assert_eq!(app.active().name, "dm-Alice");
+    }
+
+    #[test]
+    fn msg_switches_to_an_existing_dm_and_sends_inline_text() {
+        let mut app = AppState::new(
+            SELF_ID,
+            vec!["general".to_string(), "dm-Alice".to_string()],
+            "general",
+        );
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+        app.load_dm_registry(HashMap::from([(PEER_ID, "dm-Alice".to_string())]));
+
+        let action = submit(&mut app, "/msg alice hello again");
+
+        assert_eq!(app.active().name, "dm-Alice");
+        match action.expect("inline text should send immediately") {
+            InputAction::Send(channel, message) => {
+                assert_eq!(channel, "dm-Alice");
+                assert_eq!(message.text, "hello again");
+            }
+            _ => panic!("expected InputAction::Send"),
+        }
+    }
+
+    #[test]
+    fn msg_creates_a_fresh_dm_when_the_recorded_channel_is_no_longer_joined() {
+        let mut app = app(); // only "general" is joined
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+        app.load_dm_registry(HashMap::from([(PEER_ID, "dm-Alice".to_string())]));
+
+        let action = submit(&mut app, "/msg alice");
+
+        match action.expect("should fall back to creating a fresh DM") {
+            InputAction::StartDm { channel, .. } => assert_eq!(channel, "dm-Alice"),
+            _ => panic!("expected InputAction::StartDm"),
+        }
+    }
+
+    #[test]
+    fn dm_joined_activates_the_channel_and_a_later_msg_reuses_it() {
+        let mut app = app();
+
+        let result = app.handle_net_event(NetEvent::DmJoined {
+            channel: "dm-Alice".to_string(),
+            peer: PEER_ID,
+        });
+
+        assert!(result.is_none());
+        assert_eq!(app.active().name, "dm-Alice");
+        assert_eq!(app.channels.len(), 2);
+
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+        let action = submit(&mut app, "/msg alice");
+        assert!(action.is_none(), "should just switch, nothing to send");
+        assert_eq!(app.active().name, "dm-Alice");
+        assert_eq!(app.channels.len(), 2, "must not create a second DM channel");
+    }
+
+    #[test]
+    fn record_dm_channel_lets_a_later_msg_reuse_it() {
+        let mut app = AppState::new(
+            SELF_ID,
+            vec!["general".to_string(), "dm-Alice".to_string()],
+            "dm-Alice",
+        );
+        app.record_dm_channel(PEER_ID, "dm-Alice".to_string());
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+
+        let action = submit(&mut app, "/msg alice");
+
+        assert!(action.is_none());
+        assert_eq!(app.active().name, "dm-Alice");
     }
 }

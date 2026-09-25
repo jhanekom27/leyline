@@ -147,6 +147,7 @@ Typed into the message box and submitted with `Enter`:
 | `/join <channel-name>` | Join or create a channel by name, then switch to it |
 | `/join <ticket>` | Join the channel named in a pasted invite ticket |
 | `/invite` | Show the active channel's invite ticket in the transcript (and copy it to your clipboard, if one is available) to share with others |
+| `/msg <alias-or-hex-prefix> [text]` | Message a specific peer 1:1: switches to (or auto-creates) a private channel just for the two of you, named `dm-<alias-or-hex-prefix>`; share its invite ticket the same way as any new channel so they can join it too. With `[text]`, sends it immediately once the channel is ready |
 | `/leave` | Leave the active channel |
 | `/leave <channel-name>` | Leave a specific joined channel without switching to it |
 | `/who` | List the active channel's peers, showing each one's full endpoint id, broadcast nickname (if any), and local alias (if any) |
