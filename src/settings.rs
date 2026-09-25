@@ -1,6 +1,10 @@
-//! Persisted local preferences -- currently just whether incoming messages
-//! ring the terminal bell (`/bell`, see `app::AppState::run_bell`). Local
-//! only, like `contacts.rs`; nothing here is ever sent over the wire.
+//! Persisted local preferences: whether incoming messages ring the
+//! terminal bell (`/bell`, see `app::AppState::run_bell`), and the last
+//! broadcast nickname set via `/nick` (see `net::Net::set_nickname`, which
+//! is what actually sends it to peers -- this module only remembers it
+//! locally, so it doesn't need to be retyped every session). Local only,
+//! like `contacts.rs`: loading/saving these preferences is never itself
+//! network activity.
 //!
 //! Mirrors `contacts.rs`/`channel_registry.rs`'s persisted-postcard-file
 //! pattern: small, infrequently-changed data, so it's simplest to just
@@ -23,11 +27,20 @@ struct SettingsData {
     /// default, since the whole point is to notice a message without
     /// having to watch the TUI.
     bell_enabled: bool,
+    /// The last broadcast nickname set via `/nick`, if any -- seeded back
+    /// into `net::Net` at startup so it can re-announce it once a channel
+    /// gains a neighbor (see `net::Net::announce_nickname`), the same way
+    /// it already does mid-session. `None` until `/nick` is run for the
+    /// first time.
+    nickname: Option<String>,
 }
 
 impl Default for SettingsData {
     fn default() -> Self {
-        Self { bell_enabled: true }
+        Self {
+            bell_enabled: true,
+            nickname: None,
+        }
     }
 }
 
@@ -47,8 +60,9 @@ impl Settings {
     ///
     /// A corrupt file is logged and treated as defaults rather than failing
     /// startup -- like `contacts.rs`, losing it just means falling back to
-    /// the bell's default-on behavior, not any real data loss. Only a
-    /// genuine I/O error (e.g. permission denied) is returned as `Err`.
+    /// the bell's default-on behavior and an unset nickname, not any real
+    /// data loss. Only a genuine I/O error (e.g. permission denied) is
+    /// returned as `Err`.
     pub fn load(path: PathBuf) -> anyhow::Result<Self> {
         let data = match fs::read(&path) {
             Ok(bytes) => decode(&bytes),
@@ -71,6 +85,21 @@ impl Settings {
     /// restarts too).
     pub fn set_bell_enabled(&mut self, enabled: bool) -> anyhow::Result<()> {
         self.data.bell_enabled = enabled;
+        self.save()
+    }
+
+    /// Our last broadcast nickname, if `/nick` has ever been run -- seeded
+    /// into `net::Net` once at startup (see `net::Net::start`) so it can
+    /// re-announce it once a channel gains a neighbor, without needing it
+    /// retyped every session.
+    pub fn nickname(&self) -> Option<String> {
+        self.data.nickname.clone()
+    }
+
+    /// Persists a new broadcast nickname, overwriting whatever was recorded
+    /// before (so re-running `/nick` updates what's restored next time).
+    pub fn set_nickname(&mut self, nickname: String) -> anyhow::Result<()> {
+        self.data.nickname = Some(nickname);
         self.save()
     }
 
@@ -147,5 +176,48 @@ mod tests {
 
         let reloaded = Settings::load(path).unwrap();
         assert!(reloaded.bell_enabled());
+    }
+
+    #[test]
+    fn missing_file_defaults_nickname_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(settings_at(&dir).nickname(), None);
+    }
+
+    #[test]
+    fn corrupt_file_is_tolerated_as_no_nickname() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("settings"), b"not a valid settings file").unwrap();
+        assert_eq!(settings_at(&dir).nickname(), None);
+    }
+
+    #[test]
+    fn set_nickname_then_nickname_reflects_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = settings_at(&dir);
+        settings.set_nickname("Alice".to_string()).unwrap();
+        assert_eq!(settings.nickname(), Some("Alice".to_string()));
+    }
+
+    #[test]
+    fn nickname_persists_across_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings");
+
+        let mut settings = Settings::load(path.clone()).unwrap();
+        settings.set_nickname("Alice".to_string()).unwrap();
+
+        let reloaded = Settings::load(path).unwrap();
+        assert_eq!(reloaded.nickname(), Some("Alice".to_string()));
+    }
+
+    #[test]
+    fn nickname_and_bell_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = settings_at(&dir);
+        settings.set_bell_enabled(false).unwrap();
+        settings.set_nickname("Alice".to_string()).unwrap();
+        assert!(!settings.bell_enabled());
+        assert_eq!(settings.nickname(), Some("Alice".to_string()));
     }
 }

@@ -86,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         secret_key,
         join_ticket,
         known_channels,
+        settings.nickname(),
         net_tx,
         backfill.clone(),
     )
@@ -362,6 +363,9 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                                 }
                             }
                             Some(InputAction::Nick(name)) => {
+                                if let Err(err) = settings.set_nickname(name.clone()) {
+                                    warn!("failed to persist nickname: {err}");
+                                }
                                 net.set_nickname(name);
                             }
                             Some(InputAction::Leave(channel)) => {

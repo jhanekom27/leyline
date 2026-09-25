@@ -273,11 +273,14 @@ pub struct Net {
     /// that fetch from us, and lets us fetch from a peer that announced a
     /// root hash we don't have yet.
     backfill: BackfillStore,
-    /// Our current broadcast nickname, if `/nick` has been run this session
+    /// Our current broadcast nickname, if one has ever been set via `/nick`
     /// -- re-sent to each channel's newly-up neighbors the same way a
     /// `HistoryAnnounce` is (see `announce_nickname`), so a peer who
-    /// connects after we set it still learns it. Never persisted, unlike
-    /// `contacts.rs`'s petnames -- see features.md's "Broadcast nicknames".
+    /// connects after we set it still learns it. Seeded from the previous
+    /// session's persisted value at startup (see `Net::start` and
+    /// `crate::settings::Settings::nickname`), unlike `nicknames` on
+    /// `AppState`, which tracks *peers'* announced names and is never
+    /// persisted.
     nickname: Mutex<Option<String>>,
     /// Our own endpoint id, as raw bytes so callers don't need to depend on
     /// iroh types.
@@ -297,14 +300,19 @@ impl Net {
     /// no `--join` ticket for it either -- gets a freshly generated one, so
     /// even your very first, un-shared "general" is its own private room
     /// (see `RoomSecret`'s doc comment). Spawns a gossip task per joined
-    /// channel forwarding events to `events_tx`. Returns the names of the
-    /// channels joined, in join order, plus the name of the channel that
-    /// should start active (the `--join` ticket's channel, if one was given
-    /// and usable, else "general").
+    /// channel forwarding events to `events_tx`. `nickname` seeds our
+    /// broadcast nickname from the previous session's persisted value (see
+    /// `crate::settings::Settings::nickname`), if any, so it's ready to
+    /// re-announce (via `announce_nickname`) as soon as a channel gains a
+    /// neighbor, without needing `/nick` retyped first. Returns the names
+    /// of the channels joined, in join order, plus the name of the channel
+    /// that should start active (the `--join` ticket's channel, if one was
+    /// given and usable, else "general").
     pub async fn start(
         secret_key: SecretKey,
         join_ticket: Option<String>,
         known_channels: Vec<(String, RoomSecret, Vec<EndpointAddr>)>,
+        nickname: Option<String>,
         events_tx: mpsc::Sender<NetEvent>,
         backfill: BackfillStore,
     ) -> anyhow::Result<(Self, Vec<String>, String)> {
@@ -363,7 +371,7 @@ impl Net {
             channels: Arc::new(Mutex::new(HashMap::new())),
             events_tx,
             backfill,
-            nickname: Mutex::new(None),
+            nickname: Mutex::new(nickname),
             our_id,
         };
 

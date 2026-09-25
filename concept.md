@@ -63,9 +63,14 @@ comes down to in a TUI.
 - `/nick <name>` broadcasts a chosen display name to every joined channel
   (a `GossipPayload::Identity`, re-sent on `NeighborUp` the same way a
   `HistoryAnnounce` is -- see "Message wire format" below). Unlike a pet
-  name, it's spoofable and not persisted, so `display_name` only falls
-  back to it after a local pet name, and shows it alongside the sender's
-  hex id rather than in place of it.
+  name, it's spoofable -- nothing stops another peer from claiming the
+  same name -- so `display_name` only falls back to it after a local pet
+  name, and shows it alongside the sender's hex id rather than in place
+  of it. The last value set is persisted locally (`settings.rs`, mirroring
+  `bell_enabled`) and reseeded into `Net` on the next launch, so it's
+  ready to re-announce as soon as a channel gains a neighbor, without
+  needing to be retyped every session -- persistence only saves you
+  retyping it, though; it's still just as spoofable as before.
 - `/msg <alias-or-hex-prefix> [text]` messages one peer 1:1: it's just an
   ordinary channel, auto-provisioned and auto-named (`dm-<label>`)
   through the same ticket flow as any other, so it inherits privacy,

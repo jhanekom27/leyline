@@ -26,13 +26,12 @@ mechanisms, not one, since they trade off differently:
   peers you haven't petnamed, but spoofable -- nothing stops two peers both
   claiming "alice" -- so it should supplement the id, never fully replace
   it (e.g. `alice (a1b2)` until pinned locally).
-- [ ] **Persist the broadcast nickname** -- `Net::nickname` (a
-  `Mutex<Option<String>>`) resets to `None` on every launch, unlike
-  `bell_enabled` (`settings.rs`) or petnames (`contacts.rs`), so `/nick`
-  has to be retyped every session before peers see it again. Saving the
-  last-set value and re-announcing it once channels are joined -- the same
-  way `Net::announce_nickname` already does on `NeighborUp` -- would make
-  it behave like every other saved preference.
+- [x] **Persist the broadcast nickname** -- the last value set via `/nick`
+  is now saved in `settings.rs` (mirroring `bell_enabled`) and reseeded
+  into `Net::nickname` on the next launch, so peers see it again as soon
+  as a channel gains a neighbor -- the same way `Net::announce_nickname`
+  already re-announces on `NeighborUp` -- without it needing to be
+  retyped every session.
 - [x] Resolution order in `display_name`: local petname if set, then the
   last-seen broadcast nickname, then the `hex_prefix` fallback it already
   has today.
