@@ -20,11 +20,6 @@ use crate::search::{self, SearchOutcome, SearchResults};
 /// bounding render/memory cost in a long-lived session.
 const MAX_SCROLLBACK: usize = 500;
 
-/// Cap on how many recently-seen message ids we remember per channel.
-/// Gossip is best-effort and can redeliver, so incoming messages are
-/// deduped by id -- see concept.md's "Message wire format" section.
-const MAX_SEEN_IDS: usize = 256;
-
 /// A line in a channel's transcript: either a real chat message or a
 /// local-only notice (invite output, command errors). System lines never
 /// travel over the network -- see message.rs for the wire format. Named
@@ -44,8 +39,20 @@ pub struct Channel {
     /// Whether this channel has unseen activity, shown in the tab bar --
     /// cleared when it becomes the active channel.
     pub has_unread: bool,
-    /// Recently-seen message ids, oldest first, for incoming-message dedupe.
-    seen_ids: VecDeque<u64>,
+    /// Every message id seen so far in this channel (live gossip or
+    /// backfill), for dedupe. Deliberately unbounded -- capping this by
+    /// recency used to be the cause of a real duplication bug:
+    /// `net::Net::sync_history` redelivers a channel's *entire* known
+    /// history (`backfill::BackfillStore::fetch`) on every root mismatch,
+    /// not just messages sent since the last sync, and in an active
+    /// multi-peer channel roots mismatch essentially continuously. A
+    /// bounded recency window let old-but-still-displayed message ids age
+    /// out, so the next resync treated them as brand new -- redisplaying
+    /// and re-persisting them -- and that repeated on every later resync,
+    /// compounding indefinitely. A few bytes per message ever seen in a
+    /// channel is a trivial memory cost next to keeping that channel's
+    /// full history on disk anyway.
+    seen_ids: HashSet<u64>,
     /// Active `/search <term>` results, if any -- see `AppState::run_search`
     /// and `ui::render_messages`. Transient UI state, like `scroll`: never
     /// persisted, and not kept live as new messages arrive (re-run
@@ -61,23 +68,16 @@ impl Channel {
             peers: Vec::new(),
             scroll: 0,
             has_unread: false,
-            seen_ids: VecDeque::new(),
+            seen_ids: HashSet::new(),
             search: None,
         }
     }
 
-    /// Records `id` as seen, evicting the oldest entry once over capacity.
-    /// Returns `true` if `id` had not already been seen (i.e. it should be
-    /// displayed).
+    /// Records `id` as seen. Returns `true` if `id` had not already been
+    /// seen (i.e. it should be displayed) -- see `seen_ids`'s doc comment
+    /// for why this must never forget an id once recorded.
     fn remember_seen(&mut self, id: u64) -> bool {
-        if self.seen_ids.contains(&id) {
-            return false;
-        }
-        self.seen_ids.push_back(id);
-        if self.seen_ids.len() > MAX_SEEN_IDS {
-            self.seen_ids.pop_front();
-        }
-        true
+        self.seen_ids.insert(id)
     }
 
     fn push(&mut self, line: TranscriptLine) {
@@ -1948,6 +1948,39 @@ mod tests {
         // be shown twice.
         app.handle_net_event(NetEvent::Received("general".to_string(), message));
         assert_eq!(app.active().messages.len(), before + 1);
+    }
+
+    #[test]
+    fn a_message_is_still_deduped_after_hundreds_of_others_arrive() {
+        // Regression test for a real duplication bug: `seen_ids` used to be
+        // a 256-entry recency window, but `net::Net::sync_history` can
+        // redeliver a channel's *entire* history at any time (not just
+        // messages sent since the last sync -- see
+        // `backfill::BackfillStore::fetch`), so an old-but-still-displayed
+        // message must still be rejected as a duplicate no matter how much
+        // channel activity happened after it.
+        let mut app = app();
+        let first = compose_message(PEER_ID, "the first message", None);
+        app.handle_net_event(NetEvent::Received("general".to_string(), first.clone()));
+
+        for i in 0..300 {
+            app.handle_net_event(NetEvent::Received(
+                "general".to_string(),
+                compose_message(PEER_ID, &format!("filler {i}"), None),
+            ));
+        }
+
+        let before = app.active().messages.len();
+        let result = app.handle_net_event(NetEvent::Received("general".to_string(), first));
+        assert!(
+            result.is_none(),
+            "a redelivery of an old message must still be rejected as a duplicate"
+        );
+        assert_eq!(
+            app.active().messages.len(),
+            before,
+            "must not be re-inserted into the transcript"
+        );
     }
 
     #[test]
