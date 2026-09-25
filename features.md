@@ -26,6 +26,13 @@ mechanisms, not one, since they trade off differently:
   peers you haven't petnamed, but spoofable -- nothing stops two peers both
   claiming "alice" -- so it should supplement the id, never fully replace
   it (e.g. `alice (a1b2)` until pinned locally).
+- [ ] **Persist the broadcast nickname** -- `Net::nickname` (a
+  `Mutex<Option<String>>`) resets to `None` on every launch, unlike
+  `bell_enabled` (`settings.rs`) or petnames (`contacts.rs`), so `/nick`
+  has to be retyped every session before peers see it again. Saving the
+  last-set value and re-announcing it once channels are joined -- the same
+  way `Net::announce_nickname` already does on `NeighborUp` -- would make
+  it behave like every other saved preference.
 - [x] Resolution order in `display_name`: local petname if set, then the
   last-seen broadcast nickname, then the `hex_prefix` fallback it already
   has today.
@@ -41,6 +48,11 @@ mechanisms, not one, since they trade off differently:
   so it survives rewrapping), `Enter` arms it, `Esc` cancels. A `/reply
   [text]` command covers the common "reply to the most recent message"
   case without picking.
+- [ ] **Thread view** -- a command (e.g. `/thread <id>`) that walks a
+  message's `reply_to` chain -- both up to whatever it replied to and down
+  to every message that replied to it -- and shows just that conversation
+  on its own, instead of scrolling the whole transcript to follow a reply
+  chain by eye.
 - [ ] **Edit / delete own messages** -- a new envelope variant referencing
   the original `id`, accepted only if `sender` matches. Tombstone as
   "(deleted)" rather than actually removing, so dedupe/backfill never have
@@ -69,6 +81,13 @@ mechanisms, not one, since they trade off differently:
   scrolls, past `MAX_INPUT_VISIBLE_LINES`). `Home`/`End`/`Ctrl+U`/`Ctrl+K`
   act on the current line rather than the whole message, matching
   standard multi-line editors (`AppState::current_line_bounds`).
+- [ ] **Per-channel input drafts** -- `AppState::input`/`cursor` live on
+  `AppState` itself, not on `Channel`, so `switch_channel` neither saves
+  nor clears them: half-typed text in `#general` is still sitting in the
+  box after `Tab` to `#random`, and `Enter` sends it to whichever channel
+  is now active, not the one it was written for. Moving `input`/`cursor`
+  onto `Channel` would give each channel its own draft, like most chat
+  clients, without changing how `replying_to` is already scoped.
 - [x] **Markdown rendering** -- headings (`#`/`##`/`###`), fenced code
   blocks, inline code, bold (`**`), italic (`*`/`_`), unordered lists
   (`-`/`*`/`+`), ordered lists (`N.`), and blockquotes (`>`, nested via
@@ -80,6 +99,11 @@ mechanisms, not one, since they trade off differently:
   highlighting still applies on top of that styling
   (`ui::highlight_spans`). Deliberately minimal for now -- no nested
   lists, tables, links/images, or code syntax highlighting.
+- [ ] **Clickable links** -- detect bare URLs in message text and wrap
+  them in an OSC 8 terminal hyperlink escape sequence when rendering, so
+  terminals that support it (most modern ones) make them Cmd/Ctrl-clickable
+  without ever leaving the TUI. No new dependency -- just a URL-matching
+  pass in `ui.rs`/`markdown.rs` alongside the existing styling.
 
 ## Channels & presence
 
@@ -94,6 +118,12 @@ mechanisms, not one, since they trade off differently:
   explicitly (unlike `display_name`'s blended, one-string precedence
   order used elsewhere); previously the header only showed a count and
   the sidebar only a 4-byte hex prefix.
+- [ ] **Unread counts, and jump-to-first-unread** -- `Channel::has_unread`
+  is currently a bool (shown as a dot in the tab bar), so a channel with
+  one new message looks the same as one with a hundred, and switching to
+  it lands wherever `scroll` last was rather than at the oldest unseen
+  message. Tracking a count -- and the id of the first unseen message --
+  alongside `has_unread` would cover both.
 - [ ] **Last-seen timestamps** -- presence is purely ephemeral today
   (`NeighborUp`/`NeighborDown`, concept.md's "Presence" section).
   Persisting "last seen at T" per peer per channel would let offline
