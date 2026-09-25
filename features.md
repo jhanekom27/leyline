@@ -70,13 +70,16 @@ mechanisms, not one, since they trade off differently:
   act on the current line rather than the whole message, matching
   standard multi-line editors (`AppState::current_line_bounds`).
 - [x] **Markdown rendering** -- headings (`#`/`##`/`###`), fenced code
-  blocks, inline code, bold (`**`), and italic (`*`/`_`) typed into a
-  message render as styled output in the transcript (a small hand-rolled
-  renderer, `markdown.rs`, not a CommonMark parser), rather than showing
-  as literal source; search-term highlighting still applies on top of
-  that styling (`ui::highlight_spans`). Deliberately minimal for now --
-  no lists, blockquotes, tables, links/images, or code syntax
-  highlighting.
+  blocks, inline code, bold (`**`), italic (`*`/`_`), unordered lists
+  (`-`/`*`/`+`), ordered lists (`N.`), and blockquotes (`>`, nested via
+  repeated `>`) typed into a message render as styled output in the
+  transcript (a small hand-rolled renderer, `markdown.rs`, not a
+  CommonMark parser), rather than showing as literal source; a list
+  item's or blockquote's marker gets a hanging indent so wrapped
+  continuation lines still line up under the text. Search-term
+  highlighting still applies on top of that styling
+  (`ui::highlight_spans`). Deliberately minimal for now -- no nested
+  lists, tables, links/images, or code syntax highlighting.
 
 ## Channels & presence
 

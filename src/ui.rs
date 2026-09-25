@@ -1136,6 +1136,28 @@ mod tests {
     }
 
     #[test]
+    fn push_chat_rows_renders_a_list_item_and_a_blockquote() {
+        let app = AppState::new([1; 32], vec!["general".to_string()], "general");
+        let message = text_message(1, [1; 32], "- item one\n> quoted");
+        let layout = row_layout(80);
+        let mut rows = Vec::new();
+
+        push_chat_rows(&mut rows, &app, &message, true, &layout, None, false);
+
+        assert_eq!(rows.len(), 2);
+        assert!(
+            row_text(&rows[0]).ends_with("\u{2022} item one"),
+            "got: {}",
+            row_text(&rows[0])
+        );
+        assert!(
+            row_text(&rows[1]).ends_with("\u{2502} quoted"),
+            "got: {}",
+            row_text(&rows[1])
+        );
+    }
+
+    #[test]
     fn push_chat_rows_never_markdown_parses_an_attachment_caption() {
         let self_id = [1; 32];
         let app = AppState::new(self_id, vec!["general".to_string()], "general");

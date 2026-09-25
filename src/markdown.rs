@@ -8,10 +8,12 @@
 //! joining consecutive non-blank lines into one reflowed paragraph.
 //!
 //! Supports headings (`#`/`##`/`###`), fenced code blocks (three
-//! backticks), inline code (single backtick), bold (`**`), and italic
-//! (`*` or `_`). Deliberately out of scope for now: lists, blockquotes,
-//! tables, links/images, strikethrough, nested inline styles, and code
-//! syntax highlighting -- see plan-multiline-input-and-markdown.md.
+//! backticks), inline code (single backtick), bold (`**`), italic
+//! (`*` or `_`), unordered lists (`-`/`*`/`+`), ordered lists (`N.`),
+//! and blockquotes (`>`, nested via repeated `>`). Deliberately out of
+//! scope for now: tables, links/images, strikethrough, nested inline
+//! styles, task lists, and code syntax highlighting -- see
+//! plan-multiline-input-and-markdown.md.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
@@ -24,6 +26,16 @@ enum Block {
     /// Lines between a pair of fence lines (or from an unterminated
     /// fence to the end of the text).
     Code(Vec<String>),
+    /// A `-`/`*`/`+` unordered list item; content still has inline
+    /// styling to parse.
+    Bullet(String),
+    /// An ordered list item: the number exactly as typed (never
+    /// renumbered, since each line is scanned independently -- see
+    /// `parse_ordered`) and its content.
+    Ordered(String, String),
+    /// A `>` blockquote line, with its nesting depth (repeated `>`s --
+    /// see `parse_blockquote`) and its content.
+    Blockquote(usize, String),
     /// Any other non-empty line, with inline styling still to parse.
     Paragraph(String),
     /// An empty source line, rendered as a blank row.
@@ -31,11 +43,11 @@ enum Block {
 }
 
 /// Renders `text` (a chat message's raw source) into rows of styled spans:
-/// headings and paragraphs are word-wrapped (inline `**bold**`/`*italic*`/
-/// `` `code` `` styling preserved across the wrap), code block lines are
-/// character-wrapped since code must never be reflowed (see `wrap_chars`).
-/// Always returns at least one row, mirroring `textwrap::wrap`'s behavior
-/// on an empty string.
+/// headings, paragraphs, list items, and blockquotes are word-wrapped
+/// (inline `**bold**`/`*italic*`/`` `code` `` styling preserved across the
+/// wrap), code block lines are character-wrapped since code must never be
+/// reflowed (see `wrap_chars`). Always returns at least one row, mirroring
+/// `textwrap::wrap`'s behavior on an empty string.
 pub fn render(text: &str, width: usize) -> Vec<Vec<Span<'static>>> {
     let width = width.max(1);
     let mut rows = Vec::new();
@@ -43,17 +55,13 @@ pub fn render(text: &str, width: usize) -> Vec<Vec<Span<'static>>> {
         match block {
             Block::Blank => rows.push(Vec::new()),
             Block::Heading(level, content) => {
-                // Inline markers inside a heading are still recognized,
-                // just patched onto the heading's own base style rather
-                // than parsed recursively (nested inline styles are out
-                // of scope) -- e.g. bold-in-a-heading just stays the
-                // heading's color with extra emphasis.
-                let base = heading_style(level);
-                let styled: Vec<(String, Style)> = tokenize_inline(&content)
-                    .into_iter()
-                    .map(|(run_text, run_style)| (run_text, base.patch(run_style)))
-                    .collect();
-                rows.extend(pack_words(split_into_words(flatten(&styled)), width));
+                rows.extend(render_line(
+                    &content,
+                    width,
+                    "",
+                    Style::default(),
+                    heading_style(level),
+                ));
             }
             Block::Code(lines) => {
                 for line in lines {
@@ -62,9 +70,43 @@ pub fn render(text: &str, width: usize) -> Vec<Vec<Span<'static>>> {
                     }
                 }
             }
+            Block::Bullet(content) => {
+                rows.extend(render_line(
+                    &content,
+                    width,
+                    "\u{2022} ",
+                    Style::default(),
+                    Style::default(),
+                ));
+            }
+            Block::Ordered(number, content) => {
+                let marker = format!("{number}. ");
+                rows.extend(render_line(
+                    &content,
+                    width,
+                    &marker,
+                    Style::default(),
+                    Style::default(),
+                ));
+            }
+            Block::Blockquote(depth, content) => {
+                let marker = "\u{2502} ".repeat(depth);
+                rows.extend(render_line(
+                    &content,
+                    width,
+                    &marker,
+                    quote_bar_style(),
+                    quote_style(),
+                ));
+            }
             Block::Paragraph(line) => {
-                let runs = tokenize_inline(&line);
-                rows.extend(pack_words(split_into_words(flatten(&runs)), width));
+                rows.extend(render_line(
+                    &line,
+                    width,
+                    "",
+                    Style::default(),
+                    Style::default(),
+                ));
             }
         }
     }
@@ -74,13 +116,61 @@ pub fn render(text: &str, width: usize) -> Vec<Vec<Span<'static>>> {
     rows
 }
 
+/// Renders one source line's inline-tokenized content, wrapped to `width`
+/// minus `marker`'s width, with `marker` (styled `marker_style`)
+/// prefixing the first row and blank padding of the same width on
+/// continuation rows -- shared by every block that's just "one line of
+/// inline-styled text," optionally with a leading marker. An empty
+/// `marker` (headings, plain paragraphs) adds no prefix at all, so
+/// wrapping and the resulting spans are unaffected. `content_style` is
+/// patched *under* each inline span's own style (bold/italic/code), so
+/// e.g. a heading or blockquote can apply a uniform base style while
+/// still layering its own emphasis on top.
+fn render_line(
+    content: &str,
+    width: usize,
+    marker: &str,
+    marker_style: Style,
+    content_style: Style,
+) -> Vec<Vec<Span<'static>>> {
+    let marker_width = marker.chars().count();
+    let content_width = width.saturating_sub(marker_width).max(1);
+    let runs: Vec<(String, Style)> = tokenize_inline(content)
+        .into_iter()
+        .map(|(text, style)| (text, content_style.patch(style)))
+        .collect();
+    let mut wrapped = pack_words(split_into_words(flatten(&runs)), content_width);
+    if wrapped.is_empty() {
+        wrapped.push(Vec::new());
+    }
+
+    let blank_prefix = " ".repeat(marker_width);
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let mut full_row = if index == 0 && !marker.is_empty() {
+                vec![Span::styled(marker.to_string(), marker_style)]
+            } else if index > 0 && !blank_prefix.is_empty() {
+                vec![Span::raw(blank_prefix.clone())]
+            } else {
+                Vec::new()
+            };
+            full_row.extend(row);
+            full_row
+        })
+        .collect()
+}
+
 /// Scans `text` into `Block`s, one per source line -- split with the same
 /// `split('\n')` `textwrap::wrap` itself uses, so a message with no
 /// markdown syntax at all reflows identically to before this module
 /// replaced the plain `textwrap::wrap` call in `ui::push_chat_rows`. A
 /// line of 1-3 `#`s plus a space starts a heading; a fence line toggles
 /// code-block mode until the next one (or the end of the text, for an
-/// unterminated fence -- still shown rather than silently dropped).
+/// unterminated fence -- still shown rather than silently dropped); a
+/// `>` starts a blockquote; a `-`/`*`/`+` plus a space starts an
+/// unordered list item; digits plus `. ` start an ordered one.
 fn parse_blocks(text: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut in_code = false;
@@ -102,6 +192,12 @@ fn parse_blocks(text: &str) -> Vec<Block> {
         }
         if let Some((level, content)) = parse_heading(line) {
             blocks.push(Block::Heading(level, content.to_string()));
+        } else if let Some((depth, content)) = parse_blockquote(line) {
+            blocks.push(Block::Blockquote(depth, content.to_string()));
+        } else if let Some(content) = parse_bullet(line) {
+            blocks.push(Block::Bullet(content.to_string()));
+        } else if let Some((number, content)) = parse_ordered(line) {
+            blocks.push(Block::Ordered(number.to_string(), content.to_string()));
         } else if line.is_empty() {
             blocks.push(Block::Blank);
         } else {
@@ -137,6 +233,54 @@ fn parse_heading(line: &str) -> Option<(u8, &str)> {
     Some((hashes as u8, content))
 }
 
+/// Recognizes a `-`/`*`/`+` unordered list item (the marker followed by a
+/// space), returning its content.
+fn parse_bullet(line: &str) -> Option<&str> {
+    let rest = line
+        .strip_prefix('-')
+        .or_else(|| line.strip_prefix('*'))
+        .or_else(|| line.strip_prefix('+'))?;
+    rest.strip_prefix(' ')
+}
+
+/// Recognizes an ordered list item: one or more digits followed by `. `,
+/// returning the number text (used verbatim as typed -- items are never
+/// renumbered, since each line is scanned independently of the others)
+/// and the content after it. A decimal like "1.5" is correctly left as a
+/// plain paragraph, since there's no space right after the `.`.
+fn parse_ordered(line: &str) -> Option<(&str, &str)> {
+    let digit_count = line.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digit_count == 0 {
+        return None;
+    }
+    let (number, rest) = line.split_at(digit_count);
+    let content = rest.strip_prefix(". ")?;
+    Some((number, content))
+}
+
+/// Recognizes a `>` blockquote line, counting consecutive `>` markers
+/// (each optionally followed by one space, so both ">>nested" and
+/// "> > nested" work) for its nesting depth, and returning the content
+/// after them.
+fn parse_blockquote(line: &str) -> Option<(usize, &str)> {
+    let mut rest = line.strip_prefix('>')?;
+    let mut depth = 1;
+    loop {
+        let after_space = rest.strip_prefix(' ').unwrap_or(rest);
+        match after_space.strip_prefix('>') {
+            Some(next) => {
+                rest = next;
+                depth += 1;
+            }
+            None => {
+                rest = after_space;
+                break;
+            }
+        }
+    }
+    Some((depth, rest))
+}
+
 /// Heading style: bold accent color for every level, with a small extra
 /// touch (underline for `#`, italic for `###`) so the three levels are
 /// still visually distinguishable at a glance.
@@ -161,6 +305,19 @@ fn bold_style() -> Style {
 
 fn italic_style() -> Style {
     Style::default().add_modifier(Modifier::ITALIC)
+}
+
+/// Style applied to a blockquote's own text -- italic, with no color
+/// change, so it reads as quoted without looking like a system notice
+/// (which uses a dim gray italic elsewhere in `ui.rs`).
+fn quote_style() -> Style {
+    Style::default().add_modifier(Modifier::ITALIC)
+}
+
+/// Style applied to a blockquote's `\u{2502}` bar marker(s) -- dim, so the
+/// bar reads as a structural rail rather than part of the quoted text.
+fn quote_bar_style() -> Style {
+    Style::default().fg(Color::DarkGray)
 }
 
 /// Whether `c` counts as part of an identifier -- used to keep `_..._`
@@ -485,6 +642,74 @@ mod tests {
     }
 
     #[test]
+    fn parse_blocks_recognizes_unordered_list_markers() {
+        assert_eq!(
+            parse_blocks("- one\n* two\n+ three"),
+            vec![
+                Block::Bullet("one".to_string()),
+                Block::Bullet("two".to_string()),
+                Block::Bullet("three".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_blocks_does_not_treat_a_bare_dash_as_a_bullet() {
+        // No space after the marker -- not a list item.
+        assert_eq!(
+            parse_blocks("-not a list"),
+            vec![Block::Paragraph("-not a list".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_blocks_recognizes_an_ordered_list_item() {
+        assert_eq!(
+            parse_blocks("1. first\n42. later"),
+            vec![
+                Block::Ordered("1".to_string(), "first".to_string()),
+                Block::Ordered("42".to_string(), "later".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_blocks_does_not_misread_a_decimal_number_as_a_list() {
+        assert_eq!(
+            parse_blocks("v1.5 released"),
+            vec![Block::Paragraph("v1.5 released".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_blocks_recognizes_a_blockquote() {
+        assert_eq!(
+            parse_blocks("> quoted text"),
+            vec![Block::Blockquote(1, "quoted text".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_blocks_recognizes_a_blockquote_with_no_space_after_the_marker() {
+        assert_eq!(
+            parse_blocks(">quoted"),
+            vec![Block::Blockquote(1, "quoted".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_blocks_recognizes_a_nested_blockquote() {
+        assert_eq!(
+            parse_blocks("> > deeply quoted"),
+            vec![Block::Blockquote(2, "deeply quoted".to_string())]
+        );
+        assert_eq!(
+            parse_blocks(">>no spaces"),
+            vec![Block::Blockquote(2, "no spaces".to_string())]
+        );
+    }
+
+    #[test]
     fn tokenize_inline_recognizes_bold_italic_and_code() {
         assert_eq!(
             tokenize_inline("a **b** c *d* e `f` g"),
@@ -603,6 +828,75 @@ mod tests {
     #[test]
     fn render_never_returns_an_empty_row_list() {
         assert_eq!(render("", 80), vec![Vec::<Span<'static>>::new()]);
+    }
+
+    #[test]
+    fn render_renders_a_bullet_with_its_marker() {
+        let rows = render("- an item", 80);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_text(&rows[0]), "\u{2022} an item");
+    }
+
+    #[test]
+    fn render_hanging_indents_a_wrapped_bullet_under_its_text() {
+        let rows = render("- a longer item that wraps", 12);
+        assert!(
+            rows.len() >= 2,
+            "expected the item to wrap onto multiple rows"
+        );
+        assert!(row_text(&rows[0]).starts_with("\u{2022} "));
+        assert!(
+            row_text(&rows[1]).starts_with("  "),
+            "continuation row should line up under the text, not the bullet: {:?}",
+            row_text(&rows[1])
+        );
+    }
+
+    #[test]
+    fn render_renders_an_ordered_item_with_its_number() {
+        let rows = render("1. first item", 80);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_text(&rows[0]), "1. first item");
+    }
+
+    #[test]
+    fn render_supports_inline_styling_inside_a_list_item() {
+        let rows = render("- **bold** item", 80);
+        assert_eq!(rows.len(), 1);
+        let bold_span = rows[0]
+            .iter()
+            .find(|span| span.content.as_ref() == "bold")
+            .expect("a bold span");
+        assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn render_renders_a_blockquote_with_a_bar_and_italic_text() {
+        let rows = render("> quoted", 80);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_text(&rows[0]), "\u{2502} quoted");
+        let bar_span = &rows[0][0];
+        assert_eq!(bar_span.content.as_ref(), "\u{2502} ");
+        assert_eq!(bar_span.style.fg, Some(Color::DarkGray));
+        let text_span = rows[0].last().unwrap();
+        assert_eq!(text_span.content.as_ref(), "quoted");
+        assert!(text_span.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn render_renders_a_nested_blockquote_with_a_double_bar() {
+        let rows = render(">> deeply quoted", 80);
+        assert_eq!(rows.len(), 1);
+        assert!(row_text(&rows[0]).starts_with("\u{2502} \u{2502} "));
+    }
+
+    #[test]
+    fn render_a_bare_bullet_marker_shows_just_the_marker() {
+        let rows = render("-  ", 80);
+        assert_eq!(rows.len(), 1);
+        // Trailing whitespace is trimmed like any other wrapped row, so a
+        // content-less bullet still shows exactly its own marker.
+        assert_eq!(row_text(&rows[0]), "\u{2022} ");
     }
 
     #[test]
