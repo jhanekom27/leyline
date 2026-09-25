@@ -35,6 +35,19 @@ mechanisms, not one, since they trade off differently:
 - [x] Resolution order in `display_name`: local petname if set, then the
   last-seen broadcast nickname, then the `hex_prefix` fallback it already
   has today.
+- [x] **Update notification** -- every instance broadcasts its own build
+  version (`Cargo.toml`'s semver) and git commit (stamped in at compile
+  time by a new `build.rs`, via `crate::version`) as a
+  `GossipPayload::Version`, re-sent on `NeighborUp` the same way
+  `Identity`/`Announce` are. The first time a peer's recorded version
+  becomes newer than ours, a one-time system notice fires and the TUI
+  header shows a durable "update available" indicator for the rest of the
+  session; `/who` also shows a peer's version, and a new `/version`
+  command (plus a `--version` CLI flag) reports our own. Fully
+  peer-to-peer, no release server involved -- consistent with leyline's
+  "no servers, no central relay" pitch, at the cost of only ever being
+  able to say "someone I've talked to is ahead of you," never "you're
+  definitely current."
 
 ## Messaging
 

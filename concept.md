@@ -71,6 +71,17 @@ comes down to in a TUI.
   ready to re-announce as soon as a channel gains a neighbor, without
   needing to be retyped every session -- persistence only saves you
   retyping it, though; it's still just as spoofable as before.
+- Every instance also broadcasts its own build version and git commit
+  (`GossipPayload::Version`, re-sent on `NeighborUp` the same way
+  `Identity`/`Announce` are -- see "Message wire format" below) so peers
+  running an older build can be told about it: `AppState` compares an
+  incoming `VersionAnnounce` against its own `crate::version::VERSION`
+  and, the first time a specific peer's recorded version actually becomes
+  newer, both pushes a one-time system notice and keeps a durable "update
+  available" indicator in the TUI header for the rest of the session.
+  Purely peer-to-peer, unlike a typical "check for updates" ping to a
+  release server -- it can only ever say "someone I've talked to is ahead
+  of you," never "you're definitely current."
 - `/msg <alias-or-hex-prefix> [text]` messages one peer 1:1: it's just an
   ordinary channel, auto-provisioned and auto-named (`dm-<label>`)
   through the same ticket flow as any other, so it inherits privacy,
@@ -139,6 +150,7 @@ pub enum GossipPayload {
     Chat(ChatMessage),
     Announce(HistoryAnnounce), // see "Persistence & history backfill" below
     Identity(IdentityAnnounce), // see "Identity & channels" above
+    Version(VersionAnnounce), // see "Identity & channels" above
 }
 ```
 
@@ -227,6 +239,7 @@ a channel before its history can sync to you.
 ## Project layout
 
 ```
+build.rs              // stamps the git commit hash into LEYLINE_GIT_HASH at compile time
 src/
   main.rs             // wires everything up, runs the event loop
   app.rs              // AppState, pure handle_key/handle_net_event logic
@@ -238,9 +251,10 @@ src/
   channel_registry.rs // persisted channel list, room secrets, known peers
   contacts.rs         // persisted local pet names for peers
   dm_registry.rs      // persisted peer id <-> 1:1 DM channel name, for /msg
-  settings.rs         // persisted local preference for the message bell
+  settings.rs         // persisted local preferences: message bell, broadcast nickname
   storage.rs          // local per-channel message log persistence
   search.rs           // shared match predicate + on-disk scan for /search
   backfill.rs         // iroh-blobs history manifests for offline backfill
   files.rs            // /save destination resolution, filename safety, sizes
+  version.rs          // build version/git-hash constants, newer-than-ours comparison
 ```

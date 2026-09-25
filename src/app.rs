@@ -15,6 +15,7 @@ use iroh_blobs::Hash;
 use crate::message::{ChatMessage, now_unix_ms};
 use crate::net::NetEvent;
 use crate::search::{self, SearchOutcome, SearchResults};
+use crate::version;
 
 /// Cap on in-memory scrollback per channel, per concept.md's guidance on
 /// bounding render/memory cost in a long-lived session.
@@ -264,6 +265,12 @@ pub struct AppState {
     /// `petnames`: a broadcast nickname isn't ours to persist, and its
     /// owner re-announces it on every reconnect anyway.
     nicknames: HashMap<[u8; 32], String>,
+    /// Last-announced `(version, git_hash)` per sender, from
+    /// `NetEvent::Version` -- checked by `who_line` and
+    /// `newest_known_update`. In-memory only, like `nicknames`: it isn't
+    /// ours to persist, and each peer re-announces it on every reconnect
+    /// anyway.
+    peer_versions: HashMap<[u8; 32], (String, String)>,
     /// Peer id -> local DM channel name, so `/msg` can tell whether a peer
     /// already has a private 1:1 channel to reuse -- see `run_msg` and
     /// `crate::dm_registry`. Seeded once at startup from
@@ -317,6 +324,7 @@ impl AppState {
             bell_enabled: true,
             petnames: HashMap::new(),
             nicknames: HashMap::new(),
+            peer_versions: HashMap::new(),
             dm_channels: HashMap::new(),
             picking_reply: None,
             replying_to: None,
@@ -676,6 +684,26 @@ impl AppState {
                 self.nicknames.insert(identity.sender, identity.nickname);
                 None
             }
+            // A peer's (re-)announced build version -- see features.md's
+            // version-notification idea. Always recorded (for `/who` and
+            // `newest_known_update`), regardless of whether it's newer
+            // than ours; a system notice only fires the first time this
+            // peer's recorded version actually changes to something newer
+            // than ours, so a plain reconnect (the same version
+            // re-announced) doesn't repeat it.
+            NetEvent::Version(_channel, announce) => {
+                let info = (announce.version.clone(), announce.git_hash.clone());
+                let previous = self.peer_versions.insert(announce.sender, info.clone());
+                if previous.as_ref() != Some(&info) && version::is_newer(&announce.version) {
+                    let who = self.display_name(&announce.sender);
+                    self.push_system(format!(
+                        "{who} is running v{} (you're on v{}) -- consider updating",
+                        announce.version,
+                        version::VERSION,
+                    ));
+                }
+                None
+            }
             // A `/save`d file finished downloading -- see
             // `net::Net::save_file`.
             NetEvent::FileSaved { filename, path } => {
@@ -792,6 +820,19 @@ impl AppState {
         }
     }
 
+    /// The newest peer version we've heard (via `NetEvent::Version`) that's
+    /// actually newer than ours, if any -- used by `ui::render_header`'s
+    /// persistent indicator and `/version`'s own report. Recomputed on
+    /// demand rather than cached, since `peer_versions` is small (bounded
+    /// by distinct peers ever seen, like `nicknames`).
+    pub fn newest_known_update(&self) -> Option<(&str, &str)> {
+        self.peer_versions
+            .values()
+            .filter(|(candidate, _)| version::is_newer(candidate))
+            .max_by_key(|(candidate, _)| version::parse(candidate))
+            .map(|(candidate, hash)| (candidate.as_str(), hash.as_str()))
+    }
+
     /// Appends a local-only system notice to the active channel's
     /// transcript (invite output, command errors) -- never sent over the
     /// network.
@@ -874,6 +915,7 @@ impl AppState {
             "reply" => self.run_reply(arg.trim()),
             "hints" => self.run_hints(),
             "bell" => self.run_bell(),
+            "version" => self.run_version(),
             "help" => self.run_help(),
             _ => {
                 self.push_system(format!("unknown command: /{name}"));
@@ -891,7 +933,7 @@ impl AppState {
             "commands: /join <name|ticket>, /invite, /msg <alias|hex-prefix> [text], \
              /leave [channel], /who, /send <path>, /save <hash-prefix>, /paste, \
              /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
-             /hints, /bell, /help -- keys: Tab/Shift+Tab switch channels, Alt+Enter/Ctrl+J \
+             /hints, /bell, /version, /help -- keys: Tab/Shift+Tab switch channels, Alt+Enter/Ctrl+J \
              newline, Ctrl+V paste, Ctrl+R reply (\u{2191}/\u{2193} pick, Enter confirm), \
              Up/Down scroll, Esc/Ctrl+C quit",
         );
@@ -1033,11 +1075,35 @@ impl AppState {
         if let Some(alias) = self.petnames.get(id) {
             details.push(format!("alias: {alias}"));
         }
+        if let Some((version, git_hash)) = self.peer_versions.get(id) {
+            details.push(format!("version: {version} ({git_hash})"));
+        }
         if details.is_empty() {
             hex_id(id)
         } else {
             format!("{} ({})", hex_id(id), details.join(", "))
         }
+    }
+
+    /// Handles `/version`: reports our own build version and git commit,
+    /// plus the newest peer version we've heard that's newer than ours, if
+    /// any (see `newest_known_update`). Purely local, like `/who`/`/help`:
+    /// no `InputAction` needed.
+    fn run_version(&mut self) -> Option<InputAction> {
+        let update = self
+            .newest_known_update()
+            .map(|(version, hash)| (version.to_string(), hash.to_string()));
+        self.push_system(format!(
+            "running v{} ({})",
+            version::VERSION,
+            version::GIT_HASH
+        ));
+        if let Some((peer_version, peer_hash)) = update {
+            self.push_system(format!(
+                "a peer is running a newer v{peer_version} ({peer_hash}) -- consider updating"
+            ));
+        }
+        None
     }
 
     /// Handles `/search <term>` (`/s` is a shorthand alias, see
@@ -1595,7 +1661,7 @@ fn compose_message(sender: [u8; 32], text: &str, reply_to: Option<u64>) -> ChatM
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::IdentityAnnounce;
+    use crate::message::{IdentityAnnounce, VersionAnnounce};
 
     const SELF_ID: [u8; 32] = [9; 32];
     const PEER_ID: [u8; 32] = [7; 32];
@@ -1993,6 +2059,79 @@ mod tests {
         assert!(action.is_none());
         let last = as_system(app.active().messages.back().unwrap());
         assert!(last.starts_with("usage:"));
+    }
+
+    #[test]
+    fn newer_peer_version_pushes_a_notice_once() {
+        let mut app = app();
+        let announce = VersionAnnounce {
+            sender: PEER_ID,
+            version: "999.0.0".to_string(),
+            git_hash: "abc1234".to_string(),
+        };
+        app.handle_net_event(NetEvent::Version("general".to_string(), announce.clone()));
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("999.0.0"), "got: {last}");
+
+        // Re-announcing the exact same version (e.g. on a reconnect) must
+        // not repeat the notice.
+        let before = app.active().messages.len();
+        app.handle_net_event(NetEvent::Version("general".to_string(), announce));
+        assert_eq!(
+            app.active().messages.len(),
+            before,
+            "must not repeat the notice for an unchanged re-announce"
+        );
+    }
+
+    #[test]
+    fn older_peer_version_does_not_notice_but_is_recorded_for_who() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        let before = app.active().messages.len();
+
+        app.handle_net_event(NetEvent::Version(
+            "general".to_string(),
+            VersionAnnounce {
+                sender: PEER_ID,
+                version: "0.0.0".to_string(),
+                git_hash: "abc1234".to_string(),
+            },
+        ));
+        assert_eq!(
+            app.active().messages.len(),
+            before,
+            "an older version must not push a notice"
+        );
+
+        submit(&mut app, "/who");
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("version: 0.0.0 (abc1234)"), "got: {last}");
+    }
+
+    #[test]
+    fn version_command_reports_our_own_build() {
+        let mut app = app();
+        let action = submit(&mut app, "/version");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains(version::VERSION), "got: {last}");
+    }
+
+    #[test]
+    fn version_command_also_reports_a_known_newer_peer_version() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::Version(
+            "general".to_string(),
+            VersionAnnounce {
+                sender: PEER_ID,
+                version: "999.0.0".to_string(),
+                git_hash: "abc1234".to_string(),
+            },
+        ));
+        submit(&mut app, "/version");
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("999.0.0"), "got: {last}");
     }
 
     #[test]

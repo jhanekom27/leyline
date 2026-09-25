@@ -51,6 +51,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/reply [text]",
     "/hints",
     "/bell",
+    "/version",
     "/help",
 ];
 
@@ -121,13 +122,27 @@ fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
     let tabs_line = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
     frame.render_widget(tabs_line, tabs);
 
-    let identity_line = Paragraph::new(Line::from(vec![
+    let mut identity_spans = vec![
         Span::raw(" you: "),
         Span::styled(
             hex_id(&app.self_id),
             Style::default().fg(user_color(&app.self_id)),
         ),
-    ]));
+    ];
+    // Durable for the whole session once seen (unlike the one-time system
+    // notice `AppState::handle_net_event` pushes on first detection), so it
+    // doesn't just scroll out of the transcript -- see
+    // `AppState::newest_known_update` and features.md's version-
+    // notification idea.
+    if let Some((version, _)) = app.newest_known_update() {
+        identity_spans.push(Span::styled(
+            format!("   update available: v{version}"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let identity_line = Paragraph::new(Line::from(identity_spans));
     frame.render_widget(identity_line, identity);
 }
 

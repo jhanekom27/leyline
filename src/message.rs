@@ -156,6 +156,8 @@ pub enum GossipPayload {
     Announce(HistoryAnnounce),
     /// A broadcast-nickname announcement -- see `IdentityAnnounce`.
     Identity(IdentityAnnounce),
+    /// A build-version announcement -- see `VersionAnnounce`.
+    Version(VersionAnnounce),
 }
 
 /// Flooded to the whole channel whenever a channel gains a gossip neighbor
@@ -192,6 +194,25 @@ pub struct IdentityAnnounce {
     pub sender: [u8; 32],
     /// The chosen display nickname, as typed after `/nick`.
     pub nickname: String,
+}
+
+/// Broadcast to every joined channel once we know a neighbor is listening
+/// (see net.rs's handling of `iroh_gossip`'s `NeighborUp`, the same way
+/// `HistoryAnnounce`/`IdentityAnnounce` are): our own build's version and
+/// git commit, so a peer running an older build can be told about it (see
+/// `crate::version::is_newer`). Unlike `IdentityAnnounce`, this is never
+/// user-chosen -- it's always known from the moment we start, so there's
+/// no "unset" state to track.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionAnnounce {
+    /// The announcing peer's own NodeId.
+    pub sender: [u8; 32],
+    /// The announcing peer's `crate::version::VERSION`.
+    pub version: String,
+    /// The announcing peer's `crate::version::GIT_HASH` -- informational
+    /// only (never compared), since commit hashes have no inherent
+    /// ordering.
+    pub git_hash: String,
 }
 
 #[cfg(test)]
@@ -256,6 +277,30 @@ mod tests {
         .unwrap();
         let decoded: GossipPayload = postcard::from_bytes(&identity_bytes).unwrap();
         assert!(matches!(decoded, GossipPayload::Identity(_)));
+    }
+
+    #[test]
+    fn version_payload_round_trips_through_postcard() {
+        let payload = GossipPayload::Version(VersionAnnounce {
+            sender: [6; 32],
+            version: "1.2.3".to_string(),
+            git_hash: "abc1234".to_string(),
+        });
+        let bytes = postcard::to_stdvec(&payload).unwrap();
+        let decoded: GossipPayload = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn chat_and_version_payloads_are_distinguishable() {
+        let version_bytes = postcard::to_stdvec(&GossipPayload::Version(VersionAnnounce {
+            sender: [6; 32],
+            version: "1.2.3".to_string(),
+            git_hash: "abc1234".to_string(),
+        }))
+        .unwrap();
+        let decoded: GossipPayload = postcard::from_bytes(&version_bytes).unwrap();
+        assert!(matches!(decoded, GossipPayload::Version(_)));
     }
 
     #[test]

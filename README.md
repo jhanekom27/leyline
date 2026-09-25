@@ -61,6 +61,9 @@ cargo build --release
 cargo run
 ```
 
+Run `cargo run -- --version` (or `-V`) to print the build's version and
+git commit and exit immediately, without touching disk or the network.
+
 On startup, `leyline` prints an invite ticket for each channel it joined
 (before the TUI takes over -- just "#general" by default, and private to
 this instance alone until you share it) and shows your endpoint id in the
@@ -161,6 +164,7 @@ Typed into the message box and submitted with `Enter`:
 | `/reply <text>` | Arm and immediately send `<text>` as a reply to the most recent message, in one step |
 | `/hints` | Toggle the sidebar's command hints panel on or off |
 | `/bell` | Toggle the terminal bell that rings when a message arrives, on or off (on by default; the setting persists across restarts) |
+| `/version` | Show this build's version and git commit, plus the newest peer version seen that's newer than yours, if any -- see the header's "update available" indicator |
 | `/help` | Show the full list of commands and keybindings |
 
 ## Roadmap

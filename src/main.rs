@@ -13,6 +13,7 @@ mod settings;
 mod storage;
 mod ticket;
 mod ui;
+mod version;
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -45,6 +46,13 @@ use storage::MessageStore;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // A bare `--version`/`-V` short-circuits everything else -- no need to
+    // touch disk, identity, or networking just to print a version string.
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("leyline {} ({})", version::VERSION, version::GIT_HASH);
+        return Ok(());
+    }
+
     let dirs = project_dirs()?;
     init_logging(&dirs)?;
     let data_dir = dirs.data_dir().to_path_buf();
@@ -434,15 +442,16 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
             }
             Some(net_event) = net_rx.recv() => {
                 // Peek (without consuming) for a channel gaining a gossip
-                // neighbor, so we can also announce our history root and
-                // our current nickname (if any) to it -- see backfill.rs,
-                // concept.md's "Persistence & history backfill" section,
-                // and `Net::announce_nickname`. `app.handle_net_event`
-                // below still separately updates presence for this same
-                // event.
+                // neighbor, so we can also announce our history root, our
+                // current nickname (if any), and our build version to it --
+                // see backfill.rs, concept.md's "Persistence & history
+                // backfill" section, and `Net::announce_nickname`/
+                // `Net::announce_version`. `app.handle_net_event` below
+                // still separately updates presence for this same event.
                 if let NetEvent::PeerJoined(channel, _) = &net_event {
                     announce_history(&net, &backfill, channel);
                     net.announce_nickname(channel);
+                    net.announce_version(channel);
                 }
 
                 // Also peek for a channel finishing a runtime `/join`, so

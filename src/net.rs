@@ -32,9 +32,11 @@ use tracing::{debug, info, warn};
 
 use crate::backfill::BackfillStore;
 use crate::message::{
-    ChatMessage, FileAttachment, GossipPayload, HistoryAnnounce, IdentityAnnounce, now_unix_ms,
+    ChatMessage, FileAttachment, GossipPayload, HistoryAnnounce, IdentityAnnounce, VersionAnnounce,
+    now_unix_ms,
 };
 use crate::ticket::{ChannelTicket, RoomSecret};
+use crate::version;
 
 /// Simple guardrail against an accidental huge `/send` (e.g. a mistyped
 /// path to a large video file): `BackfillStore::add_file` copies the file
@@ -98,6 +100,9 @@ pub enum NetEvent {
     /// A peer announced (or re-announced) their broadcast nickname -- see
     /// `crate::message::IdentityAnnounce`.
     Identity(String, IdentityAnnounce),
+    /// A peer announced (or re-announced) their build version -- see
+    /// `crate::message::VersionAnnounce`.
+    Version(String, VersionAnnounce),
     /// A history backfill fetch finished and decoded some messages, ready
     /// to be deduped, persisted, and merged into the transcript.
     HistoryFetched(String, Vec<ChatMessage>),
@@ -827,6 +832,41 @@ impl Net {
         });
     }
 
+    /// Announces our build version to `channel`'s direct gossip neighbors --
+    /// called whenever a channel gains one, the same way `announce_nickname`
+    /// re-sends the current nickname (see net.rs's handling of
+    /// `iroh_gossip`'s `NeighborUp`). Unlike a nickname, our version is
+    /// always known (never unset), so there's no early-return "nothing to
+    /// announce" case here. Fire-and-forget, like `announce_nickname`.
+    pub fn announce_version(&self, channel: &str) {
+        let Some(sender) = self
+            .channels
+            .lock()
+            .expect("channels lock poisoned")
+            .get(channel)
+            .map(|c| c.sender.clone())
+        else {
+            return;
+        };
+        let payload = GossipPayload::Version(VersionAnnounce {
+            sender: self.our_id,
+            version: version::VERSION.to_string(),
+            git_hash: version::GIT_HASH.to_string(),
+        });
+        tokio::spawn(async move {
+            let bytes = match postcard::to_stdvec(&payload) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    warn!("failed to encode version announce: {err}");
+                    return;
+                }
+            };
+            if let Err(err) = sender.broadcast_neighbors(bytes.into()).await {
+                warn!("failed to broadcast version announce: {err}");
+            }
+        });
+    }
+
     /// Reacts to a received `HistoryAnnounce`: if its root differs from what
     /// we already have for `channel` (and it isn't an echo of our own
     /// announce), fetches and decodes the delta directly from the
@@ -1192,6 +1232,9 @@ async fn forward_events(
                     }
                     Ok(GossipPayload::Identity(identity)) => {
                         NetEvent::Identity(channel.clone(), identity)
+                    }
+                    Ok(GossipPayload::Version(version)) => {
+                        NetEvent::Version(channel.clone(), version)
                     }
                     Err(err) => {
                         warn!("dropping malformed gossip message: {err}");
