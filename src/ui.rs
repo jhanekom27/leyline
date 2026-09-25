@@ -14,6 +14,7 @@ use textwrap::wrap;
 
 use crate::app::{AppState, Channel, TranscriptLine, hex_id};
 use crate::files::human_size;
+use crate::markdown;
 use crate::message::ChatMessage;
 use crate::search::SearchResults;
 
@@ -25,6 +26,11 @@ const TIME_WIDTH: usize = 5;
 const NAME_WIDTH: usize = 10;
 /// Separates the name column from the message text.
 const SEPARATOR: &str = " │ ";
+
+/// Maximum number of input lines shown at once before the box scrolls
+/// vertically (see `render_input`) -- keeps a long composed or pasted
+/// message from growing the input box to swallow the whole terminal.
+const MAX_INPUT_VISIBLE_LINES: usize = 6;
 
 /// Short usage reminders for every slash command, shown in the sidebar's
 /// commands panel (`render_hints`) when `AppState::show_hints` is on.
@@ -64,13 +70,23 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     let [header, body, input] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
-        Constraint::Length(3),
+        Constraint::Length(input_box_height(&app.input)),
     ])
     .areas(frame.area());
 
     render_header(frame, header, app);
     render_body(frame, body, app);
     render_input(frame, input, app);
+}
+
+/// Height (in terminal rows, including the 2 border rows) the input box
+/// needs for `input`'s current line count, capped at
+/// `MAX_INPUT_VISIBLE_LINES` -- computed before laying out the rest of
+/// the frame (`render`) so the message pane shrinks to make room while
+/// composing a multi-line message, and grows back once it's sent.
+fn input_box_height(input: &str) -> u16 {
+    let lines = input.split('\n').count().max(1);
+    lines.min(MAX_INPUT_VISIBLE_LINES) as u16 + 2
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -314,7 +330,7 @@ fn build_message_rows(
                 let style = Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC);
-                for chunk in wrap_chars(&format!("* {text}"), inner_width) {
+                for chunk in markdown::wrap_chars(&format!("* {text}"), inner_width) {
                     rows.push(Line::from(Span::styled(chunk, style)));
                 }
             }
@@ -327,7 +343,7 @@ fn build_message_rows(
 /// transcript -- reuses the same per-message formatting
 /// (`push_chat_rows`), grouped the same way, but with no `System` lines to
 /// interleave since a search snapshot only ever holds chat matches.
-/// Highlights the matched substring in each line (see `highlighted_spans`).
+/// Highlights the matched substring in each line (see `highlight_spans`).
 fn build_search_rows(
     app: &AppState,
     search: &SearchResults,
@@ -389,14 +405,15 @@ fn row_layout(inner_width: usize) -> RowLayout {
 }
 
 /// Appends one chat message's rendered rows (colored rail, time, sender
-/// name, separator, wrapped -- and optionally highlighted, see
-/// `highlighted_spans` -- text) to `rows`. Blanks the time/name on
-/// continuation lines and on a run of messages from the same sender
-/// (`is_first_of_group`, computed by the caller since it depends on
-/// iterating the surrounding transcript/search results in order). Shared
-/// by the normal transcript (`build_message_rows`) and search results
-/// (`build_search_rows`); `term_lower` is `None` for the former, which
-/// never highlights anything.
+/// name, separator, then the message's markdown-rendered body -- see
+/// `crate::markdown::render` -- with any active search match additionally
+/// highlighted on top via `highlight_spans`) to `rows`. Blanks the
+/// time/name on continuation lines and on a run of messages from the same
+/// sender (`is_first_of_group`, computed by the caller since it depends
+/// on iterating the surrounding transcript/search results in order).
+/// Shared by the normal transcript (`build_message_rows`) and search
+/// results (`build_search_rows`); `term_lower` is `None` for the former,
+/// which never highlights anything.
 fn push_chat_rows(
     rows: &mut Vec<Line<'static>>,
     app: &AppState,
@@ -410,28 +427,36 @@ fn push_chat_rows(
     let name = fit_name(&app.display_name(&message.sender), NAME_WIDTH);
     let time = format_time(message.ts_unix_ms);
 
+    // A synthesized attachment caption (e.g. a filename) is plain text,
+    // never markdown -- only an actual message body goes through
+    // `markdown::render`.
     let caption = attachment_caption(app, message);
-    let display_text = caption.as_deref().unwrap_or(&message.text);
-    let mut wrapped = wrap(display_text, layout.wrap_width);
-    if wrapped.is_empty() {
-        wrapped.push(std::borrow::Cow::Borrowed(""));
-    }
+    let mut bodies: Vec<Vec<Span<'static>>> = match &caption {
+        Some(caption) => {
+            let mut wrapped = wrap(caption, layout.wrap_width);
+            if wrapped.is_empty() {
+                wrapped.push(std::borrow::Cow::Borrowed(""));
+            }
+            wrapped
+                .iter()
+                .map(|chunk| highlighted_spans(chunk, term_lower))
+                .collect()
+        }
+        None => markdown::render(&message.text, layout.wrap_width)
+            .into_iter()
+            .map(|row| highlight_spans(row, term_lower))
+            .collect(),
+    };
 
     // A reply's quoted preview (`reply_preview_spans`), if any, renders as
     // its own single, unwrapped row ahead of the message's own text -- it
     // takes this group's header (time/name) exactly like the text's own
     // first line would otherwise (via the `index == 0` check below), and
     // the real text always starts on a "continuation" row instead, the
-    // same as any second wrapped line already does.
-    let mut bodies: Vec<Vec<Span<'static>>> = Vec::with_capacity(1 + wrapped.len());
+    // same as any second row already does.
     if let Some(reply_to) = message.reply_to {
-        bodies.push(reply_preview_spans(app, reply_to));
+        bodies.insert(0, reply_preview_spans(app, reply_to));
     }
-    bodies.extend(
-        wrapped
-            .iter()
-            .map(|chunk| highlighted_spans(chunk, term_lower)),
-    );
 
     for (index, body) in bodies.into_iter().enumerate() {
         let show_header = index == 0 && is_first_of_group;
@@ -520,29 +545,73 @@ fn find_highlights(text: &str, term_lower: &str) -> Vec<(String, bool)> {
     segments
 }
 
-/// Renders `text` as one or more spans, styling matched segments (see
-/// `find_highlights`) distinctly. `term_lower` is `None` for the normal
+/// Renders `text` as one or more plain spans, styling matched segments
+/// (see `find_highlights`) distinctly. A thin wrapper around
+/// `highlight_spans` for the common case of a single unstyled string --
+/// used for attachment captions, which are synthesized text rather than
+/// an actual message body. `term_lower` is `None` for the normal
 /// transcript, which never highlights anything.
 fn highlighted_spans(text: &str, term_lower: Option<&str>) -> Vec<Span<'static>> {
+    highlight_spans(vec![Span::raw(text.to_string())], term_lower)
+}
+
+/// Overlays a search-match highlight onto an already-styled row of spans,
+/// so a match inside markdown-rendered text (bold, inline code, a
+/// heading, ...) keeps that styling instead of it being replaced.
+/// Intersects each span's char range against `find_highlights`'s match
+/// segments (computed from the row's concatenated plain text) and, for
+/// the matched portions, layers the highlight style over the span's own
+/// via `Style::patch` (which fills in the highlight's fg/bg/modifiers,
+/// leaving anything it doesn't set untouched). `term_lower` is `None` for
+/// the normal transcript, which never highlights anything -- `spans` is
+/// returned unchanged in that case, and whenever nothing actually matches.
+fn highlight_spans(spans: Vec<Span<'static>>, term_lower: Option<&str>) -> Vec<Span<'static>> {
     let Some(term_lower) = term_lower else {
-        return vec![Span::raw(text.to_string())];
+        return spans;
     };
-    find_highlights(text, term_lower)
-        .into_iter()
-        .map(|(segment, is_match)| {
-            if is_match {
-                Span::styled(
-                    segment,
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::raw(segment)
+    let full_text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+    let segments = find_highlights(&full_text, term_lower);
+    if let [(_, false)] = segments.as_slice() {
+        return spans; // no match anywhere in this row
+    }
+
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    // Char-index bounds of each match segment, to intersect against each
+    // span's own bounds below.
+    let mut bounds = Vec::with_capacity(segments.len());
+    let mut offset = 0;
+    for (text, is_match) in &segments {
+        let len = text.chars().count();
+        bounds.push((offset, offset + len, *is_match));
+        offset += len;
+    }
+
+    let mut out = Vec::new();
+    let mut span_start = 0;
+    for span in spans {
+        let chars: Vec<char> = span.content.chars().collect();
+        let span_end = span_start + chars.len();
+        for &(seg_start, seg_end, is_match) in &bounds {
+            let start = seg_start.max(span_start);
+            let end = seg_end.min(span_end);
+            if start >= end {
+                continue;
             }
-        })
-        .collect()
+            let piece: String = chars[start - span_start..end - span_start].iter().collect();
+            let style = if is_match {
+                span.style.patch(highlight)
+            } else {
+                span.style
+            };
+            out.push(Span::styled(piece, style));
+        }
+        span_start = span_end;
+    }
+    out
 }
 
 /// Maximum length (in characters) of the quoted snippet shown for a reply
@@ -585,7 +654,12 @@ fn reply_snippet(message: &ChatMessage) -> String {
         Some(attachment) if message.text.is_empty() => attachment.filename.as_str(),
         _ => message.text.as_str(),
     };
-    format!("\"{}\"", truncate_chars(text, REPLY_SNIPPET_MAX))
+    // Flattened to a single line first -- both callers (the reply preview
+    // row and the input box's reply banner) need this to stay one
+    // unwrapped row, which a multi-line parent's embedded newline would
+    // otherwise break.
+    let flattened = text.replace('\n', " ");
+    format!("\"{}\"", truncate_chars(&flattened, REPLY_SNIPPET_MAX))
 }
 
 /// Truncates `text` to at most `max_chars` characters, appending `…` if it
@@ -609,21 +683,6 @@ fn reversed_span(span: Span<'static>) -> Span<'static> {
         style: span.style.add_modifier(Modifier::REVERSED),
         ..span
     }
-}
-
-/// Splits `text` into `width`-wide chunks, breaking mid-word if needed.
-/// Used instead of word-wrapping because the dominant case (invite
-/// tickets) is one long token with no natural break points at all.
-fn wrap_chars(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
-        return vec![String::new()];
-    }
-    chars
-        .chunks(width)
-        .map(|chunk| chunk.iter().collect())
-        .collect()
 }
 
 /// Pads `name` to exactly `width` characters, truncating with a trailing
@@ -715,29 +774,99 @@ fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
         .title(title)
         .border_type(BorderType::Rounded);
     let inner = block.inner(area);
+    frame.render_widget(block, area);
+
     let prompt_width = prompt.chars().count();
     let text_width = (inner.width as usize).saturating_sub(prompt_width).max(1);
+    let visible_rows = (inner.height as usize).max(1);
 
-    // Horizontal-scroll the input so the cursor always stays in view.
-    let chars: Vec<char> = app.input.chars().collect();
-    let visible_start = app.cursor.saturating_sub(text_width.saturating_sub(1));
-    let visible_end = (visible_start + text_width).min(chars.len());
-    let visible: String = chars[visible_start..visible_end].iter().collect();
+    // Multi-line input never word-wraps a single logical line inside the
+    // box (that would need mapping the cursor through wrapped text, which
+    // `ui::markdown`-style rendering can afford since it's read-only, but
+    // the input box also needs to place a live terminal cursor) -- each
+    // `\n`-delimited line horizontal-scrolls independently instead,
+    // exactly like the old single-line box did.
+    let lines: Vec<&str> = app.input.split('\n').collect();
+    let (cursor_line, cursor_col) = cursor_line_and_col(&app.input, app.cursor);
 
-    let paragraph = Paragraph::new(Line::from(vec![
-        Span::styled(
-            prompt.clone(),
-            Style::default()
-                .fg(user_color(&app.self_id))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(visible),
-    ]))
-    .block(block);
-    frame.render_widget(paragraph, area);
+    // Vertically window `lines` so the cursor's line is always visible,
+    // mirroring `render_messages`'s approach to keeping its reply-pick
+    // highlight in view -- simpler here since the input box has no
+    // persisted scroll state of its own to preserve between renders.
+    let line_start = if cursor_line < visible_rows {
+        0
+    } else {
+        cursor_line + 1 - visible_rows
+    };
+    let line_end = (line_start + visible_rows).min(lines.len());
 
-    let cursor_col = inner.x + (prompt_width + (app.cursor - visible_start)) as u16;
-    frame.set_cursor_position((cursor_col, inner.y));
+    for (row_offset, line) in lines[line_start..line_end].iter().enumerate() {
+        let line_index = line_start + row_offset;
+        let chars: Vec<char> = line.chars().collect();
+
+        let (visible_text, col_on_row) = if line_index == cursor_line {
+            // Horizontal-scroll the focused line so the cursor always
+            // stays in view.
+            let visible_start = cursor_col.saturating_sub(text_width.saturating_sub(1));
+            let visible_end = (visible_start + text_width).min(chars.len());
+            (
+                chars[visible_start..visible_end].iter().collect::<String>(),
+                cursor_col - visible_start,
+            )
+        } else {
+            // Other lines just clip from the start -- only the focused
+            // line needs to track the cursor horizontally.
+            let visible_end = text_width.min(chars.len());
+            (chars[..visible_end].iter().collect::<String>(), 0)
+        };
+
+        // The colored prompt only ever prefixes the message's actual
+        // first line; continuation lines get blank padding of the same
+        // width so their text still lines up underneath it.
+        let spans = if line_index == 0 {
+            vec![
+                Span::styled(
+                    prompt.clone(),
+                    Style::default()
+                        .fg(user_color(&app.self_id))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(visible_text),
+            ]
+        } else {
+            vec![Span::raw(" ".repeat(prompt_width)), Span::raw(visible_text)]
+        };
+
+        let row_y = inner.y + row_offset as u16;
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(inner.x, row_y, inner.width, 1),
+        );
+        if line_index == cursor_line {
+            let cursor_x = inner.x + (prompt_width + col_on_row) as u16;
+            frame.set_cursor_position((cursor_x, row_y));
+        }
+    }
+}
+
+/// Maps a flat char-index cursor position into (line index, column within
+/// that line) against `input`'s `\n`-delimited lines -- used by
+/// `render_input` to decide which logical line's horizontal scroll
+/// window to compute and where to place the terminal cursor.
+fn cursor_line_and_col(input: &str, cursor: usize) -> (usize, usize) {
+    let mut remaining = cursor;
+    let mut last_index = 0;
+    let mut last_len = 0;
+    for (index, line) in input.split('\n').enumerate() {
+        let len = line.chars().count();
+        if remaining <= len {
+            return (index, remaining);
+        }
+        remaining -= len + 1; // +1 for the '\n' consumed between lines
+        last_index = index;
+        last_len = len;
+    }
+    (last_index, last_len)
 }
 
 /// Builds the input box's title while a reply is armed
@@ -932,5 +1061,156 @@ mod tests {
         assert_eq!(reversed.content, "hi");
         assert!(reversed.style.add_modifier.contains(Modifier::REVERSED));
         assert_eq!(reversed.style.fg, Some(Color::Red));
+    }
+
+    /// Concatenates a rendered row's spans back into plain text, for
+    /// assertions that don't care how the row was split into spans.
+    fn row_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn push_chat_rows_renders_a_multiline_message_as_multiple_rows() {
+        let app = AppState::new([1; 32], vec!["general".to_string()], "general");
+        let message = text_message(1, [1; 32], "line one\nline two");
+        let layout = row_layout(80);
+        let mut rows = Vec::new();
+
+        push_chat_rows(&mut rows, &app, &message, true, &layout, None, false);
+
+        assert_eq!(rows.len(), 2);
+        assert!(
+            row_text(&rows[0]).ends_with("line one"),
+            "got: {}",
+            row_text(&rows[0])
+        );
+        assert!(
+            row_text(&rows[1]).ends_with("line two"),
+            "got: {}",
+            row_text(&rows[1])
+        );
+    }
+
+    #[test]
+    fn push_chat_rows_renders_a_heading_with_its_style() {
+        let app = AppState::new([1; 32], vec!["general".to_string()], "general");
+        let message = text_message(1, [1; 32], "# Title");
+        let layout = row_layout(80);
+        let mut rows = Vec::new();
+
+        push_chat_rows(&mut rows, &app, &message, true, &layout, None, false);
+
+        assert_eq!(rows.len(), 1);
+        // The body starts right after the fixed rail/time/name/separator
+        // prefix (see `push_chat_rows`'s column layout).
+        let body = rows[0].spans.last().expect("a body span");
+        assert_eq!(body.content.as_ref(), "Title");
+        assert_eq!(body.style.fg, Some(Color::Cyan));
+        assert!(body.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn push_chat_rows_renders_inline_bold_and_code_styling() {
+        let app = AppState::new([1; 32], vec!["general".to_string()], "general");
+        let message = text_message(1, [1; 32], "plain **bold** and `code`");
+        let layout = row_layout(80);
+        let mut rows = Vec::new();
+
+        push_chat_rows(&mut rows, &app, &message, true, &layout, None, false);
+
+        assert_eq!(rows.len(), 1);
+        let body = &rows[0].spans[6..]; // past the fixed rail/time/name/separator prefix
+        let bold_span = body
+            .iter()
+            .find(|span| span.content.as_ref() == "bold")
+            .expect("a bold span");
+        assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
+        let code_span = body
+            .iter()
+            .find(|span| span.content.as_ref() == "code")
+            .expect("a code span");
+        assert_eq!(code_span.style.fg, Some(Color::Magenta));
+    }
+
+    #[test]
+    fn push_chat_rows_never_markdown_parses_an_attachment_caption() {
+        let self_id = [1; 32];
+        let app = AppState::new(self_id, vec!["general".to_string()], "general");
+        let message = file_message(self_id, "notes_**important**.txt", 10);
+        let layout = row_layout(80);
+        let mut rows = Vec::new();
+
+        push_chat_rows(&mut rows, &app, &message, true, &layout, None, false);
+
+        let text = row_text(&rows[0]);
+        assert!(
+            text.contains("**important**"),
+            "caption must stay literal, not be markdown-rendered: {text}"
+        );
+    }
+
+    #[test]
+    fn highlight_spans_returns_plain_spans_unchanged_when_search_is_inactive() {
+        let spans = vec![Span::styled(
+            "bold".to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        assert_eq!(highlight_spans(spans.clone(), None), spans);
+    }
+
+    #[test]
+    fn highlight_spans_preserves_markdown_styling_on_a_match() {
+        let spans = vec![Span::styled(
+            "bold".to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+
+        let highlighted = highlight_spans(spans, Some("old"));
+
+        let matched = highlighted
+            .iter()
+            .find(|span| span.content.as_ref() == "old")
+            .expect("the matched piece");
+        assert!(
+            matched.style.add_modifier.contains(Modifier::BOLD),
+            "must keep its markdown styling"
+        );
+        assert_eq!(
+            matched.style.bg,
+            Some(Color::Yellow),
+            "must also carry the search highlight"
+        );
+        let unmatched = highlighted
+            .iter()
+            .find(|span| span.content.as_ref() == "b")
+            .expect("the unmatched piece");
+        assert_eq!(unmatched.style.bg, None, "unmatched text isn't highlighted");
+    }
+
+    #[test]
+    fn highlight_spans_finds_a_match_spanning_two_spans() {
+        // "bo" + "ld" concatenates to "bold", so a search for "old" must
+        // still be found even though it straddles a span boundary.
+        let spans = vec![
+            Span::styled(
+                "bo".to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("ld".to_string()),
+        ];
+
+        let highlighted = highlight_spans(spans, Some("old"));
+
+        let full_text: String = highlighted.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(full_text, "bold");
+        assert!(
+            highlighted
+                .iter()
+                .any(|span| span.style.bg == Some(Color::Yellow)),
+            "expected at least one highlighted piece"
+        );
     }
 }

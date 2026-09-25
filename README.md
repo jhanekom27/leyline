@@ -122,13 +122,14 @@ HOME=/tmp/leyline-b CARGO_HOME="$REAL_CARGO_HOME" cargo run
 | Key | Action |
 | --- | --- |
 | Type | Insert a character at the cursor |
-| `Left` / `Right` | Move the cursor one character |
-| `Home` / `Ctrl+A` | Jump to the start of the line |
-| `End` / `Ctrl+E` | Jump to the end of the line |
+| `Left` / `Right` | Move the cursor one character (across a line break too, in a multi-line message) |
+| `Home` / `Ctrl+A` | Jump to the start of the current line |
+| `End` / `Ctrl+E` | Jump to the end of the current line |
 | `Backspace` / `Delete` | Delete the character before / at the cursor |
-| `Ctrl+U` | Delete from the start of the line to the cursor |
-| `Ctrl+K` | Delete from the cursor to the end of the line |
+| `Ctrl+U` | Delete from the start of the current line to the cursor |
+| `Ctrl+K` | Delete from the cursor to the end of the current line |
 | `Ctrl+W` | Delete the word before the cursor |
+| `Alt+Enter` / `Ctrl+J` | Insert a newline in the message box without sending, for a longer, spaced-out message -- the box grows to fit (and scrolls, past a handful of lines) |
 | `Enter` | Send the composed message, or run a `/` command |
 | (paste, e.g. `Cmd+V`/`Ctrl+V`) | Paste text from the terminal as one atomic edit, so a multi-line paste can't prematurely send a partial line or trigger a stray `/command` |
 | `Ctrl+V` | Share whatever's on the OS clipboard (a file, an image, or text) with the active channel -- same as `/paste`. `Cmd+V` also works if your terminal forwards it, but most (including this one) reserve it for their own text-paste above |

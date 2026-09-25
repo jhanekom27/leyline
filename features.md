@@ -63,6 +63,20 @@ mechanisms, not one, since they trade off differently:
   terminal tab is focused, so you notice leyline without watching the
   TUI. `/bell` toggles it, persisted via a new `settings.rs` (mirrors
   `contacts.rs`'s pattern) so the preference survives restarts.
+- [x] **Multi-line input** -- `Alt+Enter`/`Ctrl+J` inserts a literal
+  newline instead of sending, so a longer, spaced-out message can be
+  composed before pressing `Enter`; the input box grows to fit (and
+  scrolls, past `MAX_INPUT_VISIBLE_LINES`). `Home`/`End`/`Ctrl+U`/`Ctrl+K`
+  act on the current line rather than the whole message, matching
+  standard multi-line editors (`AppState::current_line_bounds`).
+- [x] **Markdown rendering** -- headings (`#`/`##`/`###`), fenced code
+  blocks, inline code, bold (`**`), and italic (`*`/`_`) typed into a
+  message render as styled output in the transcript (a small hand-rolled
+  renderer, `markdown.rs`, not a CommonMark parser), rather than showing
+  as literal source; search-term highlighting still applies on top of
+  that styling (`ui::highlight_spans`). Deliberately minimal for now --
+  no lists, blockquotes, tables, links/images, or code syntax
+  highlighting.
 
 ## Channels & presence
 

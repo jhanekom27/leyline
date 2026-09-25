@@ -463,6 +463,17 @@ impl AppState {
             KeyCode::Char('u') if ctrl => self.delete_to_start(),
             KeyCode::Char('k') if ctrl => self.delete_to_end(),
             KeyCode::Char('w') if ctrl => self.delete_word_backward(),
+            // Inserts a literal newline instead of submitting. Ctrl+J is
+            // the plain ASCII linefeed byte, so every terminal reports it
+            // the same way regardless of Alt/Meta configuration. Alt+Enter
+            // is the more discoverable binding (mirrors Slack/Discord's
+            // Shift+Enter convention) and works just as reliably: any
+            // terminal using the standard xterm Alt-prefixing convention
+            // sends `ESC` then `\r`, which crossterm reports as `Enter`
+            // with the `ALT` modifier. Both are checked before the plain
+            // `Enter` arm below so a bare `Enter` still always submits.
+            KeyCode::Char('j') if ctrl => self.insert_newline(),
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.insert_newline(),
             // Cmd on macOS -- reported as `KeyModifiers::SUPER` by
             // crossterm, if the terminal forwards it at all. Plain Ctrl+V
             // is the dependable cross-platform trigger, since terminals
@@ -800,8 +811,8 @@ impl AppState {
             "commands: /join <name|ticket>, /invite, /leave [channel], /who, \
              /send <path>, /save <hash-prefix>, /paste, /alias <hex-prefix> <name>, \
              /nick <name>, /search <term> (or /s), /reply [text], /hints, /bell, /help -- keys: \
-             Tab/Shift+Tab switch channels, Ctrl+V paste, Ctrl+R reply (\u{2191}/\u{2193} pick, \
-             Enter confirm), Up/Down scroll, Esc/Ctrl+C quit",
+             Tab/Shift+Tab switch channels, Alt+Enter/Ctrl+J newline, Ctrl+V paste, Ctrl+R reply \
+             (\u{2191}/\u{2193} pick, Enter confirm), Up/Down scroll, Esc/Ctrl+C quit",
         );
         None
     }
@@ -1244,12 +1255,35 @@ impl AppState {
         self.cursor = (self.cursor + 1).min(self.char_count());
     }
 
+    /// Char-index bounds of the line containing the cursor: the nearest
+    /// `\n` before/after it (exclusive of the newline itself), or the
+    /// buffer's edges if there is none. Multi-line input redefines "line"
+    /// for `Home`/`End`/`Ctrl+A`/`Ctrl+E`/`Ctrl+U`/`Ctrl+K` from "the whole
+    /// buffer" to this -- matching standard multi-line editor behavior --
+    /// while `Left`/`Right`/`Backspace`/`Delete`/`Ctrl+W` stay simple
+    /// char-index operations that already cross a `\n` boundary like any
+    /// other character (e.g. `Left` at column 0 lands at the end of the
+    /// previous line). A no-op change for single-line input, since then
+    /// there's only ever one line spanning the whole buffer.
+    fn current_line_bounds(&self) -> (usize, usize) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let start = chars[..self.cursor]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map_or(0, |i| i + 1);
+        let end = chars[self.cursor..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map_or(chars.len(), |i| self.cursor + i);
+        (start, end)
+    }
+
     fn move_home(&mut self) {
-        self.cursor = 0;
+        self.cursor = self.current_line_bounds().0;
     }
 
     fn move_end(&mut self) {
-        self.cursor = self.char_count();
+        self.cursor = self.current_line_bounds().1;
     }
 
     fn insert_char(&mut self, c: char) {
@@ -1258,28 +1292,35 @@ impl AppState {
         self.cursor += 1;
     }
 
+    /// Inserts a literal newline at the cursor without submitting --
+    /// bound to `Alt+Enter`/`Ctrl+J` in `handle_key`, and used by
+    /// `paste_text` for an embedded line break in pasted text.
+    fn insert_newline(&mut self) {
+        self.insert_char('\n');
+    }
+
     /// Inserts a terminal bracketed-paste's full text at the cursor as one
     /// atomic edit (see main.rs's `Event::Paste` handling, enabled via
     /// `EnableBracketedPaste`). Without bracketed paste, a multi-line
     /// paste instead arrives as a fast burst of ordinary key events, so an
-    /// embedded newline mid-paste hits `submit_input` partway through --
-    /// prematurely sending a partial line or running a stray `/command`.
-    /// Embedded newlines are flattened to spaces since the input box is a
-    /// single line by construction (`ui::render_input` never wraps it).
+    /// embedded newline mid-paste would hit `submit_input` partway through
+    /// -- prematurely sending a partial line or running a stray
+    /// `/command`. `paste_text` never submits, so a pasted newline just
+    /// becomes a real line break (`insert_newline`) instead.
     pub fn paste_text(&mut self, text: &str) {
         let mut chars = text.chars().peekable();
         while let Some(c) = chars.next() {
             match c {
                 // `\r\n` counts as a single line break, not two -- without
-                // this, a Windows-style multi-line paste would flatten to
-                // double spaces between lines.
+                // this, a Windows-style multi-line paste would insert an
+                // extra blank line between paragraphs.
                 '\r' => {
                     if chars.peek() == Some(&'\n') {
                         chars.next();
                     }
-                    self.insert_char(' ');
+                    self.insert_newline();
                 }
-                '\n' => self.insert_char(' '),
+                '\n' => self.insert_newline(),
                 c => self.insert_char(c),
             }
         }
@@ -1306,17 +1347,21 @@ impl AppState {
         self.input.replace_range(start..end, "");
     }
 
-    /// Ctrl+U: deletes from the start of the line to the cursor.
+    /// Ctrl+U: deletes from the start of the current line to the cursor.
     fn delete_to_start(&mut self) {
+        let (line_start, _) = self.current_line_bounds();
+        let start = self.byte_index(line_start);
         let end = self.byte_index(self.cursor);
-        self.input.replace_range(0..end, "");
-        self.cursor = 0;
+        self.input.replace_range(start..end, "");
+        self.cursor = line_start;
     }
 
-    /// Ctrl+K: deletes from the cursor to the end of the line.
+    /// Ctrl+K: deletes from the cursor to the end of the current line.
     fn delete_to_end(&mut self) {
+        let (_, line_end) = self.current_line_bounds();
         let start = self.byte_index(self.cursor);
-        self.input.truncate(start);
+        let end = self.byte_index(line_end);
+        self.input.replace_range(start..end, "");
     }
 
     /// Ctrl+W: deletes the word immediately before the cursor.
@@ -1457,14 +1502,14 @@ mod tests {
     }
 
     #[test]
-    fn paste_text_flattens_embedded_newlines_to_spaces() {
+    fn paste_text_inserts_embedded_newlines_literally() {
         // Without bracketed paste, a multi-line paste's embedded `Enter`
         // keystrokes would submit partway through -- `paste_text` is the
-        // atomic alternative, so a pasted newline must never become a
-        // literal line break in the (single-line) input box.
+        // atomic alternative, so it can safely turn a pasted newline into
+        // a real line break instead of flattening it to a space.
         let mut app = app();
         app.paste_text("line one\nline two\r\nline three");
-        assert_eq!(app.input, "line one line two line three");
+        assert_eq!(app.input, "line one\nline two\nline three");
     }
 
     #[test]
@@ -1473,7 +1518,88 @@ mod tests {
         let before = app.active().messages.len();
         app.paste_text("/join sneaky\nrest of paste");
         assert_eq!(app.active().messages.len(), before, "paste must not submit");
-        assert_eq!(app.input, "/join sneaky rest of paste");
+        assert_eq!(app.input, "/join sneaky\nrest of paste");
+    }
+
+    #[test]
+    fn alt_enter_inserts_a_newline_instead_of_submitting() {
+        let mut app = app();
+        let before = app.active().messages.len();
+        app.handle_key(key(KeyCode::Char('h')));
+        let action = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        app.handle_key(key(KeyCode::Char('i')));
+        assert!(action.is_none());
+        assert_eq!(app.input, "h\ni");
+        assert_eq!(app.active().messages.len(), before, "must not submit");
+    }
+
+    #[test]
+    fn ctrl_j_inserts_a_newline_instead_of_submitting() {
+        let mut app = app();
+        app.handle_key(key(KeyCode::Char('h')));
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert!(action.is_none());
+        assert_eq!(app.input, "h\n");
+    }
+
+    #[test]
+    fn plain_enter_still_submits_a_multiline_message() {
+        let mut app = app();
+        for c in "line one".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        for c in "line two".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        let sent = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.input, "");
+        match sent.expect("enter with non-empty input returns an action") {
+            InputAction::Send(_, message) => assert_eq!(message.text, "line one\nline two"),
+            _ => panic!("expected InputAction::Send"),
+        }
+    }
+
+    #[test]
+    fn home_and_end_move_within_the_current_line_only() {
+        let mut app = app();
+        app.paste_text("first\nsecond"); // cursor ends on the second line
+        app.handle_key(key(KeyCode::Home));
+        assert_eq!(
+            app.cursor,
+            "first\n".chars().count(),
+            "Home lands at the start of the current line, not the whole buffer"
+        );
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(
+            app.cursor,
+            app.input.chars().count(),
+            "End lands at the end of the current line"
+        );
+    }
+
+    #[test]
+    fn ctrl_k_deletes_only_to_the_end_of_the_current_line() {
+        let mut app = app();
+        app.paste_text("first\nsecond");
+        app.handle_key(key(KeyCode::Home)); // start of "second"
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.input, "first\n",
+            "Ctrl+K must not touch the previous line"
+        );
+    }
+
+    #[test]
+    fn ctrl_u_deletes_only_to_the_start_of_the_current_line() {
+        let mut app = app();
+        app.paste_text("first\nsecond");
+        app.handle_key(key(KeyCode::End)); // already at the end of "second"
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.input, "first\n",
+            "Ctrl+U must not touch the previous line"
+        );
     }
 
     #[test]
