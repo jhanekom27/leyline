@@ -92,14 +92,14 @@ mechanisms, not one, since they trade off differently:
   composed before pressing `Enter`; the input box grows to fit (and
   scrolls, past `MAX_INPUT_VISIBLE_LINES`). `Home`/`End`/`Ctrl+U`/`Ctrl+K`
   act on the current line rather than the whole message, matching
-  standard multi-line editors (`AppState::current_line_bounds`).
-- [ ] **Per-channel input drafts** -- `AppState::input`/`cursor` live on
-  `AppState` itself, not on `Channel`, so `switch_channel` neither saves
-  nor clears them: half-typed text in `#general` is still sitting in the
-  box after `Tab` to `#random`, and `Enter` sends it to whichever channel
-  is now active, not the one it was written for. Moving `input`/`cursor`
-  onto `Channel` would give each channel its own draft, like most chat
-  clients, without changing how `replying_to` is already scoped.
+  standard multi-line editors (`Channel::current_line_bounds`).
+- [x] **Per-channel input drafts** -- `input`/`cursor` live on `Channel`
+  itself, not `AppState`, so half-typed text in `#general` stays put and
+  keeps its cursor position when you `Tab` to `#random` and back, instead
+  of following you to whichever channel is active when you press `Enter`.
+  The editing keys/commands (`insert_char`, `delete_backward`, etc.) moved
+  to `Channel` along with the fields, since they only ever touch those
+  two; `replying_to` stays scoped on `AppState` exactly as before.
 - [x] **Markdown rendering** -- headings (`#`/`##`/`###`), fenced code
   blocks, inline code, bold (`**`), italic (`*`/`_`), unordered lists
   (`-`/`*`/`+`), ordered lists (`N.`), and blockquotes (`>`, nested via

@@ -72,7 +72,7 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     let [header, body, input] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
-        Constraint::Length(input_box_height(&app.input)),
+        Constraint::Length(input_box_height(&app.active().input)),
     ])
     .areas(frame.area());
 
@@ -802,8 +802,8 @@ fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
     // the input box also needs to place a live terminal cursor) -- each
     // `\n`-delimited line horizontal-scrolls independently instead,
     // exactly like the old single-line box did.
-    let lines: Vec<&str> = app.input.split('\n').collect();
-    let (cursor_line, cursor_col) = cursor_line_and_col(&app.input, app.cursor);
+    let lines: Vec<&str> = app.active().input.split('\n').collect();
+    let (cursor_line, cursor_col) = cursor_line_and_col(&app.active().input, app.active().cursor);
 
     // Vertically window `lines` so the cursor's line is always visible,
     // mirroring `render_messages`'s approach to keeping its reply-pick

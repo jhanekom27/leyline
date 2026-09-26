@@ -31,7 +31,8 @@ pub enum TranscriptLine {
     System(String),
 }
 
-/// One joined channel's transcript, presence, and per-channel scroll state.
+/// One joined channel's transcript, presence, per-channel scroll state,
+/// and in-progress input draft.
 pub struct Channel {
     pub name: String,
     pub messages: VecDeque<TranscriptLine>,
@@ -59,6 +60,18 @@ pub struct Channel {
     /// persisted, and not kept live as new messages arrive (re-run
     /// `/search <term>` to refresh).
     pub search: Option<SearchResults>,
+    /// This channel's own composed-but-unsent message text -- kept per
+    /// channel (not on `AppState`) so switching tabs
+    /// (`AppState::switch_channel`) never loses a half-typed draft in one
+    /// channel or leaks it into another's `Enter` (features.md's
+    /// "Per-channel input drafts"). In-memory only, like `scroll`. The
+    /// editing methods below (`insert_char`, `delete_backward`, etc.) only
+    /// ever touch this and `cursor`, so they live on `Channel` rather than
+    /// `AppState`.
+    pub input: String,
+    /// Character index (not byte offset -- see `byte_index`) of the
+    /// cursor within `input`.
+    pub cursor: usize,
 }
 
 impl Channel {
@@ -71,6 +84,8 @@ impl Channel {
             has_unread: false,
             seen_ids: HashSet::new(),
             search: None,
+            input: String::new(),
+            cursor: 0,
         }
     }
 
@@ -160,6 +175,133 @@ impl Channel {
             _ => None,
         })
     }
+
+    fn char_count(&self) -> usize {
+        self.input.chars().count()
+    }
+
+    /// Byte offset in `input` corresponding to a character index.
+    ///
+    /// Needed because `String` indexing/mutation is byte-based, but the
+    /// cursor is tracked as a character index so editing works correctly
+    /// with multi-byte UTF-8 input.
+    fn byte_index(&self, char_idx: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.input.len())
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.char_count());
+    }
+
+    /// Char-index bounds of the line containing the cursor: the nearest
+    /// `\n` before/after it (exclusive of the newline itself), or the
+    /// buffer's edges if there is none. Multi-line input redefines "line"
+    /// for `Home`/`End`/`Ctrl+A`/`Ctrl+E`/`Ctrl+U`/`Ctrl+K` from "the whole
+    /// buffer" to this -- matching standard multi-line editor behavior --
+    /// while `Left`/`Right`/`Backspace`/`Delete`/`Ctrl+W` stay simple
+    /// char-index operations that already cross a `\n` boundary like any
+    /// other character (e.g. `Left` at column 0 lands at the end of the
+    /// previous line). A no-op change for single-line input, since then
+    /// there's only ever one line spanning the whole buffer.
+    fn current_line_bounds(&self) -> (usize, usize) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let start = chars[..self.cursor]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map_or(0, |i| i + 1);
+        let end = chars[self.cursor..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map_or(chars.len(), |i| self.cursor + i);
+        (start, end)
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = self.current_line_bounds().0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.current_line_bounds().1;
+    }
+
+    fn insert_char(&mut self, c: char) {
+        let idx = self.byte_index(self.cursor);
+        self.input.insert(idx, c);
+        self.cursor += 1;
+    }
+
+    /// Inserts a literal newline at the cursor without submitting --
+    /// bound to `Alt+Enter`/`Ctrl+J` in `AppState::handle_key`, and used
+    /// by `AppState::paste_text` for an embedded line break in pasted
+    /// text.
+    fn insert_newline(&mut self) {
+        self.insert_char('\n');
+    }
+
+    /// Backspace: deletes the character before the cursor.
+    fn delete_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end = self.byte_index(self.cursor);
+        let start = self.byte_index(self.cursor - 1);
+        self.input.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+
+    /// Delete: deletes the character at the cursor.
+    fn delete_forward(&mut self) {
+        if self.cursor >= self.char_count() {
+            return;
+        }
+        let start = self.byte_index(self.cursor);
+        let end = self.byte_index(self.cursor + 1);
+        self.input.replace_range(start..end, "");
+    }
+
+    /// Ctrl+U: deletes from the start of the current line to the cursor.
+    fn delete_to_start(&mut self) {
+        let (line_start, _) = self.current_line_bounds();
+        let start = self.byte_index(line_start);
+        let end = self.byte_index(self.cursor);
+        self.input.replace_range(start..end, "");
+        self.cursor = line_start;
+    }
+
+    /// Ctrl+K: deletes from the cursor to the end of the current line.
+    fn delete_to_end(&mut self) {
+        let (_, line_end) = self.current_line_bounds();
+        let start = self.byte_index(self.cursor);
+        let end = self.byte_index(line_end);
+        self.input.replace_range(start..end, "");
+    }
+
+    /// Ctrl+W: deletes the word immediately before the cursor.
+    fn delete_word_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut idx = self.cursor;
+        while idx > 0 && chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        while idx > 0 && !chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        let start = self.byte_index(idx);
+        let end = self.byte_index(self.cursor);
+        self.input.replace_range(start..end, "");
+        self.cursor = idx;
+    }
 }
 
 /// An action for the caller (`main.rs`) to perform in response to a
@@ -239,13 +381,11 @@ pub struct AppState {
     pub self_id: [u8; 32],
     pub channels: Vec<Channel>,
     pub active: usize,
-    pub input: String,
-    pub cursor: usize,
     pub should_quit: bool,
     /// Whether the sidebar's command hints panel is shown -- toggled via
     /// `/hints` (`run_hints`). Visible by default so the panel actually
-    /// teaches new users; in-memory only, like `scroll`/`input`, not
-    /// persisted across restarts.
+    /// teaches new users; in-memory only, like `scroll`, not persisted
+    /// across restarts.
     pub show_hints: bool,
     /// Whether an incoming message rings the terminal bell -- toggled via
     /// `/bell` (`run_bell`). Unlike `show_hints`, this preference is
@@ -317,8 +457,6 @@ impl AppState {
             self_id,
             channels,
             active,
-            input: String::new(),
-            cursor: 0,
             should_quit: false,
             show_hints: true,
             bell_enabled: true,
@@ -543,11 +681,11 @@ impl AppState {
             }
             KeyCode::Char('c') if ctrl => self.should_quit = true,
             KeyCode::Char('r') if ctrl => self.start_reply_pick(),
-            KeyCode::Char('a') if ctrl => self.move_home(),
-            KeyCode::Char('e') if ctrl => self.move_end(),
-            KeyCode::Char('u') if ctrl => self.delete_to_start(),
-            KeyCode::Char('k') if ctrl => self.delete_to_end(),
-            KeyCode::Char('w') if ctrl => self.delete_word_backward(),
+            KeyCode::Char('a') if ctrl => self.active_mut().move_home(),
+            KeyCode::Char('e') if ctrl => self.active_mut().move_end(),
+            KeyCode::Char('u') if ctrl => self.active_mut().delete_to_start(),
+            KeyCode::Char('k') if ctrl => self.active_mut().delete_to_end(),
+            KeyCode::Char('w') if ctrl => self.active_mut().delete_word_backward(),
             // Inserts a literal newline instead of submitting. Ctrl+J is
             // the plain ASCII linefeed byte, so every terminal reports it
             // the same way regardless of Alt/Meta configuration. Alt+Enter
@@ -557,8 +695,10 @@ impl AppState {
             // sends `ESC` then `\r`, which crossterm reports as `Enter`
             // with the `ALT` modifier. Both are checked before the plain
             // `Enter` arm below so a bare `Enter` still always submits.
-            KeyCode::Char('j') if ctrl => self.insert_newline(),
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.insert_newline(),
+            KeyCode::Char('j') if ctrl => self.active_mut().insert_newline(),
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.active_mut().insert_newline()
+            }
             // Cmd on macOS -- reported as `KeyModifiers::SUPER` by
             // crossterm, if the terminal forwards it at all. Plain Ctrl+V
             // is the dependable cross-platform trigger, since terminals
@@ -569,12 +709,12 @@ impl AppState {
                 return self.run_paste();
             }
             KeyCode::Enter => return self.submit_input(),
-            KeyCode::Backspace => self.delete_backward(),
-            KeyCode::Delete => self.delete_forward(),
-            KeyCode::Home => self.move_home(),
-            KeyCode::End => self.move_end(),
-            KeyCode::Left => self.move_left(),
-            KeyCode::Right => self.move_right(),
+            KeyCode::Backspace => self.active_mut().delete_backward(),
+            KeyCode::Delete => self.active_mut().delete_forward(),
+            KeyCode::Home => self.active_mut().move_home(),
+            KeyCode::End => self.active_mut().move_end(),
+            KeyCode::Left => self.active_mut().move_left(),
+            KeyCode::Right => self.active_mut().move_right(),
             KeyCode::Up => {
                 let channel = self.active_mut();
                 channel.scroll = channel.scroll.saturating_add(1);
@@ -585,7 +725,7 @@ impl AppState {
             }
             KeyCode::Tab => self.switch_channel(1),
             KeyCode::BackTab => self.switch_channel(-1),
-            KeyCode::Char(c) => self.insert_char(c),
+            KeyCode::Char(c) => self.active_mut().insert_char(c),
             _ => {}
         }
         None
@@ -855,12 +995,13 @@ impl AppState {
     }
 
     fn submit_input(&mut self) -> Option<InputAction> {
-        if self.input.trim().is_empty() {
+        let channel = self.active_mut();
+        if channel.input.trim().is_empty() {
             return None;
         }
-        let text = std::mem::take(&mut self.input);
-        self.cursor = 0;
-        self.active_mut().scroll = 0;
+        let text = std::mem::take(&mut channel.input);
+        channel.cursor = 0;
+        channel.scroll = 0;
 
         if let Some(rest) = text.strip_prefix('/') {
             return self.run_command(rest.trim());
@@ -1468,75 +1609,6 @@ impl AppState {
         result
     }
 
-    fn char_count(&self) -> usize {
-        self.input.chars().count()
-    }
-
-    /// Byte offset in `self.input` corresponding to a character index.
-    ///
-    /// Needed because `String` indexing/mutation is byte-based, but the
-    /// cursor is tracked as a character index so editing works correctly
-    /// with multi-byte UTF-8 input.
-    fn byte_index(&self, char_idx: usize) -> usize {
-        self.input
-            .char_indices()
-            .nth(char_idx)
-            .map(|(b, _)| b)
-            .unwrap_or(self.input.len())
-    }
-
-    fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.char_count());
-    }
-
-    /// Char-index bounds of the line containing the cursor: the nearest
-    /// `\n` before/after it (exclusive of the newline itself), or the
-    /// buffer's edges if there is none. Multi-line input redefines "line"
-    /// for `Home`/`End`/`Ctrl+A`/`Ctrl+E`/`Ctrl+U`/`Ctrl+K` from "the whole
-    /// buffer" to this -- matching standard multi-line editor behavior --
-    /// while `Left`/`Right`/`Backspace`/`Delete`/`Ctrl+W` stay simple
-    /// char-index operations that already cross a `\n` boundary like any
-    /// other character (e.g. `Left` at column 0 lands at the end of the
-    /// previous line). A no-op change for single-line input, since then
-    /// there's only ever one line spanning the whole buffer.
-    fn current_line_bounds(&self) -> (usize, usize) {
-        let chars: Vec<char> = self.input.chars().collect();
-        let start = chars[..self.cursor]
-            .iter()
-            .rposition(|&c| c == '\n')
-            .map_or(0, |i| i + 1);
-        let end = chars[self.cursor..]
-            .iter()
-            .position(|&c| c == '\n')
-            .map_or(chars.len(), |i| self.cursor + i);
-        (start, end)
-    }
-
-    fn move_home(&mut self) {
-        self.cursor = self.current_line_bounds().0;
-    }
-
-    fn move_end(&mut self) {
-        self.cursor = self.current_line_bounds().1;
-    }
-
-    fn insert_char(&mut self, c: char) {
-        let idx = self.byte_index(self.cursor);
-        self.input.insert(idx, c);
-        self.cursor += 1;
-    }
-
-    /// Inserts a literal newline at the cursor without submitting --
-    /// bound to `Alt+Enter`/`Ctrl+J` in `handle_key`, and used by
-    /// `paste_text` for an embedded line break in pasted text.
-    fn insert_newline(&mut self) {
-        self.insert_char('\n');
-    }
-
     /// Inserts a terminal bracketed-paste's full text at the cursor as one
     /// atomic edit (see main.rs's `Event::Paste` handling, enabled via
     /// `EnableBracketedPaste`). Without bracketed paste, a multi-line
@@ -1546,6 +1618,7 @@ impl AppState {
     /// `/command`. `paste_text` never submits, so a pasted newline just
     /// becomes a real line break (`insert_newline`) instead.
     pub fn paste_text(&mut self, text: &str) {
+        let channel = self.active_mut();
         let mut chars = text.chars().peekable();
         while let Some(c) = chars.next() {
             match c {
@@ -1556,69 +1629,12 @@ impl AppState {
                     if chars.peek() == Some(&'\n') {
                         chars.next();
                     }
-                    self.insert_newline();
+                    channel.insert_newline();
                 }
-                '\n' => self.insert_newline(),
-                c => self.insert_char(c),
+                '\n' => channel.insert_newline(),
+                c => channel.insert_char(c),
             }
         }
-    }
-
-    /// Backspace: deletes the character before the cursor.
-    fn delete_backward(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let end = self.byte_index(self.cursor);
-        let start = self.byte_index(self.cursor - 1);
-        self.input.replace_range(start..end, "");
-        self.cursor -= 1;
-    }
-
-    /// Delete: deletes the character at the cursor.
-    fn delete_forward(&mut self) {
-        if self.cursor >= self.char_count() {
-            return;
-        }
-        let start = self.byte_index(self.cursor);
-        let end = self.byte_index(self.cursor + 1);
-        self.input.replace_range(start..end, "");
-    }
-
-    /// Ctrl+U: deletes from the start of the current line to the cursor.
-    fn delete_to_start(&mut self) {
-        let (line_start, _) = self.current_line_bounds();
-        let start = self.byte_index(line_start);
-        let end = self.byte_index(self.cursor);
-        self.input.replace_range(start..end, "");
-        self.cursor = line_start;
-    }
-
-    /// Ctrl+K: deletes from the cursor to the end of the current line.
-    fn delete_to_end(&mut self) {
-        let (_, line_end) = self.current_line_bounds();
-        let start = self.byte_index(self.cursor);
-        let end = self.byte_index(line_end);
-        self.input.replace_range(start..end, "");
-    }
-
-    /// Ctrl+W: deletes the word immediately before the cursor.
-    fn delete_word_backward(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let chars: Vec<char> = self.input.chars().collect();
-        let mut idx = self.cursor;
-        while idx > 0 && chars[idx - 1].is_whitespace() {
-            idx -= 1;
-        }
-        while idx > 0 && !chars[idx - 1].is_whitespace() {
-            idx -= 1;
-        }
-        let start = self.byte_index(idx);
-        let end = self.byte_index(self.cursor);
-        self.input.replace_range(start..end, "");
-        self.cursor = idx;
     }
 }
 
@@ -1718,7 +1734,7 @@ mod tests {
         let mut app = app();
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
-        assert_eq!(app.input, "hi");
+        assert_eq!(app.active().input, "hi");
     }
 
     #[test]
@@ -1727,7 +1743,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
         app.handle_key(key(KeyCode::Backspace));
-        assert_eq!(app.input, "h");
+        assert_eq!(app.active().input, "h");
     }
 
     #[test]
@@ -1735,8 +1751,8 @@ mod tests {
         let mut app = app();
         app.handle_key(key(KeyCode::Char('h')));
         app.paste_text("i there");
-        assert_eq!(app.input, "hi there");
-        assert_eq!(app.cursor, "hi there".chars().count());
+        assert_eq!(app.active().input, "hi there");
+        assert_eq!(app.active().cursor, "hi there".chars().count());
     }
 
     #[test]
@@ -1747,7 +1763,7 @@ mod tests {
         // a real line break instead of flattening it to a space.
         let mut app = app();
         app.paste_text("line one\nline two\r\nline three");
-        assert_eq!(app.input, "line one\nline two\nline three");
+        assert_eq!(app.active().input, "line one\nline two\nline three");
     }
 
     #[test]
@@ -1756,7 +1772,7 @@ mod tests {
         let before = app.active().messages.len();
         app.paste_text("/join sneaky\nrest of paste");
         assert_eq!(app.active().messages.len(), before, "paste must not submit");
-        assert_eq!(app.input, "/join sneaky\nrest of paste");
+        assert_eq!(app.active().input, "/join sneaky\nrest of paste");
     }
 
     #[test]
@@ -1767,7 +1783,7 @@ mod tests {
         let action = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
         app.handle_key(key(KeyCode::Char('i')));
         assert!(action.is_none());
-        assert_eq!(app.input, "h\ni");
+        assert_eq!(app.active().input, "h\ni");
         assert_eq!(app.active().messages.len(), before, "must not submit");
     }
 
@@ -1777,7 +1793,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('h')));
         let action = app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
         assert!(action.is_none());
-        assert_eq!(app.input, "h\n");
+        assert_eq!(app.active().input, "h\n");
     }
 
     #[test]
@@ -1791,7 +1807,7 @@ mod tests {
             app.handle_key(key(KeyCode::Char(c)));
         }
         let sent = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.input, "");
+        assert_eq!(app.active().input, "");
         match sent.expect("enter with non-empty input returns an action") {
             InputAction::Send(_, message) => assert_eq!(message.text, "line one\nline two"),
             _ => panic!("expected InputAction::Send"),
@@ -1804,14 +1820,14 @@ mod tests {
         app.paste_text("first\nsecond"); // cursor ends on the second line
         app.handle_key(key(KeyCode::Home));
         assert_eq!(
-            app.cursor,
+            app.active().cursor,
             "first\n".chars().count(),
             "Home lands at the start of the current line, not the whole buffer"
         );
         app.handle_key(key(KeyCode::End));
         assert_eq!(
-            app.cursor,
-            app.input.chars().count(),
+            app.active().cursor,
+            app.active().input.chars().count(),
             "End lands at the end of the current line"
         );
     }
@@ -1823,7 +1839,8 @@ mod tests {
         app.handle_key(key(KeyCode::Home)); // start of "second"
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         assert_eq!(
-            app.input, "first\n",
+            app.active().input,
+            "first\n",
             "Ctrl+K must not touch the previous line"
         );
     }
@@ -1835,7 +1852,8 @@ mod tests {
         app.handle_key(key(KeyCode::End)); // already at the end of "second"
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(
-            app.input, "first\n",
+            app.active().input,
+            "first\n",
             "Ctrl+U must not touch the previous line"
         );
     }
@@ -1847,7 +1865,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
         let sent = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.input, "");
+        assert_eq!(app.active().input, "");
         assert_eq!(app.active().messages.len(), before + 1);
         let last = as_chat(app.active().messages.back().unwrap());
         assert_eq!(last.text, "hi");
@@ -2139,14 +2157,14 @@ mod tests {
         let mut app = app();
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
-        assert_eq!(app.cursor, 2);
+        assert_eq!(app.active().cursor, 2);
         app.handle_key(key(KeyCode::Left));
-        assert_eq!(app.cursor, 1);
+        assert_eq!(app.active().cursor, 1);
         app.handle_key(key(KeyCode::Right));
-        assert_eq!(app.cursor, 2);
+        assert_eq!(app.active().cursor, 2);
         app.handle_key(key(KeyCode::Right));
-        assert_eq!(app.cursor, 2);
-        assert_eq!(app.input, "hi");
+        assert_eq!(app.active().cursor, 2);
+        assert_eq!(app.active().input, "hi");
     }
 
     #[test]
@@ -2156,8 +2174,8 @@ mod tests {
         app.handle_key(key(KeyCode::Char('i')));
         app.handle_key(key(KeyCode::Left));
         app.handle_key(key(KeyCode::Char('X')));
-        assert_eq!(app.input, "hXi");
-        assert_eq!(app.cursor, 2);
+        assert_eq!(app.active().input, "hXi");
+        assert_eq!(app.active().cursor, 2);
     }
 
     #[test]
@@ -2166,9 +2184,9 @@ mod tests {
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
         app.handle_key(key(KeyCode::Home));
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.active().cursor, 0);
         app.handle_key(key(KeyCode::End));
-        assert_eq!(app.cursor, 2);
+        assert_eq!(app.active().cursor, 2);
     }
 
     #[test]
@@ -2177,9 +2195,9 @@ mod tests {
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('i')));
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.active().cursor, 0);
         app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
-        assert_eq!(app.cursor, 2);
+        assert_eq!(app.active().cursor, 2);
     }
 
     #[test]
@@ -2190,8 +2208,8 @@ mod tests {
         }
         app.handle_key(key(KeyCode::Home));
         app.handle_key(key(KeyCode::Delete));
-        assert_eq!(app.input, "i!");
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.active().input, "i!");
+        assert_eq!(app.active().cursor, 0);
     }
 
     #[test]
@@ -2202,8 +2220,8 @@ mod tests {
         }
         app.handle_key(key(KeyCode::Left));
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        assert_eq!(app.input, "!");
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.active().input, "!");
+        assert_eq!(app.active().cursor, 0);
     }
 
     #[test]
@@ -2215,8 +2233,8 @@ mod tests {
         app.handle_key(key(KeyCode::Home));
         app.handle_key(key(KeyCode::Right));
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
-        assert_eq!(app.input, "h");
-        assert_eq!(app.cursor, 1);
+        assert_eq!(app.active().input, "h");
+        assert_eq!(app.active().cursor, 1);
     }
 
     #[test]
@@ -2226,11 +2244,11 @@ mod tests {
             app.handle_key(key(KeyCode::Char(c)));
         }
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
-        assert_eq!(app.input, "hello ");
-        assert_eq!(app.cursor, 6);
+        assert_eq!(app.active().input, "hello ");
+        assert_eq!(app.active().cursor, 6);
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
-        assert_eq!(app.input, "");
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.active().input, "");
+        assert_eq!(app.active().cursor, 0);
     }
 
     #[test]
@@ -2311,6 +2329,48 @@ mod tests {
     }
 
     #[test]
+    fn switching_channels_preserves_each_channels_own_draft() {
+        // Regression test for features.md's "Per-channel input drafts":
+        // `input`/`cursor` live on `Channel`, not `AppState`, so switching
+        // tabs must neither leak a half-typed draft into the newly active
+        // channel nor lose it from the one it was written for.
+        let mut app = multi_channel_app();
+        assert_eq!(app.active().name, "random");
+
+        for c in "hello from random".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Left));
+        let cursor_in_random = app.active().cursor;
+
+        app.handle_key(key(KeyCode::Tab)); // wraps to "general"
+        assert_eq!(app.active().name, "general");
+        assert_eq!(
+            app.active().input,
+            "",
+            "switching tabs must not leak the other channel's draft in"
+        );
+        assert_eq!(app.active().cursor, 0);
+
+        for c in "typed in general".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+
+        app.handle_key(key(KeyCode::Tab)); // back to "random"
+        assert_eq!(app.active().name, "random");
+        assert_eq!(
+            app.active().input,
+            "hello from random",
+            "switching away and back must not lose or clear the draft"
+        );
+        assert_eq!(app.active().cursor, cursor_in_random);
+
+        app.handle_key(key(KeyCode::BackTab)); // back to "general"
+        assert_eq!(app.active().input, "typed in general");
+    }
+
+    #[test]
     fn switching_into_a_channel_clears_its_unread_flag() {
         let mut app = multi_channel_app();
         app.active = 1; // on "random"
@@ -2367,7 +2427,7 @@ mod tests {
             InputAction::Join(arg) => assert_eq!(arg, "project-x"),
             _ => panic!("expected InputAction::Join"),
         }
-        assert_eq!(app.input, "");
+        assert_eq!(app.active().input, "");
     }
 
     #[test]
@@ -2505,7 +2565,7 @@ mod tests {
         let mut app = app();
         let action = app.handle_key(key(KeyCode::Char('v')));
         assert!(action.is_none());
-        assert_eq!(app.input, "v");
+        assert_eq!(app.active().input, "v");
     }
 
     #[test]
