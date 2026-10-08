@@ -1,9 +1,11 @@
 # Feature ideas
 
 A running scratchpad of features under consideration, beyond what's already
-shipped -- see the [README](./README.md) roadmap for that. Nothing here is
-committed to; it's a place to capture ideas before deciding what's worth
-building next.
+shipped -- see the [README](./README.md) roadmap for that. Ideas that have
+graduated into committed work are tracked as tasks in Backlog.md instead
+(`backlog board` or `backlog task list --plain`); this file stays a place to
+jot brand-new ideas before they're promoted into a task, plus a historical
+record of what's already shipped.
 
 ## Identity & aliases
 
@@ -60,21 +62,6 @@ mechanisms, not one, since they trade off differently:
   so it survives rewrapping), `Enter` arms it, `Esc` cancels. A `/reply
   [text]` command covers the common "reply to the most recent message"
   case without picking.
-- [ ] **Thread view** -- a command (e.g. `/thread <id>`) that walks a
-  message's `reply_to` chain -- both up to whatever it replied to and down
-  to every message that replied to it -- and shows just that conversation
-  on its own, instead of scrolling the whole transcript to follow a reply
-  chain by eye.
-- [ ] **Edit / delete own messages** -- a new envelope variant referencing
-  the original `id`, accepted only if `sender` matches. Tombstone as
-  "(deleted)" rather than actually removing, so dedupe/backfill never have
-  to reason about holes in history.
-- [ ] **Reactions** -- lightweight emoji-react-to-message-id broadcasts,
-  rendered inline under a message. Same envelope-extension shape as
-  replies.
-- [ ] **@mentions** -- highlight your own name when it appears in a
-  message, plus a bell/notification when that happens on a tab that isn't
-  active.
 - [x] **Local search** -- `/search <term>` (or its `/s` shorthand) filters
   the active channel down to matches (with the matched text highlighted),
   instantly for whatever's loaded; a `tokio::task::spawn_blocking` scan of
@@ -111,11 +98,6 @@ mechanisms, not one, since they trade off differently:
   highlighting still applies on top of that styling
   (`ui::highlight_spans`). Deliberately minimal for now -- no nested
   lists, tables, links/images, or code syntax highlighting.
-- [ ] **Clickable links** -- detect bare URLs in message text and wrap
-  them in an OSC 8 terminal hyperlink escape sequence when rendering, so
-  terminals that support it (most modern ones) make them Cmd/Ctrl-clickable
-  without ever leaving the TUI. No new dependency -- just a URL-matching
-  pass in `ui.rs`/`markdown.rs` alongside the existing styling.
 
 ## Channels & presence
 
@@ -130,18 +112,6 @@ mechanisms, not one, since they trade off differently:
   explicitly (unlike `display_name`'s blended, one-string precedence
   order used elsewhere); previously the header only showed a count and
   the sidebar only a 4-byte hex prefix.
-- [ ] **Unread counts, and jump-to-first-unread** -- `Channel::has_unread`
-  is currently a bool (shown as a dot in the tab bar), so a channel with
-  one new message looks the same as one with a hundred, and switching to
-  it lands wherever `scroll` last was rather than at the oldest unseen
-  message. Tracking a count -- and the id of the first unseen message --
-  alongside `has_unread` would cover both.
-- [ ] **Last-seen timestamps** -- presence is purely ephemeral today
-  (`NeighborUp`/`NeighborDown`, concept.md's "Presence" section).
-  Persisting "last seen at T" per peer per channel would let offline
-  friends stay listed (greyed out) instead of just disappearing.
-- [ ] **Channel topic/description** -- a short, gossiped metadata string
-  per channel, shown under the tab bar.
 
 ## Files & rich content
 
@@ -164,21 +134,6 @@ mechanisms, not one, since they trade off differently:
   key events, fixing a premature-submit bug on multi-line pastes
   (`AppState::paste_text`).
 
-## Trust & safety
-
-- [ ] **Out-of-band fingerprint verification** -- a "safety number"-style
-  comparison (a la Signal) so two people can confirm an `EndpointId`
-  actually belongs to who they think it does, since anyone who intercepts
-  a ticket exchange could otherwise impersonate the sharer.
-- [ ] **Mute/block a peer** -- client-side filter on a specific endpoint
-  id's messages, stored alongside contacts; no network changes needed.
-- [ ] **Document channel-secret rotation as the "kick" story** -- a pure
-  capability/gossip model has no real ban mechanism (anyone holding the
-  `RoomSecret` can always rejoin), so the actual answer to "remove a
-  compromised member" is: generate a fresh `RoomSecret` and re-invite
-  everyone else. Worth writing down explicitly rather than later trying to
-  bolt on a ban-list gossip can't enforce.
-
 ## Networking & sharing
 
 - [x] **Direct 1:1 DMs** -- `/msg <alias-or-hex-prefix> [text]` (option
@@ -195,30 +150,3 @@ mechanisms, not one, since they trade off differently:
   still needs one manual out-of-band ticket share, same as any new
   channel -- inherent to concept.md's "Room privacy" guarantee that a
   topic must never be derivable from public info alone.
-- [ ] **True direct 1:1 messaging** -- option (b) from the original
-  "Direct 1:1 DMs" idea above: a real point-to-point QUIC stream to a
-  known `EndpointId` (a new ALPN + protocol handler on the existing
-  `Router`), bypassing gossip/`RoomSecret`/tickets entirely for peers
-  you already know. Removes the one remaining manual invite step for an
-  already-met peer, and avoids gossip-mesh overhead for a 2-node swarm,
-  but needs its own connection lifecycle/retry management, message
-  framing over a raw byte stream, presence semantics, and point-to-point
-  history sync to replace what a channel gets for free from gossip today
-  -- a bigger departure from the "one gossip task per channel" model,
-  worth prototyping separately.
-- [ ] **QR-code invite tickets** -- render a ticket as an in-terminal ASCII
-  QR code for scanning from a phone, instead of copy/pasting a long base32
-  string.
-- [ ] **`leyline://` deep links** -- a URI scheme so a ticket shared over
-  email/Slack/etc. can be clicked to auto-join, instead of manual
-  copy-paste into `/join`.
-
-## UX polish
-
-- [ ] **Command history & tab-completion** -- up-arrow through previously
-  submitted commands/messages; tab-complete `/join`, `/invite`, and (once
-  they exist) aliases.
-- [ ] **Mouse support** -- `crossterm` already supports mouse events; click
-  to switch tabs, scroll wheel for scrollback instead of only `Up`/`Down`.
-- [ ] **Configurable theme** -- pull the hardcoded colors in `ui.rs` out
-  into a small config file.

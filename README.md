@@ -53,6 +53,7 @@ See [Roadmap](#roadmap) below for how it got here.
 ## Requirements
 
 - A recent stable Rust toolchain with edition 2024 support (Rust 1.91 or newer -- iroh-gossip's current MSRV)
+- [Backlog.md](https://github.com/MrLesk/Backlog.md) for task management -- `brew install backlog-md` (see [Task management](#task-management))
 
 ## Build & run
 
@@ -179,6 +180,15 @@ the full peer-to-peer app -- all shipped:
 - [x] 5. Local message persistence + reload on start
 - [x] 6. `iroh-blobs`-based history backfill for offline peers
 - [x] 7. Room privacy: per-channel random secrets instead of name-derived topics
+
+## Task management
+
+Feature and bug work is tracked with [Backlog.md](https://github.com/MrLesk/Backlog.md),
+a markdown-native task manager -- `backlog board` paints a terminal Kanban
+board, and `backlog task list --plain` lists tasks (tasks use a `LEY-`
+prefix). Install it with `brew install backlog-md`. New, not-yet-committed
+ideas still start in [`features.md`](./features.md) before being promoted
+into a task. See [`AGENTS.md`](./AGENTS.md) for the full agent workflow.
 
 ## Architecture
 
