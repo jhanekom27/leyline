@@ -164,7 +164,7 @@ Typed into the message box and submitted with `Enter`:
 | `/search <term>` (alias `/s`) | Filter the active channel's messages down to ones containing `<term>` (instant for what's loaded, extended in the background with a scan of the full on-disk history); the pane title reminds you it's active and that `/search`/`/s` with no argument clears it |
 | `/reply` | Arm a reply to the most recent message in the active channel -- type normally afterward to send it as a reply (or press `Ctrl+R` instead to pick an older or specific-sender message) |
 | `/reply <text>` | Arm and immediately send `<text>` as a reply to the most recent message, in one step |
-| `/thread` | Show just the reply chain (ancestors and descendants) around the most recent message, isolated from the rest of the transcript -- press `Ctrl+T` instead to pick an older message; run `/thread` again (or press `Esc`) to return to the normal transcript |
+| `/thread` | Show just the reply chain (ancestors and descendants) around the most recent message, isolated from the rest of the transcript -- press `Ctrl+T` instead to pick an older message. A plain sent message automatically replies within the open thread (an explicit `Ctrl+R`/`/reply` target still wins); run `/thread` again (or press `Esc`) to return to the normal transcript |
 | `/hints` | Toggle the sidebar's command hints panel on or off |
 | `/bell` | Toggle the terminal bell that rings when a message arrives, on or off (on by default; the setting persists across restarts) |
 | `/version` | Show this build's version and git commit, plus the newest peer version seen that's newer than yours, if any -- see the header's "update available" indicator |

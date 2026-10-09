@@ -843,6 +843,12 @@ fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
     let prompt = format!("{} › ", app.display_name(&app.self_id));
     let title = match app.replying_to {
         Some(reply_to) => reply_banner_title(app, reply_to),
+        // No reply is explicitly armed, but a plain send still
+        // auto-joins the open thread (`AppState::active_thread_reply_target`)
+        // -- say so, rather than leaving that implicit.
+        None if app.active().thread.is_some() => {
+            " replying within this thread · Esc to leave ".to_string()
+        }
         None => " type a message · /help for commands ".to_string(),
     };
     let block = Block::bordered()

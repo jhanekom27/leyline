@@ -66,8 +66,11 @@ pub struct Channel {
     /// Active `/thread` view, if any -- see `AppState::run_thread`/
     /// `open_thread` and `ui::render_messages`. Mutually exclusive with
     /// `search`, like above. Transient UI state, like `search`: never
-    /// persisted, and not kept live as new messages arrive (re-run
-    /// `/thread` to refresh).
+    /// persisted. Unlike `search`, grows live as directly-connected
+    /// messages are sent or arrive (`push`, via `ThreadView::try_append`)
+    /// -- see that type's doc comment for the one case it still can't
+    /// catch. A plain message sent while this is active automatically
+    /// replies within it -- see `AppState::active_thread_reply_target`.
     pub thread: Option<ThreadView>,
     /// This channel's own composed-but-unsent message text -- kept per
     /// channel (not on `AppState`) so switching tabs
@@ -106,7 +109,17 @@ impl Channel {
         self.seen_ids.insert(id)
     }
 
+    /// Appends `line` to this channel's transcript, enforcing
+    /// `MAX_SCROLLBACK`. A new chat message is also offered to an active
+    /// `/thread` view (`ThreadView::try_append`), so a reply made or
+    /// received while reading a thread shows up immediately instead of
+    /// only on the next `/thread`/`Ctrl+T` rebuild.
     fn push(&mut self, line: TranscriptLine) {
+        if let TranscriptLine::Chat(message) = &line
+            && let Some(thread) = &mut self.thread
+        {
+            thread.try_append(message);
+        }
         self.messages.push_back(line);
         while self.messages.len() > MAX_SCROLLBACK {
             self.messages.pop_front();
@@ -1071,8 +1084,29 @@ impl AppState {
             return self.run_command(rest.trim());
         }
 
-        let reply_to = self.replying_to.take();
+        let reply_to = self
+            .replying_to
+            .take()
+            .or_else(|| self.active_thread_reply_target());
         Some(self.send_text(&text, reply_to))
+    }
+
+    /// The reply target a plain, non-explicitly-armed message should
+    /// automatically attach to: the newest message in the active
+    /// channel's open `/thread` view (`origin` itself, until the thread
+    /// gains descendants of its own), or `None` if no thread view is
+    /// open. Without this, a message sent while reading a thread would
+    /// land with no `reply_to` at all -- part of the active channel, but
+    /// not part of the conversation being viewed. Only consulted by
+    /// `submit_input` after `replying_to` (armed via `Ctrl+R`/`/reply`),
+    /// so an explicit pick always takes precedence over this default.
+    fn active_thread_reply_target(&self) -> Option<u64> {
+        self.active()
+            .thread
+            .as_ref()?
+            .messages
+            .last()
+            .map(|message| message.id)
     }
 
     /// Composes `text` as a message from us -- replying to `reply_to` if
@@ -4037,6 +4071,134 @@ mod tests {
             thread.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
             vec![1, 2],
             "a sibling reply to the same parent must not be pulled in"
+        );
+    }
+
+    #[test]
+    fn sending_a_plain_message_while_viewing_a_thread_replies_within_it() {
+        let mut app = app();
+        app.load_history("general", vec![dated_message(100, 1, PEER_ID, "root")]);
+        submit(&mut app, "/thread");
+
+        let action = submit(&mut app, "joining the thread");
+
+        match action.expect("a non-empty send returns an action") {
+            InputAction::Send(_, message) => {
+                assert_eq!(
+                    message.reply_to,
+                    Some(1),
+                    "a plain message sent while viewing a thread must join it"
+                );
+            }
+            _ => panic!("expected InputAction::Send"),
+        }
+    }
+
+    #[test]
+    fn explicit_reply_target_wins_over_the_automatic_thread_target() {
+        let mut app = app();
+        app.load_history(
+            "general",
+            vec![
+                dated_message(100, 1, PEER_ID, "root"),
+                dated_message(200, 2, PEER_ID, "another message"),
+            ],
+        );
+        submit(&mut app, "/thread"); // opens around the newest message (id 2)
+        app.replying_to = Some(1); // explicitly armed, e.g. via Ctrl+R or /reply
+
+        let action = submit(&mut app, "explicit reply");
+
+        match action.expect("a non-empty send returns an action") {
+            InputAction::Send(_, message) => {
+                assert_eq!(
+                    message.reply_to,
+                    Some(1),
+                    "an explicitly armed reply target must win over the thread's implicit one"
+                );
+            }
+            _ => panic!("expected InputAction::Send"),
+        }
+    }
+
+    #[test]
+    fn sending_a_plain_message_without_a_thread_view_has_no_reply_to() {
+        let mut app = app();
+
+        let action = submit(&mut app, "just chatting");
+
+        match action.expect("a non-empty send returns an action") {
+            InputAction::Send(_, message) => assert_eq!(message.reply_to, None),
+            _ => panic!("expected InputAction::Send"),
+        }
+    }
+
+    #[test]
+    fn sending_a_plain_message_while_viewing_a_thread_shows_up_immediately() {
+        let mut app = app();
+        app.load_history("general", vec![dated_message(100, 1, PEER_ID, "root")]);
+        submit(&mut app, "/thread");
+
+        submit(&mut app, "joining the thread");
+
+        let thread = app
+            .active()
+            .thread
+            .as_ref()
+            .expect("thread view must still be active");
+        assert_eq!(
+            thread.messages.len(),
+            2,
+            "the just-sent reply must show up without re-running /thread"
+        );
+        assert!(
+            thread
+                .messages
+                .iter()
+                .any(|m| m.text == "joining the thread"),
+            "got: {:?}",
+            thread.messages.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_received_reply_to_a_message_in_the_open_thread_appears_immediately() {
+        let mut app = app();
+        app.load_history("general", vec![dated_message(100, 1, PEER_ID, "root")]);
+        submit(&mut app, "/thread");
+
+        let reply = reply_message(200, 2, PEER_ID_2, "from a peer", 1);
+        app.handle_net_event(NetEvent::Received("general".to_string(), reply));
+
+        let thread = app
+            .active()
+            .thread
+            .as_ref()
+            .expect("thread view must still be active");
+        assert_eq!(
+            thread.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn an_unrelated_received_message_does_not_join_the_open_thread() {
+        let mut app = app();
+        app.load_history("general", vec![dated_message(100, 1, PEER_ID, "root")]);
+        submit(&mut app, "/thread");
+
+        let unrelated = dated_message(200, 2, PEER_ID_2, "different topic");
+        app.handle_net_event(NetEvent::Received("general".to_string(), unrelated));
+
+        let thread = app
+            .active()
+            .thread
+            .as_ref()
+            .expect("thread view must still be active");
+        assert_eq!(
+            thread.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![1],
+            "a message with no reply_to into the thread must not join it"
         );
     }
 

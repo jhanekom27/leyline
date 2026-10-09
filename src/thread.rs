@@ -8,9 +8,16 @@ use crate::message::ChatMessage;
 
 /// A channel's active `/thread` view -- see `app::Channel::thread`.
 ///
-/// A point-in-time snapshot, not a live filter, mirroring
-/// `search::SearchResults`: re-run `/thread`, or pick a new message with
-/// `Ctrl+T`, to pick up messages sent or received while it's active.
+/// Grows live as new messages that directly extend it are sent or arrive
+/// (`try_append`, called from `app::Channel::push`), so a reply made
+/// while reading a thread shows up immediately instead of needing
+/// `/thread` re-run. It can still fall behind in one narrow case: an
+/// incoming message whose own parent hasn't been resolved into the view
+/// yet -- unlike a locally-composed reply, which always targets
+/// something already shown (see `app::AppState::active_thread_reply_target`),
+/// a peer's message can arrive before the message it replies to. Re-run
+/// `/thread`, or pick a new message with `Ctrl+T`, to rebuild it from
+/// scratch if that happens.
 pub struct ThreadView {
     /// The message the thread was opened from -- shown in the pane title
     /// and the opening system notice (`app::AppState::open_thread`) so
@@ -22,6 +29,37 @@ pub struct ThreadView {
     /// branches off an ancestor: only the direct line through `origin` is
     /// included.
     pub messages: Vec<ChatMessage>,
+}
+
+impl ThreadView {
+    /// Appends `message` to this view if it belongs: it replies (directly)
+    /// to a message already in the chain. Returns whether it was added,
+    /// so a caller that just pushed `message` into a channel's broader
+    /// transcript (`app::Channel::push`) can also keep an already-open
+    /// thread view current, instead of only ever reflecting whatever was
+    /// in scope when `/thread`/`Ctrl+T` last (re)built it. Re-sorts by
+    /// `(ts_unix_ms, id)` after inserting, matching `build_chain`'s own
+    /// ordering, though in practice a newly-arrived message is almost
+    /// always the newest. Ignores a message already present (defensive --
+    /// `Channel::push`'s callers already dedupe by id before ever
+    /// reaching this).
+    pub fn try_append(&mut self, message: &ChatMessage) -> bool {
+        let belongs = message
+            .reply_to
+            .is_some_and(|parent| self.messages.iter().any(|existing| existing.id == parent));
+        if !belongs
+            || self
+                .messages
+                .iter()
+                .any(|existing| existing.id == message.id)
+        {
+            return false;
+        }
+        self.messages.push(message.clone());
+        self.messages
+            .sort_by_key(|existing| (existing.ts_unix_ms, existing.id));
+        true
+    }
 }
 
 /// Builds `origin`'s reply chain from `pool` (a channel's loaded chat
@@ -221,6 +259,100 @@ mod tests {
         assert_eq!(
             chain.iter().map(|m| m.id).collect::<Vec<_>>(),
             vec![1, 2, 5]
+        );
+    }
+
+    #[test]
+    fn try_append_adds_a_message_replying_to_the_origin() {
+        let origin = message(1, 100, None);
+        let mut thread = ThreadView {
+            origin: origin.clone(),
+            messages: vec![origin],
+        };
+        let reply = message(2, 200, Some(1));
+
+        assert!(thread.try_append(&reply));
+
+        assert_eq!(
+            thread.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn try_append_adds_a_message_replying_to_an_existing_descendant() {
+        let origin = message(1, 100, None);
+        let reply = message(2, 200, Some(1));
+        let mut thread = ThreadView {
+            origin: origin.clone(),
+            messages: vec![origin, reply],
+        };
+        let reply_to_reply = message(3, 300, Some(2));
+
+        assert!(thread.try_append(&reply_to_reply));
+
+        assert_eq!(
+            thread.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn try_append_rejects_a_message_with_no_reply_to() {
+        let origin = message(1, 100, None);
+        let mut thread = ThreadView {
+            origin: origin.clone(),
+            messages: vec![origin],
+        };
+        let unrelated = message(2, 200, None);
+
+        assert!(!thread.try_append(&unrelated));
+        assert_eq!(thread.messages.len(), 1);
+    }
+
+    #[test]
+    fn try_append_rejects_a_message_replying_outside_the_view() {
+        let origin = message(1, 100, None);
+        let mut thread = ThreadView {
+            origin: origin.clone(),
+            messages: vec![origin],
+        };
+        let unrelated = message(2, 200, Some(99)); // 99 isn't in the view
+
+        assert!(!thread.try_append(&unrelated));
+        assert_eq!(thread.messages.len(), 1);
+    }
+
+    #[test]
+    fn try_append_ignores_a_message_already_present() {
+        let origin = message(1, 100, None);
+        let reply = message(2, 200, Some(1));
+        let mut thread = ThreadView {
+            origin: origin.clone(),
+            messages: vec![origin, reply.clone()],
+        };
+
+        assert!(!thread.try_append(&reply));
+        assert_eq!(thread.messages.len(), 2);
+    }
+
+    #[test]
+    fn try_append_sorts_an_out_of_order_arrival() {
+        let origin = message(5, 100, None);
+        let mut thread = ThreadView {
+            origin: origin.clone(),
+            messages: vec![origin],
+        };
+        // Older timestamp than `origin`, but still a valid reply to it --
+        // e.g. a peer's message arriving late over gossip.
+        let earlier_reply = message(1, 50, Some(5));
+
+        assert!(thread.try_append(&earlier_reply));
+
+        assert_eq!(
+            thread.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![1, 5],
+            "must stay sorted by (ts_unix_ms, id) regardless of arrival order"
         );
     }
 }
