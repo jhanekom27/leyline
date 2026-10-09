@@ -138,9 +138,10 @@ HOME=/tmp/leyline-b CARGO_HOME="$REAL_CARGO_HOME" cargo run
 | (paste, e.g. `Cmd+V`/`Ctrl+V`) | Paste text from the terminal as one atomic edit, so a multi-line paste can't prematurely send a partial line or trigger a stray `/command` |
 | `Ctrl+V` | Share whatever's on the OS clipboard (a file, an image, or text) with the active channel -- same as `/paste`. `Cmd+V` also works if your terminal forwards it, but most (including this one) reserve it for their own text-paste above |
 | `Ctrl+R` | Pick a message to reply to -- `Up`/`Down` move the highlight, `Enter` confirms, `Esc` cancels |
-| `Up` / `Down` | Scroll the message history (or move the highlight while picking a reply, see `Ctrl+R`) |
+| `Ctrl+T` | Pick a message to view its reply chain in isolation -- `Up`/`Down` move the highlight, `Enter` confirms, `Esc` cancels |
+| `Up` / `Down` | Scroll the message history (or move the highlight while picking a reply or thread target, see `Ctrl+R`/`Ctrl+T`) |
 | `Tab` / `Shift+Tab` | Switch to the next / previous joined channel |
-| `Esc` / `Ctrl+C` | Cancel an in-progress reply pick or armed reply first, if any; otherwise quit |
+| `Esc` / `Ctrl+C` | Cancel an in-progress reply or thread pick, or an armed reply, first, if any; otherwise leave an open thread view if one is active; otherwise quit |
 
 ## Commands
 
@@ -163,6 +164,7 @@ Typed into the message box and submitted with `Enter`:
 | `/search <term>` (alias `/s`) | Filter the active channel's messages down to ones containing `<term>` (instant for what's loaded, extended in the background with a scan of the full on-disk history); the pane title reminds you it's active and that `/search`/`/s` with no argument clears it |
 | `/reply` | Arm a reply to the most recent message in the active channel -- type normally afterward to send it as a reply (or press `Ctrl+R` instead to pick an older or specific-sender message) |
 | `/reply <text>` | Arm and immediately send `<text>` as a reply to the most recent message, in one step |
+| `/thread` | Show just the reply chain (ancestors and descendants) around the most recent message, isolated from the rest of the transcript -- press `Ctrl+T` instead to pick an older message; run `/thread` again (or press `Esc`) to return to the normal transcript |
 | `/hints` | Toggle the sidebar's command hints panel on or off |
 | `/bell` | Toggle the terminal bell that rings when a message arrives, on or off (on by default; the setting persists across restarts) |
 | `/version` | Show this build's version and git commit, plus the newest peer version seen that's newer than yours, if any -- see the header's "update available" indicator |

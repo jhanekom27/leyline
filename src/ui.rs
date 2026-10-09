@@ -17,6 +17,7 @@ use crate::files::human_size;
 use crate::markdown;
 use crate::message::ChatMessage;
 use crate::search::SearchResults;
+use crate::thread::ThreadView;
 
 /// Width of the `HH:MM` time column in a chat row.
 const TIME_WIDTH: usize = 5;
@@ -49,6 +50,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/nick <name>",
     "/search <term> (/s)",
     "/reply [text]",
+    "/thread (Ctrl+T pick)",
     "/hints",
     "/bell",
     "/version",
@@ -213,6 +215,16 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
 
     let title = if app.picking_reply.is_some() {
         "pick a message to reply to: ↑/↓ move · Enter confirm · Esc cancel".to_string()
+    } else if app.picking_thread.is_some() {
+        "pick a message to view its thread: ↑/↓ move · Enter confirm · Esc cancel".to_string()
+    } else if let Some(thread) = &channel.thread {
+        format!(
+            "#{} · thread from {}: {} ({}) · /thread or Esc to leave",
+            channel.name,
+            app.display_name(&thread.origin.sender),
+            reply_snippet(&thread.origin),
+            thread.messages.len()
+        )
     } else {
         match &channel.search {
             Some(search) => {
@@ -291,14 +303,19 @@ fn render_scroll_indicator(
 /// word-wrapped continuation lines -- is computed here since it depends on
 /// iterating the transcript in order.
 ///
-/// Delegates to `build_search_rows` when `channel` has an active `/search`
-/// (see `app::Channel::search`), rendering its results in place of the
-/// normal transcript.
+/// Delegates to `build_thread_rows` or `build_search_rows` when `channel`
+/// has an active `/thread` view or `/search` (see `app::Channel::thread`/
+/// `search`), rendering one of those in place of the normal transcript --
+/// a channel shows at most one alternate view at a time, so `thread` is
+/// checked first but the two never both apply.
 fn build_message_rows(
     app: &AppState,
     channel: &Channel,
     inner_width: usize,
 ) -> (Vec<Line<'static>>, Option<usize>) {
+    if let Some(thread) = &channel.thread {
+        return build_thread_rows(app, thread, inner_width);
+    }
     if let Some(search) = &channel.search {
         return build_search_rows(app, search, inner_width);
     }
@@ -319,7 +336,8 @@ fn build_message_rows(
                     rows.push(Line::from(""));
                 }
                 last_chat_sender = Some(message.sender);
-                let is_picked = app.picking_reply == Some(message.id);
+                let is_picked =
+                    app.picking_reply == Some(message.id) || app.picking_thread == Some(message.id);
                 if is_picked {
                     picked_row = Some(rows.len());
                 }
@@ -377,7 +395,8 @@ fn build_search_rows(
             rows.push(Line::from(""));
         }
         last_sender = Some(message.sender);
-        let is_picked = app.picking_reply == Some(message.id);
+        let is_picked =
+            app.picking_reply == Some(message.id) || app.picking_thread == Some(message.id);
         if is_picked {
             picked_row = Some(rows.len());
         }
@@ -398,6 +417,46 @@ fn build_search_rows(
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
         )));
+    }
+    (rows, picked_row)
+}
+
+/// Renders a channel's active `/thread` view in place of its normal
+/// transcript -- reuses the same per-message formatting
+/// (`push_chat_rows`) and sender-grouping as the normal transcript and
+/// search results, but never highlights anything (`term_lower: None`),
+/// since a thread view isn't about a text match. Always has at least one
+/// row, since `thread::build_chain` always includes the origin message.
+fn build_thread_rows(
+    app: &AppState,
+    thread: &ThreadView,
+    inner_width: usize,
+) -> (Vec<Line<'static>>, Option<usize>) {
+    let layout = row_layout(inner_width);
+
+    let mut rows = Vec::new();
+    let mut picked_row = None;
+    let mut last_sender: Option<[u8; 32]> = None;
+    for message in &thread.messages {
+        let is_first_of_group = last_sender != Some(message.sender);
+        if is_first_of_group && last_sender.is_some() {
+            rows.push(Line::from(""));
+        }
+        last_sender = Some(message.sender);
+        let is_picked =
+            app.picking_reply == Some(message.id) || app.picking_thread == Some(message.id);
+        if is_picked {
+            picked_row = Some(rows.len());
+        }
+        push_chat_rows(
+            &mut rows,
+            app,
+            message,
+            is_first_of_group,
+            &layout,
+            None,
+            is_picked,
+        );
     }
     (rows, picked_row)
 }
@@ -1249,6 +1308,53 @@ mod tests {
                 .iter()
                 .any(|span| span.style.bg == Some(Color::Yellow)),
             "expected at least one highlighted piece"
+        );
+    }
+
+    #[test]
+    fn build_thread_rows_renders_each_message_in_the_chain() {
+        let app = AppState::new([9; 32], vec!["general".to_string()], "general");
+        let origin = text_message(1, [1; 32], "root");
+        let reply = text_message(2, [1; 32], "reply");
+        let thread = ThreadView {
+            origin: origin.clone(),
+            messages: vec![origin, reply],
+        };
+
+        let (rows, _) = build_thread_rows(&app, &thread, 80);
+
+        assert_eq!(rows.len(), 2);
+        assert!(
+            row_text(&rows[0]).ends_with("root"),
+            "got: {}",
+            row_text(&rows[0])
+        );
+        assert!(
+            row_text(&rows[1]).ends_with("reply"),
+            "got: {}",
+            row_text(&rows[1])
+        );
+    }
+
+    #[test]
+    fn build_thread_rows_highlights_the_row_matching_picking_thread() {
+        let mut app = AppState::new([9; 32], vec!["general".to_string()], "general");
+        app.picking_thread = Some(1);
+        let origin = text_message(1, [1; 32], "root");
+        let thread = ThreadView {
+            origin: origin.clone(),
+            messages: vec![origin],
+        };
+
+        let (rows, picked_row) = build_thread_rows(&app, &thread, 80);
+
+        assert_eq!(picked_row, Some(0));
+        assert!(
+            rows[0]
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::REVERSED)),
+            "the picked row must be rendered reversed"
         );
     }
 }

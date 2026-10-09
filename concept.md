@@ -254,6 +254,7 @@ src/
   settings.rs         // persisted local preferences: message bell, broadcast nickname
   storage.rs          // local per-channel message log persistence
   search.rs           // shared match predicate + on-disk scan for /search
+  thread.rs           // reply-chain (ancestors + descendants) builder for /thread
   backfill.rs         // iroh-blobs history manifests for offline backfill
   files.rs            // /save destination resolution, filename safety, sizes
   version.rs          // build version/git-hash constants, newer-than-ours comparison

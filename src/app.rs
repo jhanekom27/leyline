@@ -15,6 +15,7 @@ use iroh_blobs::Hash;
 use crate::message::{ChatMessage, now_unix_ms};
 use crate::net::NetEvent;
 use crate::search::{self, SearchOutcome, SearchResults};
+use crate::thread::{self, ThreadView};
 use crate::version;
 
 /// Cap on in-memory scrollback per channel, per concept.md's guidance on
@@ -56,10 +57,18 @@ pub struct Channel {
     /// full history on disk anyway.
     seen_ids: HashSet<u64>,
     /// Active `/search <term>` results, if any -- see `AppState::run_search`
-    /// and `ui::render_messages`. Transient UI state, like `scroll`: never
-    /// persisted, and not kept live as new messages arrive (re-run
-    /// `/search <term>` to refresh).
+    /// and `ui::render_messages`. Mutually exclusive with `thread` (opening
+    /// one clears the other): a channel shows at most one alternate view at
+    /// a time. Transient UI state, like `scroll`: never persisted, and not
+    /// kept live as new messages arrive (re-run `/search <term>` to
+    /// refresh).
     pub search: Option<SearchResults>,
+    /// Active `/thread` view, if any -- see `AppState::run_thread`/
+    /// `open_thread` and `ui::render_messages`. Mutually exclusive with
+    /// `search`, like above. Transient UI state, like `search`: never
+    /// persisted, and not kept live as new messages arrive (re-run
+    /// `/thread` to refresh).
+    pub thread: Option<ThreadView>,
     /// This channel's own composed-but-unsent message text -- kept per
     /// channel (not on `AppState`) so switching tabs
     /// (`AppState::switch_channel`) never loses a half-typed draft in one
@@ -84,6 +93,7 @@ impl Channel {
             has_unread: false,
             seen_ids: HashSet::new(),
             search: None,
+            thread: None,
             input: String::new(),
             cursor: 0,
         }
@@ -132,13 +142,17 @@ impl Channel {
     }
 
     /// Ids of chat messages currently visible in this channel, oldest
-    /// first: its active `/search` results if one is running (mirroring
-    /// what's actually on screen), else its full loaded transcript
-    /// (skipping `System` lines, which aren't reply targets). Shared by
-    /// reply-pick navigation (`AppState::start_reply_pick`/
-    /// `move_reply_pick`/`run_reply`), so picking only ever lands on a
-    /// message the user can currently see.
+    /// first: its active `/thread` view if one is open, else its active
+    /// `/search` results if one is running (mirroring what's actually on
+    /// screen), else its full loaded transcript (skipping `System` lines,
+    /// which aren't reply targets). Shared by reply-pick navigation
+    /// (`AppState::start_reply_pick`/`move_reply_pick`/`run_reply`) and
+    /// thread-pick navigation (`start_thread_pick`/`move_thread_pick`), so
+    /// picking only ever lands on a message the user can currently see.
     fn visible_chat_ids(&self) -> Vec<u64> {
+        if let Some(thread) = &self.thread {
+            return thread.messages.iter().map(|message| message.id).collect();
+        }
         if let Some(search) = &self.search {
             return search.messages.iter().map(|message| message.id).collect();
         }
@@ -152,19 +166,26 @@ impl Channel {
     }
 
     /// Finds a chat message by id in this channel, checking its active
-    /// search results first (if any -- `search.messages` can hold matches
-    /// from `search::run_on_disk_scan` that are older than what
-    /// `self.messages` keeps under `MAX_SCROLLBACK`) and then falling back
-    /// to the full loaded transcript. The fallback matters even with a
-    /// search active: a reply's quoted parent (`ui::reply_preview_spans`)
-    /// should still resolve when it simply doesn't match the current
-    /// filter, unlike `visible_chat_ids`, which deliberately only offers
-    /// up messages the user can currently see to *pick* a reply target
-    /// from. Also used to describe what `/reply` just armed
-    /// (`AppState::run_reply`). `None` covers a dangling `reply_to` just
+    /// thread view first, then its active search results (if any --
+    /// `search.messages` can hold matches from `search::run_on_disk_scan`
+    /// that are older than what `self.messages` keeps under
+    /// `MAX_SCROLLBACK`), and then falling back to the full loaded
+    /// transcript. The fallback matters even with a thread or search
+    /// active: a reply's quoted parent (`ui::reply_preview_spans`) should
+    /// still resolve when it simply isn't part of the current view, unlike
+    /// `visible_chat_ids`, which deliberately only offers up messages the
+    /// user can currently see to *pick* a reply or thread target from.
+    /// Also used to describe what `/reply` just armed
+    /// (`AppState::run_reply`) and to resolve a thread's origin
+    /// (`AppState::open_thread`). `None` covers a dangling `reply_to` just
     /// as much as an outright-unknown id -- see `ChatMessage::reply_to`'s
     /// doc comment.
     pub fn find_message(&self, id: u64) -> Option<&ChatMessage> {
+        if let Some(thread) = &self.thread
+            && let Some(message) = thread.messages.iter().find(|message| message.id == id)
+        {
+            return Some(message);
+        }
         if let Some(search) = &self.search
             && let Some(message) = search.messages.iter().find(|message| message.id == id)
         {
@@ -423,6 +444,12 @@ pub struct AppState {
     /// `None` when not picking -- `handle_key` checks this first, before
     /// normal typing/editing, to dispatch into `handle_picking_key`.
     pub picking_reply: Option<u64>,
+    /// The in-progress candidate while picking a message to view its
+    /// thread with `Ctrl+T` (see `start_thread_pick`/`move_thread_pick`),
+    /// by message id. `None` when not picking -- `handle_key` checks this
+    /// alongside `picking_reply`, before normal typing/editing, to
+    /// dispatch into `handle_thread_picking_key`.
+    pub picking_thread: Option<u64>,
     /// The armed reply target for the next sent message (confirmed via
     /// `Enter` while picking, or `/reply`), by message id. Attached to the
     /// next `Send`-ed `ChatMessage` and cleared on send (`send_text`), on
@@ -465,6 +492,7 @@ impl AppState {
             peer_versions: HashMap::new(),
             dm_channels: HashMap::new(),
             picking_reply: None,
+            picking_thread: None,
             replying_to: None,
         }
     }
@@ -612,6 +640,7 @@ impl AppState {
     fn finish_activating_channel(&mut self) {
         self.active_mut().has_unread = false;
         self.picking_reply = None;
+        self.picking_thread = None;
         self.replying_to = None;
     }
 
@@ -668,19 +697,27 @@ impl AppState {
             self.handle_picking_key(key);
             return None;
         }
+        if self.picking_thread.is_some() {
+            self.handle_thread_picking_key(key);
+            return None;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             // Backs out one level at a time: cancel an armed reply first
             // (mirroring `handle_picking_key`'s own Esc, which cancels a
-            // pick-in-progress instead of confirming it), only quitting
-            // once nothing is armed.
+            // pick-in-progress instead of confirming it), then leave an
+            // open thread view if there's no armed reply either, only
+            // quitting once neither is active.
             KeyCode::Esc => {
-                if self.replying_to.take().is_none() {
+                if self.replying_to.take().is_some() {
+                    // cancelled the armed reply, nothing further to do
+                } else if !self.close_thread() {
                     self.should_quit = true;
                 }
             }
             KeyCode::Char('c') if ctrl => self.should_quit = true,
             KeyCode::Char('r') if ctrl => self.start_reply_pick(),
+            KeyCode::Char('t') if ctrl => self.start_thread_pick(),
             KeyCode::Char('a') if ctrl => self.active_mut().move_home(),
             KeyCode::Char('e') if ctrl => self.active_mut().move_end(),
             KeyCode::Char('u') if ctrl => self.active_mut().delete_to_start(),
@@ -748,6 +785,32 @@ impl AppState {
             KeyCode::Down => self.move_reply_pick(1),
             KeyCode::Enter => self.replying_to = self.picking_reply.take(),
             KeyCode::Esc => self.picking_reply = None,
+            _ => {}
+        }
+    }
+
+    /// Handles a keypress while picking a message to view its thread
+    /// (`Ctrl+T`, see `start_thread_pick`): `Up`/`Down` move the
+    /// highlighted candidate (`move_thread_pick`), `Enter` opens its
+    /// thread view (`open_thread`), `Esc` cancels back to normal typing.
+    /// Mirrors `handle_picking_key`'s shape, but for thread-picking
+    /// instead of reply-picking -- kept as a separate method (rather than
+    /// a shared one parameterized by purpose) since the two confirm
+    /// actions differ.
+    fn handle_thread_picking_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
+            return;
+        }
+        match key.code {
+            KeyCode::Up => self.move_thread_pick(-1),
+            KeyCode::Down => self.move_thread_pick(1),
+            KeyCode::Enter => {
+                if let Some(id) = self.picking_thread.take() {
+                    self.open_thread(id);
+                }
+            }
+            KeyCode::Esc => self.picking_thread = None,
             _ => {}
         }
     }
@@ -909,6 +972,7 @@ impl AppState {
             // earlier tab's removal) -- a reply id only makes sense
             // against the channel it was picked in.
             self.picking_reply = None;
+            self.picking_thread = None;
             self.replying_to = None;
         }
         self.push_system(format!("left #{channel}"));
@@ -1054,6 +1118,7 @@ impl AppState {
             "paste" => self.run_paste(),
             "search" | "s" => self.run_search(arg.trim()),
             "reply" => self.run_reply(arg.trim()),
+            "thread" => self.run_thread(),
             "hints" => self.run_hints(),
             "bell" => self.run_bell(),
             "version" => self.run_version(),
@@ -1074,8 +1139,9 @@ impl AppState {
             "commands: /join <name|ticket>, /invite, /msg <alias|hex-prefix> [text], \
              /leave [channel], /who, /send <path>, /save <hash-prefix>, /paste, \
              /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
-             /hints, /bell, /version, /help -- keys: Tab/Shift+Tab switch channels, Alt+Enter/Ctrl+J \
-             newline, Ctrl+V paste, Ctrl+R reply (\u{2191}/\u{2193} pick, Enter confirm), \
+             /thread, /hints, /bell, /version, /help -- keys: Tab/Shift+Tab switch channels, \
+             Alt+Enter/Ctrl+J newline, Ctrl+V paste, Ctrl+R reply (\u{2191}/\u{2193} pick, \
+             Enter confirm), Ctrl+T thread (\u{2191}/\u{2193} pick, Enter confirm), \
              Up/Down scroll, Esc/Ctrl+C quit",
         );
         None
@@ -1272,6 +1338,7 @@ impl AppState {
         let term_lower = arg.to_lowercase();
         let messages = self.active().search_loaded(&term_lower);
         let count = messages.len();
+        self.active_mut().thread = None;
         self.active_mut().search = Some(SearchResults {
             term: arg.to_string(),
             messages,
@@ -1286,16 +1353,39 @@ impl AppState {
         })
     }
 
+    /// Finds the newest message currently visible in the active channel --
+    /// shared by reply targeting (`newest_reply_candidate`) and thread
+    /// targeting (`newest_thread_candidate`), which differ only in which
+    /// error message they report when the channel has no messages.
+    fn newest_visible_message(&self) -> Option<u64> {
+        self.active().visible_chat_ids().last().copied()
+    }
+
     /// Finds the newest message currently visible in the active channel
     /// to use as a reply target -- shared by `Ctrl+R` (`start_reply_pick`)
     /// and `/reply` (`run_reply`). Reports an error and returns `None` if
     /// the channel has no messages to reply to, mirroring `/who`'s
     /// empty-channel notice.
     fn newest_reply_candidate(&mut self) -> Option<u64> {
-        match self.active().visible_chat_ids().last().copied() {
+        match self.newest_visible_message() {
             Some(id) => Some(id),
             None => {
                 self.push_system("no messages to reply to");
+                None
+            }
+        }
+    }
+
+    /// Finds the newest message currently visible in the active channel
+    /// to use as a thread's origin -- shared by `Ctrl+T`
+    /// (`start_thread_pick`) and bare `/thread` (`run_thread`). Mirrors
+    /// `newest_reply_candidate`, but for thread-viewing instead of
+    /// replying.
+    fn newest_thread_candidate(&mut self) -> Option<u64> {
+        match self.newest_visible_message() {
+            Some(id) => Some(id),
+            None => {
+                self.push_system("no messages to view a thread for");
                 None
             }
         }
@@ -1311,24 +1401,50 @@ impl AppState {
         }
     }
 
-    /// Moves an in-progress reply pick (`picking_reply`) by `delta`
-    /// through the active channel's currently visible chat messages
+    /// Handles `Ctrl+T`: begins picking a message to view its thread, the
+    /// same way `start_reply_pick` begins picking a reply target --
+    /// confirm with `Enter` (opens the picked message's thread, see
+    /// `handle_thread_picking_key`/`open_thread`), move with `Up`/`Down`,
+    /// cancel with `Esc`.
+    fn start_thread_pick(&mut self) {
+        if let Some(id) = self.newest_thread_candidate() {
+            self.picking_thread = Some(id);
+        }
+    }
+
+    /// Moves a pick cursor currently at `current` by `delta` through the
+    /// active channel's currently visible chat messages
     /// (`Channel::visible_chat_ids`), oldest to newest. Clamps at both
     /// ends rather than wrapping -- "past the newest" and "before the
-    /// oldest" aren't meaningful positions to cycle from. A no-op if
-    /// nothing is being picked, or if the picked id has since fallen out
-    /// of `visible_chat_ids` (shouldn't normally happen, since
-    /// `start_reply_pick` always seeds it from that same list).
-    fn move_reply_pick(&mut self, delta: isize) {
-        let Some(current) = self.picking_reply else {
-            return;
-        };
+    /// oldest" aren't meaningful positions to cycle from. Returns
+    /// `current` unchanged if it's no longer among the visible ids
+    /// (shouldn't normally happen, since both `start_reply_pick` and
+    /// `start_thread_pick` always seed their cursor from that same list).
+    /// Shared by `move_reply_pick`/`move_thread_pick`, which differ only
+    /// in which field they update.
+    fn move_pick(&self, current: u64, delta: isize) -> u64 {
         let ids = self.active().visible_chat_ids();
         let Some(pos) = ids.iter().position(|&id| id == current) else {
-            return;
+            return current;
         };
         let new_pos = (pos as isize + delta).clamp(0, ids.len() as isize - 1) as usize;
-        self.picking_reply = Some(ids[new_pos]);
+        ids[new_pos]
+    }
+
+    /// Moves an in-progress reply pick (`picking_reply`) by `delta` -- see
+    /// `move_pick`. A no-op if nothing is being picked.
+    fn move_reply_pick(&mut self, delta: isize) {
+        if let Some(current) = self.picking_reply {
+            self.picking_reply = Some(self.move_pick(current, delta));
+        }
+    }
+
+    /// Moves an in-progress thread pick (`picking_thread`) by `delta` --
+    /// see `move_pick`. A no-op if nothing is being picked.
+    fn move_thread_pick(&mut self, delta: isize) {
+        if let Some(current) = self.picking_thread {
+            self.picking_thread = Some(self.move_pick(current, delta));
+        }
     }
 
     /// Handles `/reply [text]`: `arg` is everything after `/reply `
@@ -1354,6 +1470,69 @@ impl AppState {
         }
         let reply_to = self.replying_to.take();
         Some(self.send_text(arg, reply_to))
+    }
+
+    /// Handles `/thread`: with an active thread view, closes it (mirroring
+    /// `/s` clearing an active search) -- otherwise opens a thread view
+    /// around the newest message currently visible in the active channel
+    /// (`newest_thread_candidate`), mirroring `/reply`'s own "most recent
+    /// message" default. Pick an older message instead with `Ctrl+T`
+    /// (`start_thread_pick`).
+    fn run_thread(&mut self) -> Option<InputAction> {
+        if self.close_thread() {
+            return None;
+        }
+        if let Some(id) = self.newest_thread_candidate() {
+            self.open_thread(id);
+        }
+        None
+    }
+
+    /// Opens a thread view around `origin_id`: resolves it in the active
+    /// channel (`Channel::find_message`, so it works whether `origin_id`
+    /// came from the loaded transcript or an active search), builds its
+    /// reply chain (`thread::build_chain`) against the channel's loaded
+    /// chat messages, and activates it as `channel.thread` -- clearing any
+    /// active `search` first, since a channel shows at most one alternate
+    /// view at a time. A no-op if `origin_id` doesn't currently resolve to
+    /// a message (shouldn't normally happen -- both `run_thread` and
+    /// `handle_thread_picking_key` always source it from
+    /// `newest_thread_candidate`/`visible_chat_ids`, which only ever offer
+    /// up ids `find_message` can resolve).
+    fn open_thread(&mut self, origin_id: u64) {
+        let Some(origin) = self.active().find_message(origin_id).cloned() else {
+            return;
+        };
+        let pool: Vec<ChatMessage> = self
+            .active()
+            .messages
+            .iter()
+            .filter_map(|line| match line {
+                TranscriptLine::Chat(message) => Some(message.clone()),
+                TranscriptLine::System(_) => None,
+            })
+            .collect();
+        let messages = thread::build_chain(&pool, &origin);
+        let count = messages.len();
+        let sender = self.display_name(&origin.sender);
+        self.active_mut().search = None;
+        self.active_mut().thread = Some(ThreadView { origin, messages });
+        self.push_system(format!(
+            "thread view: {count} message(s) around {sender}'s message -- /thread or Esc to leave"
+        ));
+    }
+
+    /// Closes the active channel's thread view, if any, reporting it via a
+    /// system notice mirroring `/search`'s "search cleared". Returns
+    /// whether a thread view was actually active -- `run_thread`'s
+    /// toggle-off path and `handle_key`'s `Esc` chain both use this.
+    fn close_thread(&mut self) -> bool {
+        if self.active_mut().thread.take().is_some() {
+            self.push_system("thread view closed");
+            true
+        } else {
+            false
+        }
     }
 
     /// Handles `/send <path>`: `arg` is everything after `/send ` (already
@@ -1454,7 +1633,10 @@ impl AppState {
         if let Some(name) = self.dm_channels.get(&id).cloned()
             && self.activate_existing_channel(&name)
         {
-            self.push_system(format!("switched to your DM with {}", self.display_name(&id)));
+            self.push_system(format!(
+                "switched to your DM with {}",
+                self.display_name(&id)
+            ));
             return text.map(|text| self.send_text(text, None));
         }
 
@@ -3579,19 +3761,22 @@ mod tests {
 
     #[test]
     fn switch_channel_directly_clears_picking_and_armed_reply() {
-        // `switch_channel` itself must clear both, even though `Tab` can't
-        // actually reach it while picking in practice -- `handle_key`
-        // routes every key through `handle_picking_key` first in that
-        // state (see `esc_while_picking_cancels_without_quitting` and
-        // friends), which has no `Tab` arm of its own. Calling the method
+        // `switch_channel` itself must clear all three, even though `Tab`
+        // can't actually reach it while picking in practice -- `handle_key`
+        // routes every key through `handle_picking_key`/
+        // `handle_thread_picking_key` first in that state (see
+        // `esc_while_picking_cancels_without_quitting` and friends),
+        // neither of which has a `Tab` arm of its own. Calling the method
         // directly still documents/guards the invariant.
         let mut app = multi_channel_app();
         app.picking_reply = Some(1);
+        app.picking_thread = Some(3);
         app.replying_to = Some(2);
 
         app.switch_channel(1);
 
         assert!(app.picking_reply.is_none());
+        assert!(app.picking_thread.is_none());
         assert!(app.replying_to.is_none());
     }
 
@@ -3600,11 +3785,13 @@ mod tests {
         let mut app = multi_channel_app();
         assert_eq!(app.active().name, "random");
         app.picking_reply = Some(1);
+        app.picking_thread = Some(3);
         app.replying_to = Some(2);
 
         app.remove_channel("random");
 
         assert!(app.picking_reply.is_none());
+        assert!(app.picking_thread.is_none());
         assert!(app.replying_to.is_none());
     }
 
@@ -3613,11 +3800,13 @@ mod tests {
         let mut app = multi_channel_app();
         assert_eq!(app.active().name, "random");
         app.picking_reply = Some(1);
+        app.picking_thread = Some(3);
         app.replying_to = Some(2);
 
         app.remove_channel("general");
 
         assert_eq!(app.picking_reply, Some(1));
+        assert_eq!(app.picking_thread, Some(3));
         assert_eq!(app.replying_to, Some(2));
     }
 
@@ -3625,11 +3814,13 @@ mod tests {
     fn joined_event_clears_picking_and_armed_reply() {
         let mut app = app();
         app.picking_reply = Some(1);
+        app.picking_thread = Some(3);
         app.replying_to = Some(2);
 
         app.handle_net_event(NetEvent::Joined("project-x".to_string()));
 
         assert!(app.picking_reply.is_none());
+        assert!(app.picking_thread.is_none());
         assert!(app.replying_to.is_none());
     }
 
@@ -3676,6 +3867,177 @@ mod tests {
             _ => panic!("expected InputAction::Send"),
         }
         assert!(app.replying_to.is_none());
+    }
+
+    #[test]
+    fn thread_command_opens_the_newest_messages_chain() {
+        let mut app = app();
+        app.load_history(
+            "general",
+            vec![
+                dated_message(100, 1, PEER_ID, "root"),
+                reply_message(200, 2, SELF_ID, "reply", 1),
+            ],
+        );
+
+        let action = submit(&mut app, "/thread");
+
+        assert!(action.is_none());
+        let thread = app
+            .active()
+            .thread
+            .as_ref()
+            .expect("thread view must be active");
+        assert_eq!(
+            thread.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            thread.origin.id, 2,
+            "a bare /thread targets the newest visible message"
+        );
+    }
+
+    #[test]
+    fn thread_command_reports_when_there_are_no_messages() {
+        let mut app = app();
+        let action = submit(&mut app, "/thread");
+        assert!(action.is_none());
+        assert!(app.active().thread.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "no messages to view a thread for");
+    }
+
+    #[test]
+    fn thread_command_closes_an_active_thread_view() {
+        let mut app = app();
+        app.load_history("general", vec![dated_message(100, 1, PEER_ID, "root")]);
+        submit(&mut app, "/thread");
+        assert!(app.active().thread.is_some());
+
+        let action = submit(&mut app, "/thread");
+
+        assert!(action.is_none());
+        assert!(app.active().thread.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "thread view closed");
+    }
+
+    #[test]
+    fn esc_closes_an_active_thread_view_without_quitting() {
+        let mut app = app();
+        app.load_history("general", vec![dated_message(100, 1, PEER_ID, "root")]);
+        submit(&mut app, "/thread");
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.active().thread.is_none());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_t_pick_then_enter_opens_the_picked_messages_thread() {
+        let mut app = app();
+        app.load_history(
+            "general",
+            vec![
+                dated_message(100, 1, PEER_ID, "first"),
+                dated_message(200, 2, PEER_ID, "second"),
+            ],
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.picking_thread,
+            Some(2),
+            "Ctrl+T starts on the newest message"
+        );
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.picking_thread.is_none());
+        let thread = app
+            .active()
+            .thread
+            .as_ref()
+            .expect("thread view must be active");
+        assert_eq!(thread.origin.id, 1);
+    }
+
+    #[test]
+    fn esc_while_thread_picking_cancels_without_opening_a_thread() {
+        let mut app = app();
+        app.load_history("general", vec![dated_message(100, 1, PEER_ID, "hi")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.picking_thread.is_none());
+        assert!(app.active().thread.is_none());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn opening_a_thread_clears_an_active_search() {
+        let mut app = app();
+        app.load_history(
+            "general",
+            vec![
+                dated_message(100, 1, PEER_ID, "hello world"),
+                dated_message(200, 2, PEER_ID, "unrelated"),
+            ],
+        );
+        submit(&mut app, "/search hello");
+        assert!(app.active().search.is_some());
+
+        submit(&mut app, "/thread");
+
+        assert!(app.active().search.is_none());
+        assert!(app.active().thread.is_some());
+    }
+
+    #[test]
+    fn starting_a_search_clears_an_active_thread() {
+        let mut app = app();
+        app.load_history(
+            "general",
+            vec![dated_message(100, 1, PEER_ID, "hello world")],
+        );
+        submit(&mut app, "/thread");
+        assert!(app.active().thread.is_some());
+
+        submit(&mut app, "/search hello");
+
+        assert!(app.active().thread.is_none());
+        assert!(app.active().search.is_some());
+    }
+
+    #[test]
+    fn thread_excludes_a_sibling_reply_to_the_same_parent() {
+        let mut app = app();
+        app.load_history(
+            "general",
+            vec![
+                dated_message(100, 1, PEER_ID, "parent"),
+                reply_message(200, 2, PEER_ID, "origin", 1),
+                reply_message(300, 3, PEER_ID, "sibling", 1),
+            ],
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Up)); // move highlight from id 3 to id 2
+        app.handle_key(key(KeyCode::Enter));
+
+        let thread = app
+            .active()
+            .thread
+            .as_ref()
+            .expect("thread view must be active");
+        assert_eq!(
+            thread.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "a sibling reply to the same parent must not be pulled in"
+        );
     }
 
     #[test]

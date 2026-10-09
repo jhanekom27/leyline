@@ -11,6 +11,7 @@ mod net;
 mod search;
 mod settings;
 mod storage;
+mod thread;
 mod ticket;
 mod ui;
 mod version;
