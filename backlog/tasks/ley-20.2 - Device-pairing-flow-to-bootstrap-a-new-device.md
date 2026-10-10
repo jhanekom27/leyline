@@ -29,6 +29,17 @@ Device certificates (see the user-key task) let peers recognize that two Endpoin
 - [x] #4 A pairing ticket that is malformed or already used is rejected with an explanatory message, mirroring existing invite ticket error handling
 <!-- AC:END -->
 
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Add `PairingTicket { addr: EndpointAddr, secret: [u8;32] }` to ticket.rs (KIND = "leyline-pair"), mirroring ChannelTicket.
+2. New pairing.rs: PAIRING_ALPN constant, PairingPayload{user_key: [u8;32], channels}, PairingProtocol (ProtocolHandler impl holding a one-time Mutex<Option<PendingPairing>> with a 5-minute TTL), create_ticket/consume, the client-side redeem() over a direct QUIC connection, and bootstrap() which redeems a ticket and seeds a ChannelRegistry + persists the received user key via identity::persist. bootstrap() refuses to run if a user_key file already exists.
+3. net.rs: Net holds an Arc<PairingProtocol> (registered on the Router under PAIRING_ALPN, mirroring how gossip is both registered and kept as a field) plus user_key_bytes; new create_pairing_ticket() for the live /pair command.
+4. main.rs: parse_join_arg generalized into parse_args returning {join, pair} (mutually exclusive); if --pair is given, call pairing::bootstrap before loading/generating the user key, so the normal startup path picks up the seeded registry and user key transparently. New channel_snapshot() helper shared between startup known_channels and /pair ticket creation.
+5. app.rs: new InputAction::Pair + /pair (no-arg) command mirroring /invite; a /pair with an argument reports usage pointing at --pair instead.
+6. Tests: PairingTicket round trip + cross-type rejection in ticket.rs; PairingProtocol one-time-use/expiry-adjacent unit tests plus two real end-to-end tests in pairing.rs that bind real loopback Endpoints/Router and redeem over an actual QUIC connection; /pair command tests in app.rs.
+<!-- SECTION:PLAN:END -->
+
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
@@ -37,6 +48,8 @@ Implemented: PairingTicket (ticket.rs, KIND="leyline-pair") carries only an Endp
 Verification: cargo build clean, cargo test -- 407 passed/0 failed (13 new: 5 PairingTicket tests in ticket.rs, 7 PairingProtocol tests + 2 real end-to-end tests in pairing.rs, 2 /pair command tests in app.rs -- note two of those were real loopback-networking integration tests, not just in-memory unit tests: redeem_over_a_real_connection_returns_the_exact_payload spins up a real Endpoint+Router+PairingProtocol and a real client Endpoint and redeems over an actual QUIC connection; redeeming_the_same_real_ticket_twice_fails_the_second_time proves one-time-use holds over the real protocol, not just PairingProtocol:: consume in isolation). cargo clippy --all-targets clean. cargo fmt clean for every file touched (same two pre-existing, untouched-by-this-change fmt diffs in dm_registry.rs/net.rs::join noted in LEY-20.1 remain, left alone).
 
 Scope note for AC objectivity: the real end-to-end tests above directly prove the wire protocol and one-time-use semantics (ACs 1, 2, and the "already used" half of AC 4) against a real connection, not just mocked state. The malformed-ticket half of AC 4 is proven by pairing_ticket_rejects_garbage_input. Full AC 3 (new device auto-joins every channel after a real --pair invocation against a running leyline instance, across two separate data directories) will be confirmed in the cross-device manual verification step covering all three LEY-20.x branches together, since that requires the full CLI/TUI, not just the protocol module -- bootstrap() itself calls ChannelRegistry::record_channel/record_peer, whose own insertion logic is already covered by channel_registry.rs tests unchanged.
+
+Recording this plan retroactively -- implementation for LEY-20.2 was already completed and partially finalized before this step was recorded; see the implementation-notes entry below for what was actually built and verified.
 
 Live two-device verification (two isolated leyline instances, separate fake HOME dirs, real QUIC/relay networking, no shared third peer): started device-a fresh, ran /pair, redeemed the ticket via --pair on device-b. Device-b came up already showing #general as a joined tab with no /join needed (AC3). Found and fixed a real gap this surfaced: create_pairing_ticket's channel snapshot only carries previously-learned bootstrap peers (crate::channel_registry::bootstrap_for), which is empty for any channel nobody else has joined yet -- the normal case for a device's first-ever pairing. Without a bootstrap address, the redeeming device subscribes to the right gossip topic but has nothing to dial, so the two devices never actually connected (confirmed: 0 peers after 50+s, zero NeighborUp events in either leyline.log). Fixed by having create_pairing_ticket append the pairing device's own current address to every channel's bootstrap list (including _devices), mirroring announce_channel_joined's existing reasoning. After the fix, both devices showed #general -> 1 peer(s) within ~20s and /who confirmed mutual visibility. Amended into this branch's commit; cargo build/test(424)/clippy clean.
 <!-- SECTION:NOTES:END -->

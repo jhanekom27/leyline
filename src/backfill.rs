@@ -443,4 +443,68 @@ mod tests {
 
         assert_eq!(first, second, "identical bytes must hash identically");
     }
+
+    /// Regression test for the multi-device identity story (LEY-20):
+    /// `/save` always fetches a file by dialing the *sender's* EndpointId
+    /// directly (see `net::Net::save_file`), never from "the channel" at
+    /// large, so sending from one device and saving from another is really
+    /// just this -- a different device's `BackfillStore` fetching from the
+    /// sender's real, running endpoint over loopback, not merely one
+    /// store's own round trip (the other tests in this file never involve
+    /// a second store or any real networking).
+    #[tokio::test]
+    async fn fetch_file_retrieves_a_file_from_a_different_devices_backfill_store() {
+        use iroh::Endpoint;
+        use iroh::address_lookup::memory::MemoryLookup;
+        use iroh::endpoint::presets;
+        use iroh::protocol::Router;
+
+        let sender_dir = tempfile::tempdir().unwrap();
+        let sender_store = BackfillStore::new(sender_dir.path()).await.unwrap();
+        let sender_endpoint = Endpoint::bind(presets::Minimal).await.unwrap();
+        let sender_id = sender_endpoint.id();
+        let sender_addr = sender_endpoint.addr();
+        let sender_router = Router::builder(sender_endpoint)
+            .accept(iroh_blobs::ALPN, sender_store.protocol_handler())
+            .spawn();
+
+        let file_dir = tempfile::tempdir().unwrap();
+        let file_path = file_dir.path().join("report.txt");
+        std::fs::write(&file_path, b"shared across devices").unwrap();
+        let hash = sender_store.add_file(&file_path).await.unwrap();
+
+        // The receiving device: a separate store, a separate endpoint, and
+        // (mirroring net.rs's own `MemoryLookup` pre-seeding for a ticket's
+        // address hints) the sender's address seeded ahead of time, so
+        // `fetch_file`'s dial-by-bare-EndpointId has somewhere real to go
+        // without depending on public discovery infrastructure in a test.
+        let receiver_dir = tempfile::tempdir().unwrap();
+        let receiver_store = BackfillStore::new(receiver_dir.path()).await.unwrap();
+        let address_lookup = MemoryLookup::new();
+        address_lookup.add_endpoint_info(sender_addr);
+        let receiver_endpoint = Endpoint::builder(presets::Minimal)
+            .address_lookup(address_lookup)
+            .bind()
+            .await
+            .unwrap();
+
+        let destination = file_dir.path().join("downloaded.txt");
+        receiver_store
+            .fetch_file(
+                &receiver_endpoint,
+                hash,
+                *sender_id.as_bytes(),
+                &destination,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"shared across devices"
+        );
+
+        receiver_endpoint.close().await;
+        sender_router.shutdown().await.unwrap();
+    }
 }

@@ -39,6 +39,23 @@ impl RoomSecret {
         Self(rand::random())
     }
 
+    /// Deterministically derives a `RoomSecret` from a shared user key's
+    /// raw bytes, for the one channel that is an exception to "always
+    /// random": the private per-user device-sync channel
+    /// (`net::DEVICE_SYNC_CHANNEL`). Every device holding the same user
+    /// key computes the identical secret this way, so that channel needs
+    /// no ticket or transfer of its own -- unlike every other channel,
+    /// whose secret is generated once and only ever travels inside a
+    /// `ChannelTicket`. Mirrors `net::topic_for_secret`'s own
+    /// domain-separated-hash approach, just one level up (deriving a
+    /// secret instead of a topic).
+    pub fn derive_from_user_key(user_key_bytes: &[u8; 32]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"leyline-device-sync:");
+        hasher.update(user_key_bytes);
+        Self(*hasher.finalize().as_bytes())
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -243,6 +260,22 @@ mod tests {
     fn a_pairing_ticket_is_not_mistaken_for_a_channel_ticket() {
         let pairing_ticket = sample_pairing_ticket().encode_string();
         assert!(ChannelTicket::decode_string(&pairing_ticket).is_err());
+    }
+
+    #[test]
+    fn derive_from_user_key_is_deterministic_for_the_same_key() {
+        let user_key = [3; 32];
+        assert_eq!(
+            RoomSecret::derive_from_user_key(&user_key),
+            RoomSecret::derive_from_user_key(&user_key)
+        );
+    }
+
+    #[test]
+    fn derive_from_user_key_differs_for_different_keys() {
+        let a = RoomSecret::derive_from_user_key(&[3; 32]);
+        let b = RoomSecret::derive_from_user_key(&[4; 32]);
+        assert_ne!(a, b);
     }
 
     #[test]

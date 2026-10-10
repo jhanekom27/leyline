@@ -4,6 +4,7 @@ mod channel_registry;
 mod contacts;
 mod dm_registry;
 mod files;
+mod forgotten_devices;
 mod hyperlink;
 mod identity;
 mod markdown;
@@ -44,7 +45,8 @@ use channel_registry::ChannelRegistry;
 use contacts::Contacts;
 use dm_registry::DmRegistry;
 use files::{downloads_dir, resolve_destination};
-use net::{Net, NetEvent};
+use forgotten_devices::ForgottenDevices;
+use net::{DEVICE_SYNC_CHANNEL, Net, NetEvent};
 use search::{SearchOutcome, run_on_disk_scan};
 use settings::Settings;
 use storage::MessageStore;
@@ -76,6 +78,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize DM registry")?;
     let settings = Settings::load(dirs.data_dir().join("settings"))
         .context("failed to initialize settings")?;
+    let forgotten_devices = ForgottenDevices::load(dirs.data_dir().join("forgotten_devices"))
+        .context("failed to initialize forgotten devices")?;
 
     let secret_key = identity::load_or_generate(&dirs.config_dir().join("identity"))
         .context("failed to load or generate identity")?;
@@ -124,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
         contacts,
         dm_registry,
         settings,
+        forgotten_devices,
         data_dir,
     };
 
@@ -239,6 +244,7 @@ struct Session {
     contacts: Contacts,
     dm_registry: DmRegistry,
     settings: Settings,
+    forgotten_devices: ForgottenDevices,
     /// leyline's own data directory (`dirs.data_dir()`), needed so a
     /// `/save` with no resolvable OS Downloads folder still has somewhere
     /// to fall back to -- see `files::downloads_dir`.
@@ -308,6 +314,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
         mut contacts,
         mut dm_registry,
         mut settings,
+        mut forgotten_devices,
         data_dir,
     } = session;
 
@@ -315,6 +322,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
     app.load_contacts(contacts.all());
     app.load_settings(settings.bell_enabled());
     app.load_dm_registry(dm_registry.all());
+    app.load_forgotten_devices(forgotten_devices.all());
     for name in &joined_channels {
         // Ensures a brand-new channel ("general" on a first run, or a
         // `--join` ticket's channel) lands in the registry, so it's
@@ -337,6 +345,18 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
             }
             Err(err) => warn!(channel = %name, "failed to load message history: {err}"),
         }
+    }
+
+    // `DEVICE_SYNC_CHANNEL` is deliberately excluded from `joined_channels`
+    // (see `net::Net::start`), since it must never become a visible tab --
+    // but it still needs its own registry entry so `PeerAddressLearned`
+    // events for it (handled in the match below, the same as for any other
+    // channel) can accumulate bootstrap peers for a faster reconnect next
+    // restart, exactly like every ordinary channel already does.
+    if let Some(secret) = net.secret_for(DEVICE_SYNC_CHANNEL)
+        && let Err(err) = registry.record_channel(DEVICE_SYNC_CHANNEL, secret)
+    {
+        warn!("failed to persist device-sync channel: {err}");
     }
 
     // `None` if no clipboard is available (e.g. a headless SSH session) --
@@ -421,6 +441,11 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                             Some(InputAction::Alias(id, name)) => {
                                 if let Err(err) = contacts.set(id, name) {
                                     warn!("failed to persist pet name: {err}");
+                                }
+                            }
+                            Some(InputAction::ForgetDevice(id)) => {
+                                if let Err(err) = forgotten_devices.forget(id) {
+                                    warn!("failed to persist forgotten device: {err}");
                                 }
                             }
                             Some(InputAction::Nick(name)) => {
@@ -520,14 +545,26 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                 let joined_name = match &net_event {
                     NetEvent::Joined(name) => Some(name.as_str()),
                     NetEvent::DmJoined { channel, .. } => Some(channel.as_str()),
+                    NetEvent::ChannelSyncJoined(name) => Some(name.as_str()),
                     _ => None,
                 };
                 if let Some(name) = joined_name {
                     let secret = net
                         .secret_for(name)
                         .expect("just-joined channel must have a recorded secret");
+                    let is_new = !registry.channel_names().iter().any(|known| known == name);
                     if let Err(err) = registry.record_channel(name, secret) {
                         warn!(channel = %name, "failed to persist joined channel: {err}");
+                    } else if is_new && !matches!(&net_event, NetEvent::ChannelSyncJoined(_)) {
+                        // Tell our other devices too, over the private
+                        // device-sync channel (see `Net::
+                        // announce_channel_joined`) -- but never for a
+                        // `ChannelSyncJoined` itself, which is how we
+                        // learned about a channel from a sibling device in
+                        // the first place; broadcasting it right back would
+                        // just echo between devices instead of propagating
+                        // anything new.
+                        net.announce_channel_joined(name);
                     }
                 }
 
@@ -586,6 +623,21 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                     NetEvent::PeerAddressLearned(channel, addr) => {
                         if let Err(err) = registry.record_peer(&channel, addr) {
                             warn!(%channel, "failed to persist known peer address: {err}");
+                        }
+                    }
+                    // A sibling device announced joining a channel -- see
+                    // `crate::message::ChannelSyncAnnounce`. Ignored
+                    // outright if the sender is a locally forgotten device
+                    // (see `crate::forgotten_devices` and `/forget-device`);
+                    // otherwise handed to `Net::sync_channel`, which
+                    // double-checks it actually arrived on
+                    // `DEVICE_SYNC_CHANNEL` before acting on it. A
+                    // successful join reports back as
+                    // `NetEvent::ChannelSyncJoined`, handled like any other
+                    // `Joined`-shaped event above and below.
+                    NetEvent::ChannelSync(tag, announce) => {
+                        if !forgotten_devices.is_forgotten(&announce.sender) {
+                            net.sync_channel(&tag, announce);
                         }
                     }
                     // A `/send`ed file failed to import -- see

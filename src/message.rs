@@ -2,8 +2,10 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use iroh::{PublicKey, SecretKey, Signature};
+use iroh::{EndpointAddr, PublicKey, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
+
+use crate::ticket::RoomSecret;
 
 /// A single chat message, as it travels over the wire and is stored locally.
 ///
@@ -161,6 +163,9 @@ pub enum GossipPayload {
     Version(VersionAnnounce),
     /// A device-to-user binding -- see `DeviceCert`.
     Device(DeviceCert),
+    /// Another of our own devices announcing it joined a channel -- see
+    /// `ChannelSyncAnnounce`.
+    ChannelJoined(ChannelSyncAnnounce),
 }
 
 /// Flooded to the whole channel whenever a channel gains a gossip neighbor
@@ -282,6 +287,34 @@ impl DeviceCert {
         postcard::to_stdvec(&(device_id, user_id, issued_at_unix_ms))
             .expect("postcard serialization is infallible")
     }
+}
+
+/// Broadcast only on the private per-user device-sync channel
+/// (`net::DEVICE_SYNC_CHANNEL`) whenever a device joins a channel its
+/// sibling devices might not know about yet, so they can auto-join it too
+/// -- see `net::Net::sync_channel`/`announce_channel_joined` and
+/// concept.md's "Identity & channels". Never meaningful on any other
+/// channel: acting on one received elsewhere would let an unrelated peer
+/// direct this device to join arbitrary channels, so `net::forward_events`
+/// tags every `NetEvent` with the channel it actually arrived on, and
+/// `Net::sync_channel` refuses to act unless that tag is
+/// `DEVICE_SYNC_CHANNEL`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelSyncAnnounce {
+    /// The announcing device's own EndpointId -- checked against our own
+    /// id (so we don't try to rejoin a channel we just announced
+    /// ourselves) and against any locally forgotten device ids (see
+    /// `crate::forgotten_devices`) before ever being acted on.
+    pub sender: [u8; 32],
+    /// The joined channel's display name.
+    pub name: String,
+    /// The joined channel's room secret -- lets a sibling device join
+    /// directly, with no ticket exchange of its own.
+    pub secret: RoomSecret,
+    /// Address hints for reaching the channel's mesh, so a sibling device
+    /// has something concrete to bootstrap from. Always includes at least
+    /// the announcing device's own address (see `announce_channel_joined`).
+    pub peers: Vec<EndpointAddr>,
 }
 
 #[cfg(test)]
@@ -527,5 +560,31 @@ mod tests {
         .unwrap();
         let decoded: GossipPayload = postcard::from_bytes(&device_bytes).unwrap();
         assert!(matches!(decoded, GossipPayload::Device(_)));
+    }
+
+    fn sample_channel_sync_announce() -> ChannelSyncAnnounce {
+        ChannelSyncAnnounce {
+            sender: [5; 32],
+            name: "project-x".to_string(),
+            secret: crate::ticket::RoomSecret::generate(),
+            peers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn channel_joined_payload_round_trips_through_postcard() {
+        let payload = GossipPayload::ChannelJoined(sample_channel_sync_announce());
+        let bytes = postcard::to_stdvec(&payload).unwrap();
+        let decoded: GossipPayload = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn chat_and_channel_joined_payloads_are_distinguishable() {
+        let bytes =
+            postcard::to_stdvec(&GossipPayload::ChannelJoined(sample_channel_sync_announce()))
+                .unwrap();
+        let decoded: GossipPayload = postcard::from_bytes(&bytes).unwrap();
+        assert!(matches!(decoded, GossipPayload::ChannelJoined(_)));
     }
 }

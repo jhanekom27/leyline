@@ -32,8 +32,8 @@ use tracing::{debug, info, warn};
 
 use crate::backfill::BackfillStore;
 use crate::message::{
-    ChatMessage, DeviceCert, FileAttachment, GossipPayload, HistoryAnnounce, IdentityAnnounce,
-    VersionAnnounce, now_unix_ms,
+    ChannelSyncAnnounce, ChatMessage, DeviceCert, FileAttachment, GossipPayload, HistoryAnnounce,
+    IdentityAnnounce, VersionAnnounce, now_unix_ms,
 };
 use crate::pairing::{self, PairingProtocol};
 use crate::ticket::{ChannelTicket, PairingTicket, RoomSecret};
@@ -47,6 +47,26 @@ const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
 
 /// The channel every instance joins on startup.
 const DEFAULT_CHANNEL: &str = "general";
+
+/// A private, per-user channel every device belonging to the same person
+/// auto-joins (see `Net::start`), used only to broadcast
+/// `crate::message::ChannelSyncAnnounce`s so sibling devices learn about a
+/// newly-joined channel without needing to be re-paired -- see
+/// `Net::sync_channel`/`announce_channel_joined` and concept.md's
+/// "Identity & channels". Its `RoomSecret` is derived from the shared user
+/// key (`RoomSecret::derive_from_user_key`), never generated or carried in
+/// a ticket, so nothing needs to be transferred for every device to land
+/// on the same topic.
+///
+/// Reserved and deliberately *not* an ordinary channel from the UI's
+/// perspective: it is excluded from the `joined` list `Net::start`
+/// returns, so it never becomes an `AppState` tab, is never printed as an
+/// `/invite`-able ticket, and `Net::join` refuses to (re)join it by name
+/// -- see each of those for why. A leaked ticket for it would let anyone
+/// who redeemed it feed this device fabricated `ChannelSyncAnnounce`s, so
+/// `Net::sync_channel` double-checks that one actually arrived on this
+/// exact channel before ever acting on it.
+pub const DEVICE_SYNC_CHANNEL: &str = "_devices";
 
 /// How many times to retry joining a channel's bootstrap peer, and how long
 /// to wait between attempts.
@@ -109,6 +129,19 @@ pub enum NetEvent {
     /// Already verified (`DeviceCert::is_valid`) by the time this is
     /// emitted -- see `forward_events` -- so `app.rs` never has to.
     Device(String, DeviceCert),
+    /// A sibling device announced joining a channel -- see
+    /// `crate::message::ChannelSyncAnnounce`. Tagged with the channel this
+    /// arrived on (like every other `NetEvent`) so `Net::sync_channel` can
+    /// refuse to act on one that did not actually arrive on
+    /// `DEVICE_SYNC_CHANNEL`.
+    ChannelSync(String, ChannelSyncAnnounce),
+    /// A channel learned via `DEVICE_SYNC_CHANNEL` finished subscribing --
+    /// see `Net::join_known`. Deliberately distinct from `Joined`/
+    /// `DmJoined`: both of those switch the active tab, since a user
+    /// explicitly asked to go there, but a sibling device auto-joining a
+    /// channel in the background must not yank focus away from whatever
+    /// this device's user is actually looking at.
+    ChannelSyncJoined(String),
     /// A history backfill fetch finished and decoded some messages, ready
     /// to be deduped, persisted, and merged into the transcript.
     HistoryFetched(String, Vec<ChatMessage>),
@@ -463,7 +496,7 @@ impl Net {
         joined.push(DEFAULT_CHANNEL.to_string());
 
         for (name, secret, addrs) in &known_channels {
-            if name.as_str() == DEFAULT_CHANNEL {
+            if name.as_str() == DEFAULT_CHANNEL || name.as_str() == DEVICE_SYNC_CHANNEL {
                 continue;
             }
             let mut bootstrap = addrs.clone();
@@ -475,6 +508,29 @@ impl Net {
                 .with_context(|| format!("failed to rejoin channel {name:?}"))?;
             joined.push(name.clone());
         }
+
+        // Every device also joins its own private device-sync channel
+        // (see `DEVICE_SYNC_CHANNEL`'s doc comment): its secret is always
+        // derived from the shared user key, never looked up or generated,
+        // and it is deliberately left out of `joined` so it never becomes
+        // a visible tab or an `/invite`-able ticket below. Bootstrap peers
+        // are still reused from a previous session exactly like any other
+        // channel, so reconnecting to sibling devices gets faster over
+        // time (see main.rs, which records learned peers for it the same
+        // way it does for every other channel).
+        let device_sync_secret = RoomSecret::derive_from_user_key(&user_key_bytes);
+        let device_sync_bootstrap = known_channels
+            .iter()
+            .find(|(name, _, _)| name.as_str() == DEVICE_SYNC_CHANNEL)
+            .map(|(_, _, addrs)| addrs.clone())
+            .unwrap_or_default();
+        net.subscribe_and_register(
+            DEVICE_SYNC_CHANNEL,
+            device_sync_secret,
+            device_sync_bootstrap,
+        )
+        .await
+        .context("failed to join device-sync channel")?;
 
         let active = match &ticket {
             Some(t) if !joined.contains(&t.name) => {
@@ -595,6 +651,11 @@ impl Net {
         if name.is_empty() {
             return None;
         }
+        if name == DEVICE_SYNC_CHANNEL {
+            return Some(format!(
+                "#{DEVICE_SYNC_CHANNEL} is reserved for syncing your own paired devices and can't be joined directly"
+            ));
+        }
 
         let existing_secret = self
             .channels
@@ -690,6 +751,76 @@ impl Net {
         });
 
         message
+    }
+
+    /// Joins `name` using an already-known `secret` and `bootstrap` peer
+    /// addresses learned from a `crate::message::ChannelSyncAnnounce`
+    /// (`sync_channel`), rather than typed by the user or carried in a
+    /// ticket. Mirrors `join`'s spawn-then-report shape for a brand-new
+    /// channel, but skips ticket parsing, self-reference messaging, and
+    /// DM bookkeeping entirely, since none of that applies here -- just
+    /// filters out any bootstrap address naming our own id, the same
+    /// reason `join` does. Reports success as `NetEvent::ChannelSyncJoined`
+    /// rather than `Joined`, so the caller can add a background tab
+    /// without switching to it (see that variant's doc comment). A no-op
+    /// if `name` is already joined, matching `join`'s own idempotent
+    /// re-join behavior.
+    pub fn join_known(&self, name: String, secret: RoomSecret, bootstrap: Vec<EndpointAddr>) {
+        if self
+            .channels
+            .lock()
+            .expect("channels lock poisoned")
+            .contains_key(&name)
+        {
+            return;
+        }
+        let bootstrap: Vec<EndpointAddr> = bootstrap
+            .into_iter()
+            .filter(|addr| !is_self(addr, self.our_id))
+            .collect();
+
+        let topic = topic_for_secret(&secret);
+        let gossip = self.gossip.clone();
+        let address_lookup = self.address_lookup.clone();
+        let channels = Arc::clone(&self.channels);
+        let events_tx = self.events_tx.clone();
+        let endpoint = self.router.endpoint().clone();
+        tokio::spawn(async move {
+            for addr in &bootstrap {
+                address_lookup.add_endpoint_info(addr.clone());
+            }
+            let bootstrap_ids: Vec<EndpointId> = bootstrap.iter().map(|addr| addr.id).collect();
+
+            match gossip.subscribe(topic, bootstrap_ids.clone()).await {
+                Ok(topic_handle) => {
+                    let (sender, receiver) = topic_handle.split();
+                    let mut tasks = Vec::new();
+                    if !bootstrap_ids.is_empty() {
+                        tasks.push(tokio::spawn(retry_join(sender.clone(), bootstrap_ids)));
+                    }
+                    tasks.push(tokio::spawn(forward_events(
+                        name.clone(),
+                        receiver,
+                        events_tx.clone(),
+                        endpoint,
+                    )));
+                    channels.lock().expect("channels lock poisoned").insert(
+                        name.clone(),
+                        JoinedChannel {
+                            secret,
+                            sender,
+                            tasks,
+                        },
+                    );
+                    let _ = events_tx.send(NetEvent::ChannelSyncJoined(name)).await;
+                }
+                Err(err) => {
+                    let _ = events_tx
+                        .send(NetEvent::JoinFailed(name, err.to_string()))
+                        .await;
+                }
+            }
+        });
     }
 
     /// Leaves a previously joined channel: drops its gossip subscription
@@ -902,6 +1033,52 @@ impl Net {
         });
     }
 
+    /// Announces (over `DEVICE_SYNC_CHANNEL` only) that we just joined
+    /// `name`, so sibling devices learn about it too -- see
+    /// `crate::message::ChannelSyncAnnounce` and `sync_channel`. Includes
+    /// our own address as a bootstrap peer, so a sibling has an immediate,
+    /// concrete way to reach the new channel's mesh instead of only a bare
+    /// topic id. Uses a full-mesh `broadcast`, like `announce`/`send` --
+    /// this is a one-shot event, never re-sent on a later `NeighborUp` the
+    /// way `announce_nickname`/`announce_version`/`announce_device` are,
+    /// so it needs the stronger delivery guarantee to reach every current
+    /// member reliably. A no-op if `name` or `DEVICE_SYNC_CHANNEL` itself
+    /// isn't actually joined (both should be impossible by the time this
+    /// is called, but this avoids a panic if that assumption is ever
+    /// broken).
+    pub fn announce_channel_joined(&self, name: &str) {
+        let Some(secret) = self.secret_for(name) else {
+            return;
+        };
+        let Some(sender) = self
+            .channels
+            .lock()
+            .expect("channels lock poisoned")
+            .get(DEVICE_SYNC_CHANNEL)
+            .map(|c| c.sender.clone())
+        else {
+            return;
+        };
+        let payload = GossipPayload::ChannelJoined(ChannelSyncAnnounce {
+            sender: self.our_id,
+            name: name.to_string(),
+            secret,
+            peers: vec![self.router.endpoint().addr()],
+        });
+        tokio::spawn(async move {
+            let bytes = match postcard::to_stdvec(&payload) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    warn!("failed to encode channel-sync announce: {err}");
+                    return;
+                }
+            };
+            if let Err(err) = sender.broadcast(bytes.into()).await {
+                warn!("failed to broadcast channel-sync announce: {err}");
+            }
+        });
+    }
+
     /// Announces our device certificate (see `crate::message::DeviceCert`)
     /// to `channel`'s direct gossip neighbors -- called whenever a channel
     /// gains one, the same way `announce_nickname`/`announce_version` do.
@@ -966,6 +1143,21 @@ impl Net {
                 Err(err) => warn!(%channel, "failed to sync history: {err}"),
             }
         });
+    }
+
+    /// Reacts to a received `ChannelSyncAnnounce` (see `NetEvent::
+    /// ChannelSync`): if it actually arrived on `DEVICE_SYNC_CHANNEL` and
+    /// isn't an echo of our own announce, joins the named channel using
+    /// its already-known secret and peer addresses (`join_known`) rather
+    /// than generating a fresh one or needing a ticket. Ignores one that
+    /// arrived on any other channel -- see `DEVICE_SYNC_CHANNEL`'s doc
+    /// comment for why that check matters. Fire-and-forget, like
+    /// `sync_history`.
+    pub fn sync_channel(&self, channel: &str, announce: ChannelSyncAnnounce) {
+        if channel != DEVICE_SYNC_CHANNEL || announce.sender == self.our_id {
+            return;
+        }
+        self.join_known(announce.name, announce.secret, announce.peers);
     }
 
     /// Imports `path` into the shared blob store and prepares it to be
@@ -1339,6 +1531,9 @@ async fn forward_events(
                     Ok(GossipPayload::Device(_)) => {
                         warn!("dropping device certificate with an invalid signature");
                         continue;
+                    }
+                    Ok(GossipPayload::ChannelJoined(announce)) => {
+                        NetEvent::ChannelSync(channel.clone(), announce)
                     }
                     Err(err) => {
                         warn!("dropping malformed gossip message: {err}");

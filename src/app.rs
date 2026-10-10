@@ -13,7 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use iroh_blobs::Hash;
 
 use crate::message::{ChatMessage, now_unix_ms};
-use crate::net::NetEvent;
+use crate::net::{DEVICE_SYNC_CHANNEL, NetEvent};
 use crate::search::{self, SearchOutcome, SearchResults};
 use crate::thread::{self, ThreadView};
 use crate::version;
@@ -365,6 +365,11 @@ pub enum InputAction {
     /// `net::Net::create_pairing_ticket`) and report it back (via
     /// `AppState::push_system`) once built, mirroring `Invite`.
     Pair,
+    /// Stop trusting a specific device id, resolved from a typed
+    /// hex-prefix by `/forget-device` (see `run_command` and
+    /// `crate::forgotten_devices`). Unlike `Alias`, never canonicalized --
+    /// forgetting targets one specific device, not a whole person.
+    ForgetDevice([u8; 32]),
     /// Persist a local pet name for a specific endpoint id, resolved from
     /// a typed hex-prefix by `/alias` (see `run_command` and
     /// `crate::contacts`).
@@ -456,6 +461,14 @@ pub struct AppState {
     /// display identity. In-memory only, like `nicknames`/`peer_versions`:
     /// a peer re-announces their cert on every reconnect anyway.
     device_to_user: HashMap<[u8; 32], [u8; 32]>,
+    /// Device ids explicitly forgotten via `/forget-device` -- see
+    /// `crate::forgotten_devices`. Consulted by `canonical_id`, which
+    /// treats a forgotten device exactly as if no certificate were known
+    /// for it, so forgetting a device immediately stops it from being
+    /// grouped under its (former) canonical user id as well as from being
+    /// trusted for future device-sync announces (see main.rs). Local and
+    /// best-effort, not real revocation -- see that module's doc comment.
+    forgotten: HashSet<[u8; 32]>,
     /// Peer id -> local DM channel name, so `/msg` can tell whether a peer
     /// already has a private 1:1 channel to reuse -- see `run_msg` and
     /// `crate::dm_registry`. Seeded once at startup from
@@ -515,6 +528,7 @@ impl AppState {
             nicknames: HashMap::new(),
             peer_versions: HashMap::new(),
             device_to_user: HashMap::new(),
+            forgotten: HashSet::new(),
             dm_channels: HashMap::new(),
             picking_reply: None,
             picking_thread: None,
@@ -553,6 +567,14 @@ impl AppState {
     /// mirrors `load_contacts`.
     pub fn load_dm_registry(&mut self, dm_channels: HashMap<[u8; 32], String>) {
         self.dm_channels = dm_channels;
+    }
+
+    /// Seeds forgotten device ids persisted by the caller (see
+    /// `crate::forgotten_devices`). Intended to be called once, right
+    /// after `AppState::new`, before the event loop starts -- mirrors
+    /// `load_contacts`.
+    pub fn load_forgotten_devices(&mut self, forgotten: HashSet<[u8; 32]>) {
+        self.forgotten = forgotten;
     }
 
     /// Merges a batch of possibly-historical messages fetched via backfill
@@ -692,6 +714,20 @@ impl AppState {
             self.channels.push(Channel::new(name));
             self.active = self.channels.len() - 1;
             self.finish_activating_channel();
+        }
+    }
+
+    /// Adds `name` as a new, joined-but-inactive tab -- for a channel
+    /// learned via the private device-sync channel (see
+    /// `NetEvent::ChannelSyncJoined`), which should appear once actually
+    /// joined without yanking focus away from whatever the user is
+    /// currently looking at, unlike `activate_or_create_channel`'s
+    /// deliberate tab-switch for a user-initiated `/join`. A no-op if
+    /// `name` is already a tab (e.g. this device already knew about it
+    /// some other way).
+    fn add_background_channel(&mut self, name: String) {
+        if !self.channels.iter().any(|c| c.name == name) {
+            self.channels.push(Channel::new(name));
         }
     }
 
@@ -904,6 +940,21 @@ impl AppState {
                 self.push_system(format!("failed to join #{name}: {error}"));
                 None
             }
+            // A channel learned via the private device-sync channel
+            // finished subscribing -- see `net::NetEvent::ChannelSyncJoined`
+            // and `net::Net::join_known`. Adds a background tab rather
+            // than switching to it, unlike a plain `Joined`: the user
+            // never asked to go there, a sibling device just did.
+            NetEvent::ChannelSyncJoined(name) => {
+                self.add_background_channel(name);
+                None
+            }
+            // Raw `ChannelSync` announces are acted on by `net::Net::
+            // sync_channel` (called from main.rs), which reports back as
+            // `ChannelSyncJoined` above once (and if) the join actually
+            // succeeds -- nothing for app.rs to do with the raw announce
+            // itself.
+            NetEvent::ChannelSync(..) => None,
             // A peer's (re-)announced broadcast nickname -- see
             // features.md's "Broadcast nicknames". Simply overwrite
             // whatever we last had for `sender`'s resolved identity, so
@@ -1092,7 +1143,15 @@ impl AppState {
     /// through this first, so two of one person's devices collapse onto
     /// whichever single petname/nickname has been recorded for that
     /// person, instead of needing one recorded per device.
+    ///
+    /// A forgotten device (`/forget-device`, see `forgotten`) is always
+    /// treated as if no certificate were known for it, regardless of what
+    /// `device_to_user` still remembers -- forgetting takes effect
+    /// immediately, not just for future certificates.
     pub fn canonical_id(&self, id: &[u8; 32]) -> [u8; 32] {
+        if self.forgotten.contains(id) {
+            return *id;
+        }
         self.device_to_user.get(id).copied().unwrap_or(*id)
     }
 
@@ -1196,12 +1255,18 @@ impl AppState {
                 if arg.is_empty() {
                     self.push_system("usage: /join <channel-name-or-ticket>");
                     None
+                } else if arg == DEVICE_SYNC_CHANNEL {
+                    self.push_system(format!(
+                        "#{DEVICE_SYNC_CHANNEL} is reserved for syncing your own paired devices"
+                    ));
+                    None
                 } else {
                     Some(InputAction::Join(arg.to_string()))
                 }
             }
             "invite" => Some(InputAction::Invite(self.active().name.clone())),
             "pair" => self.run_pair(arg.trim()),
+            "forget-device" => self.run_forget_device(arg.trim()),
             "msg" => self.run_msg(arg.trim()),
             "alias" => self.run_alias(arg.trim()),
             "nick" => self.run_nick(arg.trim()),
@@ -1230,9 +1295,10 @@ impl AppState {
     /// detail actually lives.
     fn run_help(&mut self) -> Option<InputAction> {
         self.push_system(
-            "commands: /join <name|ticket>, /invite, /pair, /msg <alias|hex-prefix> [text], \
-             /leave [channel], /who, /send <path>, /save <hash-prefix>, /paste, \
-             /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
+            "commands: /join <name|ticket>, /invite, /pair, /forget-device <hex-prefix>, \
+             /msg <alias|hex-prefix> [text], /leave [channel], /who, /send <path>, \
+             /save <hash-prefix>, /paste, /alias <hex-prefix> <name>, /nick <name>, \
+             /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- keys: Tab/Shift+Tab switch channels, \
              Alt+Enter/Ctrl+J newline, Ctrl+V paste, Ctrl+R reply (\u{2191}/\u{2193} pick, \
              Enter confirm), Ctrl+T thread (\u{2191}/\u{2193} pick, Enter confirm), \
@@ -1318,6 +1384,34 @@ impl AppState {
             return None;
         }
         Some(InputAction::Pair)
+    }
+
+    /// Handles `/forget-device <hex-prefix>`: resolves the prefix via
+    /// `resolve_id` and, on success, immediately stops trusting that
+    /// device locally -- for instant UI feedback -- while returning an
+    /// `InputAction::ForgetDevice` for the caller to persist (see
+    /// `crate::forgotten_devices`). Deliberately operates on the literal
+    /// device id resolved, not its canonical user id (unlike `/alias`):
+    /// forgetting targets one specific device (e.g. a lost phone), not
+    /// every device belonging to that person. This is local and
+    /// best-effort, not real revocation -- see
+    /// `crate::forgotten_devices`'s doc comment.
+    fn run_forget_device(&mut self, arg: &str) -> Option<InputAction> {
+        if arg.is_empty() {
+            self.push_system("usage: /forget-device <hex-prefix>");
+            return None;
+        }
+        match self.resolve_id(arg) {
+            Ok(id) => {
+                self.forgotten.insert(id);
+                self.push_system(format!("forgot device {}", hex_id(&id)));
+                Some(InputAction::ForgetDevice(id))
+            }
+            Err(err) => {
+                self.push_system(err);
+                None
+            }
+        }
     }
 
     /// Handles `/nick <name>`: `arg` is everything after `/nick ` (already
@@ -2500,6 +2594,56 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_a_device_stops_it_from_being_grouped_under_its_canonical_id() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        let user_key = SecretKey::generate();
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID),
+        ));
+        assert_ne!(
+            app.canonical_id(&PEER_ID),
+            PEER_ID,
+            "sanity check: cert took effect"
+        );
+
+        submit(
+            &mut app,
+            &format!("/forget-device {}", &hex_id(&PEER_ID)[..8]),
+        );
+
+        assert_eq!(
+            app.canonical_id(&PEER_ID),
+            PEER_ID,
+            "a forgotten device must resolve to itself, ignoring any known certificate"
+        );
+    }
+
+    #[test]
+    fn forget_device_returns_the_action_with_the_resolved_id() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        let full_id = hex_id(&PEER_ID);
+
+        let action = submit(&mut app, &format!("/forget-device {}", &full_id[..8]));
+
+        match action.expect("a successful /forget-device returns an action") {
+            InputAction::ForgetDevice(id) => assert_eq!(id, PEER_ID),
+            _ => panic!("expected InputAction::ForgetDevice"),
+        }
+    }
+
+    #[test]
+    fn forget_device_reports_an_error_for_an_unknown_prefix() {
+        let mut app = app();
+        let action = submit(&mut app, "/forget-device ffffffff");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("no known peer"), "got: {last}");
+    }
+
+    #[test]
     fn nick_command_returns_action_and_pushes_system_notice() {
         let mut app = app();
         let action = submit(&mut app, "/nick Alice");
@@ -2900,6 +3044,15 @@ mod tests {
     }
 
     #[test]
+    fn slash_join_rejects_the_reserved_device_sync_channel_name() {
+        let mut app = app();
+        let action = submit(&mut app, "/join _devices");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("reserved"), "got: {last}");
+    }
+
+    #[test]
     fn unknown_command_shows_error_and_returns_none() {
         let mut app = app();
         for c in "/bogus".chars() {
@@ -3252,6 +3405,32 @@ mod tests {
             "must not duplicate an existing channel"
         );
         assert_eq!(app.active().name, "random");
+    }
+
+    #[test]
+    fn channel_sync_joined_adds_a_background_tab_without_switching_active() {
+        // Unlike a plain `Joined` (the user explicitly ran /join), a
+        // channel learned via the private device-sync channel must not
+        // yank focus away from whatever the user is currently looking at.
+        let mut app = app();
+        assert_eq!(app.active().name, "general");
+
+        app.handle_net_event(NetEvent::ChannelSyncJoined("project-x".to_string()));
+
+        assert_eq!(app.channels.len(), 2);
+        assert_eq!(
+            app.active().name,
+            "general",
+            "a background sync join must not switch the active tab"
+        );
+        assert!(app.channels.iter().any(|c| c.name == "project-x"));
+    }
+
+    #[test]
+    fn channel_sync_joined_on_an_already_known_channel_does_not_duplicate() {
+        let mut app = multi_channel_app();
+        app.handle_net_event(NetEvent::ChannelSyncJoined("random".to_string()));
+        assert_eq!(app.channels.len(), 2, "must not duplicate an existing tab");
     }
 
     #[test]
