@@ -4,6 +4,7 @@ mod channel_registry;
 mod contacts;
 mod dm_registry;
 mod files;
+mod hyperlink;
 mod identity;
 mod markdown;
 mod message;

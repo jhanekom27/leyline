@@ -14,6 +14,7 @@ use textwrap::wrap;
 
 use crate::app::{AppState, Channel, TranscriptLine, hex_id};
 use crate::files::human_size;
+use crate::hyperlink;
 use crate::markdown;
 use crate::message::ChatMessage;
 use crate::search::SearchResults;
@@ -243,13 +244,14 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
             None => format!("#{} · {} peer(s)", channel.name, channel.peers.len()),
         }
     };
-    let list = List::new(items).block(
-        Block::bordered()
-            .title(title)
-            .border_type(BorderType::Rounded),
-    );
+    let block = Block::bordered()
+        .title(title)
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+    let list = List::new(items).block(block);
     frame.render_widget(list, area);
     render_scroll_indicator(frame, area, start, total, visible_rows);
+    hyperlink::linkify(frame.buffer_mut(), inner);
 }
 
 /// Overlays a scroll-position thumb on the messages block's right border,
