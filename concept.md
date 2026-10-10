@@ -14,6 +14,18 @@ run, and use it; this document covers *why* it's built this way.
 - Peers found by pasting an invite ticket (endpoint id + room secret + address hints), not a directory service
 - Runs fully async on tokio
 
+## Decisions
+
+Significant, hard-to-reverse architectural choices are recorded as Backlog
+decision records (`backlog decision list`, under `backlog/decisions/`) rather
+than only described in prose here -- e.g.
+[no central server](backlog/decisions/decision-1%20-%20Pure-peer-to-peer-messaging-over-iroh-gossip-no-central-server.md)
+and
+[room privacy](backlog/decisions/decision-2%20-%20Room-privacy-via-capability-style-access-not-name-derived-topics-or-extra-encryption.md).
+More get added as they come up; `backlog decision create "title"` scaffolds a
+new one (fill in its Context/Decision/Consequences body by hand afterward --
+the CLI only manages the title/status/id metadata).
+
 ## Architecture at a glance
 
 ```
