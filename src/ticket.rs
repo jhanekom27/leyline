@@ -1,10 +1,13 @@
 //! Invite ticket encode/decode.
 //!
-//! A ticket bundles a channel's display name, its room secret, and one
-//! peer's address into a single string a friend can paste in to join --
-//! see concept.md's "Identity & channels" section. Built on the
-//! `iroh-tickets` crate's `Ticket` trait, which handles the base32 string
-//! round trip.
+//! A `ChannelTicket` bundles a channel's display name, its room secret,
+//! and one peer's address into a single string a friend can paste in to
+//! join -- see concept.md's "Identity & channels" section. A
+//! `PairingTicket` is a different, one-time credential for bootstrapping
+//! a brand-new device's whole identity instead -- see `pairing.rs`. Both
+//! are built on the `iroh-tickets` crate's `Ticket` trait, which handles
+//! the base32 string round trip and keeps the two from ever being
+//! confused for each other (distinguished by `Ticket::KIND`).
 
 use std::fmt;
 
@@ -115,6 +118,36 @@ impl ChannelTicketV1 {
     }
 }
 
+/// A one-time pairing invitation: an already-initialized device's address
+/// plus a short-lived secret, so a brand-new device can redeem it over a
+/// direct connection to receive the shared user key and every known
+/// channel -- see `pairing.rs`. Unlike `ChannelTicket`, this carries no
+/// room name or room secret of its own: `/pair`'s whole point is
+/// bootstrapping a new device's *identity*, before it has anything to
+/// join yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingTicket {
+    /// The already-initialized device's address, to dial over
+    /// `pairing::PAIRING_ALPN`.
+    pub addr: EndpointAddr,
+    /// One-time secret proving the redeemer was actually shown this
+    /// ticket -- checked and consumed by `pairing::PairingProtocol`, so a
+    /// copy of the ticket can't be redeemed a second time.
+    pub secret: [u8; 32],
+}
+
+impl Ticket for PairingTicket {
+    const KIND: &'static str = "leyline-pair";
+
+    fn encode_bytes(&self) -> Vec<u8> {
+        postcard::to_stdvec(self).expect("postcard serialization is infallible")
+    }
+
+    fn decode_bytes(bytes: &[u8]) -> Result<Self, ParseError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -177,6 +210,39 @@ mod tests {
         ticket.dm = true;
         let encoded = ticket.encode_string();
         assert_eq!(ChannelTicket::decode_string(&encoded).unwrap(), ticket);
+    }
+
+    fn sample_pairing_ticket() -> PairingTicket {
+        PairingTicket {
+            addr: sample_ticket().addr,
+            secret: rand::random(),
+        }
+    }
+
+    #[test]
+    fn pairing_ticket_round_trips_through_its_string_form() {
+        let ticket = sample_pairing_ticket();
+        let encoded = ticket.encode_string();
+        assert!(encoded.starts_with("leyline-pair"));
+        let decoded = PairingTicket::decode_string(&encoded).unwrap();
+        assert_eq!(ticket, decoded);
+    }
+
+    #[test]
+    fn pairing_ticket_rejects_garbage_input() {
+        assert!(PairingTicket::decode_string("not-a-ticket").is_err());
+    }
+
+    #[test]
+    fn a_channel_ticket_is_not_mistaken_for_a_pairing_ticket() {
+        let channel_ticket = sample_ticket().encode_string();
+        assert!(PairingTicket::decode_string(&channel_ticket).is_err());
+    }
+
+    #[test]
+    fn a_pairing_ticket_is_not_mistaken_for_a_channel_ticket() {
+        let pairing_ticket = sample_pairing_ticket().encode_string();
+        assert!(ChannelTicket::decode_string(&pairing_ticket).is_err());
     }
 
     #[test]

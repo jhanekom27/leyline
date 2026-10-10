@@ -35,7 +35,8 @@ use crate::message::{
     ChatMessage, DeviceCert, FileAttachment, GossipPayload, HistoryAnnounce, IdentityAnnounce,
     VersionAnnounce, now_unix_ms,
 };
-use crate::ticket::{ChannelTicket, RoomSecret};
+use crate::pairing::{self, PairingProtocol};
+use crate::ticket::{ChannelTicket, PairingTicket, RoomSecret};
 use crate::version;
 
 /// Simple guardrail against an accidental huge `/send` (e.g. a mistyped
@@ -301,6 +302,17 @@ pub struct Net {
     /// process; re-broadcast by `announce_device` the same way
     /// `nickname`/our build version already are.
     our_cert: DeviceCert,
+    /// The shared user key's raw bytes, handed to a new device that
+    /// redeems a pairing ticket (see `create_pairing_ticket` and
+    /// `pairing.rs`). Raw bytes rather than `iroh::SecretKey`, matching
+    /// how `identity.rs` already treats key material as plain bytes.
+    user_key_bytes: [u8; 32],
+    /// Registered on `router` under `pairing::PAIRING_ALPN`, and also kept
+    /// here so `create_pairing_ticket` can produce tickets against the
+    /// exact same pending-secret state the registered handler checks --
+    /// mirrors how `gossip` is both registered on `router` and kept as its
+    /// own field for later calls.
+    pairing: Arc<PairingProtocol>,
 }
 
 impl Net {
@@ -320,10 +332,13 @@ impl Net {
     /// broadcast nickname from the previous session's persisted value (see
     /// `crate::settings::Settings::nickname`), if any, so it's ready to
     /// re-announce (via `announce_nickname`) as soon as a channel gains a
-    /// neighbor, without needing `/nick` retyped first. Returns the names
-    /// of the channels joined, in join order, plus the name of the channel
-    /// that should start active (the `--join` ticket's channel, if one was
-    /// given and usable, else "general").
+    /// neighbor, without needing `/nick` retyped first. Also registers the
+    /// device-pairing protocol (`pairing::PairingProtocol`) on the same
+    /// router, so `create_pairing_ticket`/`/pair` can bootstrap a
+    /// brand-new device later. Returns the names of the channels joined,
+    /// in join order, plus the name of the channel that should start
+    /// active (the `--join` ticket's channel, if one was given and
+    /// usable, else "general").
     pub async fn start(
         secret_key: SecretKey,
         user_key: SecretKey,
@@ -376,12 +391,15 @@ impl Net {
         }
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
+        let pairing = Arc::new(PairingProtocol::new());
         let router = Router::builder(endpoint)
             .accept(GOSSIP_ALPN, gossip.clone())
             .accept(iroh_blobs::ALPN, backfill.protocol_handler())
+            .accept(pairing::PAIRING_ALPN, pairing.clone())
             .spawn();
 
         let our_cert = DeviceCert::new(our_id, &user_key, now_unix_ms());
+        let user_key_bytes = user_key.to_bytes();
 
         let net = Self {
             router,
@@ -393,6 +411,8 @@ impl Net {
             nickname: Mutex::new(nickname),
             our_id,
             our_cert,
+            user_key_bytes,
+            pairing,
         };
 
         // A ticket naming our own identity can't reach anyone -- an invite
@@ -1197,6 +1217,37 @@ impl Net {
                 }
             }
         });
+    }
+
+    /// Creates a one-time pairing ticket (see `pairing::PairingProtocol`
+    /// and `ticket::PairingTicket`) for `/pair` to show: this device's own
+    /// address, the shared user key, and `channels` -- a snapshot of every
+    /// currently-known channel, in the same shape `Net::start` accepts as
+    /// `known_channels` -- so a brand-new device that redeems it can seed
+    /// its own channel registry and join everything through the normal
+    /// startup path, exactly as if it had been running all along. Our own
+    /// address is appended to every channel's bootstrap list -- including
+    /// one with no previously-learned peers at all, the common case for a
+    /// channel nobody else has ever joined -- mirroring
+    /// `announce_channel_joined`'s same reasoning: without a concrete
+    /// address to dial, the redeeming device would have nothing but a bare
+    /// topic id for each channel and could never actually form a gossip
+    /// mesh with the very device it just paired with. Synchronous, like
+    /// `ticket_for`.
+    pub fn create_pairing_ticket(
+        &self,
+        channels: Vec<(String, RoomSecret, Vec<EndpointAddr>)>,
+    ) -> PairingTicket {
+        let our_addr = self.router.endpoint().addr();
+        let channels = channels
+            .into_iter()
+            .map(|(name, secret, mut peers)| {
+                peers.push(our_addr.clone());
+                (name, secret, peers)
+            })
+            .collect();
+        self.pairing
+            .create_ticket(our_addr, self.user_key_bytes, channels)
     }
 
     /// Builds this instance's invite ticket string for `channel`: our

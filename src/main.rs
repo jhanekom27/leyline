@@ -9,6 +9,7 @@ mod identity;
 mod markdown;
 mod message;
 mod net;
+mod pairing;
 mod search;
 mod settings;
 mod storage;
@@ -31,6 +32,8 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use futures::StreamExt;
+use iroh::EndpointAddr;
+use iroh_tickets::Ticket;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
@@ -45,6 +48,7 @@ use net::{Net, NetEvent};
 use search::{SearchOutcome, run_on_disk_scan};
 use settings::Settings;
 use storage::MessageStore;
+use ticket::RoomSecret;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -64,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
     let backfill = BackfillStore::new(dirs.data_dir().join("blobs"))
         .await
         .context("failed to initialize history backfill storage")?;
-    let registry = ChannelRegistry::load(dirs.data_dir().join("channels"))
+    let mut registry = ChannelRegistry::load(dirs.data_dir().join("channels"))
         .context("failed to initialize channel registry")?;
     let contacts = Contacts::load(dirs.data_dir().join("contacts"))
         .context("failed to initialize contacts")?;
@@ -75,29 +79,26 @@ async fn main() -> anyhow::Result<()> {
 
     let secret_key = identity::load_or_generate(&dirs.config_dir().join("identity"))
         .context("failed to load or generate identity")?;
-    let user_key = identity::load_or_generate(&dirs.config_dir().join("user_key"))
+    let args = parse_args()?;
+    let user_key_path = dirs.config_dir().join("user_key");
+    if let Some(ticket) = &args.pair {
+        pairing::bootstrap(&secret_key, ticket, &user_key_path, &mut registry)
+            .await
+            .context("failed to redeem pairing ticket")?;
+    }
+    let user_key = identity::load_or_generate(&user_key_path)
         .context("failed to load or generate user key")?;
-    let join_ticket = parse_join_arg()?;
 
     // What to rejoin from the previous session -- see channel_registry.rs
-    // and `Net::start`. Empty on a first run (just "general" then).
-    let known_channels = registry
-        .channel_names()
-        .into_iter()
-        .map(|name| {
-            let secret = registry
-                .secret_for(&name)
-                .expect("a recorded channel always has a room secret");
-            let addrs = registry.bootstrap_for(&name);
-            (name, secret, addrs)
-        })
-        .collect();
+    // and `Net::start`. Empty on a first run (just "general" then) --
+    // unless `--pair` just seeded it with another device's channels.
+    let known_channels = channel_snapshot(&registry);
 
     let (net_tx, net_rx) = mpsc::channel(64);
     let (net, joined_channels, active_channel) = Net::start(
         secret_key,
         user_key,
-        join_ticket,
+        args.join,
         known_channels,
         settings.nickname(),
         net_tx,
@@ -139,22 +140,58 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-/// Parses an optional `--join <ticket>` flag used to bootstrap into another
-/// instance's channel via its invite ticket. Omit it to start alone with
-/// just the default "general" channel, e.g. as the first peer others join.
-fn parse_join_arg() -> anyhow::Result<Option<String>> {
+/// Parsed CLI arguments: an optional `--join <ticket>` to bootstrap into
+/// another instance's channel, and/or an optional `--pair <ticket>` to
+/// bootstrap this device's whole identity from an already-paired one
+/// (see `pairing::bootstrap`) before anything else starts. The two are
+/// mutually exclusive -- `--pair` runs before this device has any
+/// identity to join a channel under, so combining them in one invocation
+/// isn't a case worth supporting yet.
+struct Args {
+    join: Option<String>,
+    pair: Option<String>,
+}
+
+fn parse_args() -> anyhow::Result<Args> {
     let mut args = std::env::args().skip(1);
-    let mut ticket = None;
+    let mut join = None;
+    let mut pair = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--join" => {
-                anyhow::ensure!(ticket.is_none(), "--join can only be specified once");
-                ticket = Some(args.next().context("--join requires a ticket")?);
+                anyhow::ensure!(join.is_none(), "--join can only be specified once");
+                join = Some(args.next().context("--join requires a ticket")?);
+            }
+            "--pair" => {
+                anyhow::ensure!(pair.is_none(), "--pair can only be specified once");
+                pair = Some(args.next().context("--pair requires a ticket")?);
             }
             other => anyhow::bail!("unknown argument: {other}"),
         }
     }
-    Ok(ticket)
+    anyhow::ensure!(
+        join.is_none() || pair.is_none(),
+        "--join and --pair cannot be combined"
+    );
+    Ok(Args { join, pair })
+}
+
+/// Snapshots every currently-known channel's name, room secret, and known
+/// peer addresses -- the shape both `Net::start`'s `known_channels` and a
+/// pairing ticket's payload (`net::Net::create_pairing_ticket`) need.
+/// Shared so the two can never drift apart.
+fn channel_snapshot(registry: &ChannelRegistry) -> Vec<(String, RoomSecret, Vec<EndpointAddr>)> {
+    registry
+        .channel_names()
+        .into_iter()
+        .map(|name| {
+            let secret = registry
+                .secret_for(&name)
+                .expect("a recorded channel always has a room secret");
+            let addrs = registry.bootstrap_for(&name);
+            (name, secret, addrs)
+        })
+        .collect()
 }
 
 /// Resolves this app's OS-specific project directories, shared by logging
@@ -369,6 +406,17 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                                 });
                                 let suffix = if copied { " (copied to clipboard)" } else { "" };
                                 app.push_system(format!("invite for #{channel}: {ticket}{suffix}"));
+                            }
+                            Some(InputAction::Pair) => {
+                                let snapshot = channel_snapshot(&registry);
+                                let ticket = net.create_pairing_ticket(snapshot).encode_string();
+                                let copied = clipboard.as_mut().is_some_and(|clipboard| {
+                                    clipboard.set_text(ticket.clone()).is_ok()
+                                });
+                                let suffix = if copied { " (copied to clipboard)" } else { "" };
+                                app.push_system(format!(
+                                    "pairing ticket -- redeem on a brand-new device with `leyline --pair <ticket>`: {ticket}{suffix}"
+                                ));
                             }
                             Some(InputAction::Alias(id, name)) => {
                                 if let Err(err) = contacts.set(id, name) {

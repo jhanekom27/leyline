@@ -112,10 +112,16 @@ comes down to in a TUI.
   user key treat them as one person (`AppState::canonical_id`) in `/who`
   and everywhere `display_name` is used -- just another self-asserted,
   gossip-broadcast fact like a nickname, except cryptographically bound to
-  a stable key instead of spoofable free text. A second device starts out
-  sharing the same user key by copying its file over by hand; a pairing
-  flow to automate that, and keeping a person's devices' channel
-  memberships in sync, are tracked separately (LEY-20.2/.3).
+  a stable key instead of spoofable free text. A brand-new device gets the
+  same user key (and every already-known channel) by redeeming a one-time
+  **pairing ticket** instead of copying the file by hand: an already-paired
+  device runs `/pair` to print one (`Net::create_pairing_ticket`, same
+  shape as `/invite`), and the new device redeems it with
+  `leyline --pair <ticket>` before its own event loop ever starts
+  (`pairing.rs`) -- by the time a live command could run, it would already
+  have generated its own, unrelated user key and an un-shared "general"
+  channel. Keeping a person's devices' channel memberships in sync *after*
+  pairing is tracked separately (LEY-20.3).
 
 ## Room privacy
 
@@ -272,8 +278,9 @@ src/
   ui.rs               // ratatui render functions, no logic
   net.rs              // iroh Endpoint + iroh-gossip actor(s), emits NetEvent
   message.rs          // ChatMessage/GossipPayload/HistoryAnnounce wire format
-  identity.rs         // SecretKey load/persist
-  ticket.rs           // RoomSecret + invite ticket encode/decode
+  identity.rs         // SecretKey load/persist (device identity + shared user key)
+  ticket.rs           // RoomSecret + invite/pairing ticket encode/decode
+  pairing.rs          // device pairing: one-time ticket exchange protocol
   channel_registry.rs // persisted channel list, room secrets, known peers
   contacts.rs         // persisted local pet names for peers
   dm_registry.rs      // persisted peer id <-> 1:1 DM channel name, for /msg

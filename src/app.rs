@@ -361,6 +361,10 @@ pub enum InputAction {
     /// Build an invite ticket for the named channel and report it back
     /// (via `AppState::push_system`) once built.
     Invite(String),
+    /// Build a pairing ticket for a brand-new device to redeem (see
+    /// `net::Net::create_pairing_ticket`) and report it back (via
+    /// `AppState::push_system`) once built, mirroring `Invite`.
+    Pair,
     /// Persist a local pet name for a specific endpoint id, resolved from
     /// a typed hex-prefix by `/alias` (see `run_command` and
     /// `crate::contacts`).
@@ -1197,6 +1201,7 @@ impl AppState {
                 }
             }
             "invite" => Some(InputAction::Invite(self.active().name.clone())),
+            "pair" => self.run_pair(arg.trim()),
             "msg" => self.run_msg(arg.trim()),
             "alias" => self.run_alias(arg.trim()),
             "nick" => self.run_nick(arg.trim()),
@@ -1225,7 +1230,7 @@ impl AppState {
     /// detail actually lives.
     fn run_help(&mut self) -> Option<InputAction> {
         self.push_system(
-            "commands: /join <name|ticket>, /invite, /msg <alias|hex-prefix> [text], \
+            "commands: /join <name|ticket>, /invite, /pair, /msg <alias|hex-prefix> [text], \
              /leave [channel], /who, /send <path>, /save <hash-prefix>, /paste, \
              /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- keys: Tab/Shift+Tab switch channels, \
@@ -1295,6 +1300,24 @@ impl AppState {
                 None
             }
         }
+    }
+
+    /// Handles `/pair`: builds a one-time pairing ticket for a brand-new
+    /// device to redeem via `leyline --pair <ticket>` at startup (see
+    /// `net::Net::create_pairing_ticket` and `pairing.rs`), and reports it
+    /// back as a system notice, mirroring `/invite`. Takes no argument --
+    /// redeeming a ticket happens before a device has any session to type
+    /// a command into (see main.rs), so `/pair <ticket>` here just points
+    /// at the right flag instead of attempting anything itself.
+    fn run_pair(&mut self, arg: &str) -> Option<InputAction> {
+        if !arg.is_empty() {
+            self.push_system(
+                "usage: /pair (no argument) -- to redeem a pairing ticket on a brand-new \
+                 device, run `leyline --pair <ticket>` there instead",
+            );
+            return None;
+        }
+        Some(InputAction::Pair)
     }
 
     /// Handles `/nick <name>`: `arg` is everything after `/nick ` (already
@@ -2495,6 +2518,22 @@ mod tests {
         assert!(action.is_none());
         let last = as_system(app.active().messages.back().unwrap());
         assert!(last.starts_with("usage:"));
+    }
+
+    #[test]
+    fn pair_with_no_argument_returns_the_pair_action() {
+        let mut app = app();
+        let action = submit(&mut app, "/pair");
+        assert!(matches!(action, Some(InputAction::Pair)));
+    }
+
+    #[test]
+    fn pair_with_an_argument_reports_usage_instead_of_the_pair_action() {
+        let mut app = app();
+        let action = submit(&mut app, "/pair some-ticket");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("--pair"), "got: {last}");
     }
 
     #[test]
