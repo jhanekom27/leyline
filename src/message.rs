@@ -2,6 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use iroh::{PublicKey, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 
 /// A single chat message, as it travels over the wire and is stored locally.
@@ -158,6 +159,8 @@ pub enum GossipPayload {
     Identity(IdentityAnnounce),
     /// A build-version announcement -- see `VersionAnnounce`.
     Version(VersionAnnounce),
+    /// A device-to-user binding -- see `DeviceCert`.
+    Device(DeviceCert),
 }
 
 /// Flooded to the whole channel whenever a channel gains a gossip neighbor
@@ -213,6 +216,72 @@ pub struct VersionAnnounce {
     /// only (never compared), since commit hashes have no inherent
     /// ordering.
     pub git_hash: String,
+}
+
+/// Binds a device's own `EndpointId` to a longer-lived user key, so a peer
+/// who sees certificates for two different device ids signed by the same
+/// user key can treat them as the same person -- see concept.md's
+/// "Identity & channels". Broadcast as `GossipPayload::Device`, re-sent on
+/// `NeighborUp` the same way `IdentityAnnounce`/`VersionAnnounce` are (see
+/// `net::Net::announce_device`). Every device has one from first run
+/// onward (see `identity.rs`), so there's no "no cert" state for *our own*
+/// device to handle -- only a peer we haven't heard from yet, or one on a
+/// build that predates this, lacks one (`AppState::canonical_id` falls
+/// back to treating such a peer's device id as its own identity,
+/// unchanged).
+///
+/// Never expires and is never revoked over the network: removing a device
+/// is a local, best-effort decision, and real removal is the same
+/// "rotate the secret" story LEY-11 already documents for channels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceCert {
+    /// The device's own EndpointId -- the key that actually
+    /// authenticates/encrypts its connections, same as everywhere else in
+    /// this wire format.
+    pub device_id: [u8; 32],
+    /// The user key's public half. Two certs with the same `user_id` (and
+    /// a valid `signature` each) belong to the same person.
+    pub user_id: [u8; 32],
+    /// When this device was bound to the user key, for display/debugging
+    /// only -- never checked for expiry, and not persisted anywhere, so it
+    /// simply reflects whenever this process last started up.
+    pub issued_at_unix_ms: u64,
+    /// `user_id`'s signature over this cert's other three fields.
+    pub signature: Signature,
+}
+
+impl DeviceCert {
+    /// Builds and signs a fresh certificate binding `device_id` (this
+    /// device's own EndpointId) to `user_key`.
+    pub fn new(device_id: [u8; 32], user_key: &SecretKey, issued_at_unix_ms: u64) -> Self {
+        let user_id = *user_key.public().as_bytes();
+        let signature = user_key.sign(&Self::signed_bytes(device_id, user_id, issued_at_unix_ms));
+        Self {
+            device_id,
+            user_id,
+            issued_at_unix_ms,
+            signature,
+        }
+    }
+
+    /// Checks this cert's `signature` against its own `user_id`. `false`
+    /// for a tampered field, a malformed `user_id`, or a signature made by
+    /// a different key -- callers (`net::forward_events`) drop a cert that
+    /// fails this rather than ever recording it.
+    pub fn is_valid(&self) -> bool {
+        let Ok(user_key) = PublicKey::from_bytes(&self.user_id) else {
+            return false;
+        };
+        let bytes = Self::signed_bytes(self.device_id, self.user_id, self.issued_at_unix_ms);
+        user_key.verify(&bytes, &self.signature).is_ok()
+    }
+
+    /// The bytes `new`/`is_valid` sign/verify: every field except
+    /// `signature` itself, postcard-encoded.
+    fn signed_bytes(device_id: [u8; 32], user_id: [u8; 32], issued_at_unix_ms: u64) -> Vec<u8> {
+        postcard::to_stdvec(&(device_id, user_id, issued_at_unix_ms))
+            .expect("postcard serialization is infallible")
+    }
 }
 
 #[cfg(test)]
@@ -399,5 +468,64 @@ mod tests {
     #[test]
     fn decode_rejects_genuinely_malformed_bytes() {
         assert!(ChatMessage::decode(b"not a chat message").is_err());
+    }
+
+    fn sample_device_cert(user_key: &SecretKey, device_id: [u8; 32]) -> DeviceCert {
+        DeviceCert::new(device_id, user_key, 1_000)
+    }
+
+    #[test]
+    fn device_cert_is_valid_when_correctly_signed() {
+        let user_key = SecretKey::generate();
+        let cert = sample_device_cert(&user_key, [1; 32]);
+        assert!(cert.is_valid());
+    }
+
+    #[test]
+    fn device_cert_is_invalid_when_the_device_id_is_tampered_with() {
+        let user_key = SecretKey::generate();
+        let mut cert = sample_device_cert(&user_key, [1; 32]);
+        cert.device_id = [2; 32];
+        assert!(!cert.is_valid());
+    }
+
+    #[test]
+    fn device_cert_is_invalid_for_a_signature_from_a_different_key() {
+        let user_key = SecretKey::generate();
+        let other_key = SecretKey::generate();
+        let mut cert = sample_device_cert(&user_key, [1; 32]);
+        // Swap in a different user's public id without re-signing --
+        // simulates an attacker claiming someone else's user id.
+        cert.user_id = *other_key.public().as_bytes();
+        assert!(!cert.is_valid());
+    }
+
+    #[test]
+    fn two_devices_signed_by_the_same_user_key_share_a_user_id() {
+        let user_key = SecretKey::generate();
+        let a = sample_device_cert(&user_key, [1; 32]);
+        let b = sample_device_cert(&user_key, [2; 32]);
+        assert_eq!(a.user_id, b.user_id);
+        assert_ne!(a.device_id, b.device_id);
+    }
+
+    #[test]
+    fn device_payload_round_trips_through_postcard() {
+        let user_key = SecretKey::generate();
+        let payload = GossipPayload::Device(sample_device_cert(&user_key, [1; 32]));
+        let bytes = postcard::to_stdvec(&payload).unwrap();
+        let decoded: GossipPayload = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn chat_and_device_payloads_are_distinguishable() {
+        let user_key = SecretKey::generate();
+        let device_bytes = postcard::to_stdvec(&GossipPayload::Device(sample_device_cert(
+            &user_key, [1; 32],
+        )))
+        .unwrap();
+        let decoded: GossipPayload = postcard::from_bytes(&device_bytes).unwrap();
+        assert!(matches!(decoded, GossipPayload::Device(_)));
     }
 }

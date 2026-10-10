@@ -445,6 +445,13 @@ pub struct AppState {
     /// ours to persist, and each peer re-announces it on every reconnect
     /// anyway.
     peer_versions: HashMap<[u8; 32], (String, String)>,
+    /// Device id -> user id, built from verified `crate::message::DeviceCert`s
+    /// (`NetEvent::Device`, already checked by `net::forward_events` before
+    /// it ever reaches here). Consulted by `canonical_id`, which is what
+    /// actually lets two of one person's devices collapse onto a single
+    /// display identity. In-memory only, like `nicknames`/`peer_versions`:
+    /// a peer re-announces their cert on every reconnect anyway.
+    device_to_user: HashMap<[u8; 32], [u8; 32]>,
     /// Peer id -> local DM channel name, so `/msg` can tell whether a peer
     /// already has a private 1:1 channel to reuse -- see `run_msg` and
     /// `crate::dm_registry`. Seeded once at startup from
@@ -503,6 +510,7 @@ impl AppState {
             petnames: HashMap::new(),
             nicknames: HashMap::new(),
             peer_versions: HashMap::new(),
+            device_to_user: HashMap::new(),
             dm_channels: HashMap::new(),
             picking_reply: None,
             picking_thread: None,
@@ -894,22 +902,29 @@ impl AppState {
             }
             // A peer's (re-)announced broadcast nickname -- see
             // features.md's "Broadcast nicknames". Simply overwrite
-            // whatever we last had for `sender`, so `display_name` always
-            // reflects the most recently seen one.
+            // whatever we last had for `sender`'s resolved identity, so
+            // `display_name` always reflects the most recently seen one.
+            // Keyed by `canonical_id` (not the raw sender) so a nickname
+            // broadcast by any one of a person's devices is seen as that
+            // person's nickname everywhere -- see `NetEvent::Device` below
+            // for how an entry already recorded under a bare device id
+            // gets migrated once that device's certificate arrives.
             NetEvent::Identity(_channel, identity) => {
-                self.nicknames.insert(identity.sender, identity.nickname);
+                let id = self.canonical_id(&identity.sender);
+                self.nicknames.insert(id, identity.nickname);
                 None
             }
             // A peer's (re-)announced build version -- see features.md's
             // version-notification idea. Always recorded (for `/who` and
             // `newest_known_update`), regardless of whether it's newer
             // than ours; a system notice only fires the first time this
-            // peer's recorded version actually changes to something newer
-            // than ours, so a plain reconnect (the same version
-            // re-announced) doesn't repeat it.
+            // peer's recorded version actually becomes newer than ours,
+            // so a plain reconnect (the same version re-announced) doesn't
+            // repeat it. Keyed by `canonical_id`, like `nicknames` above.
             NetEvent::Version(_channel, announce) => {
+                let id = self.canonical_id(&announce.sender);
                 let info = (announce.version.clone(), announce.git_hash.clone());
-                let previous = self.peer_versions.insert(announce.sender, info.clone());
+                let previous = self.peer_versions.insert(id, info.clone());
                 if previous.as_ref() != Some(&info) && version::is_newer(&announce.version) {
                     let who = self.display_name(&announce.sender);
                     self.push_system(format!(
@@ -917,6 +932,27 @@ impl AppState {
                         announce.version,
                         version::VERSION,
                     ));
+                }
+                None
+            }
+            // A peer's device certificate -- see `crate::message::DeviceCert`.
+            // Already verified by `net::forward_events` before this ever
+            // arrives, so it's simply recorded. The first time a device id
+            // newly resolves to a user id, migrate anything already
+            // recorded under that bare device id (a nickname/version seen
+            // before its cert, since gossip delivery has no ordering
+            // guarantee) onto the now-known canonical id, so it isn't
+            // orphaned under a key `display_name`/`who_line` no longer
+            // look up.
+            NetEvent::Device(_channel, cert) => {
+                let previous = self.device_to_user.insert(cert.device_id, cert.user_id);
+                if previous != Some(cert.user_id) {
+                    if let Some(nickname) = self.nicknames.remove(&cert.device_id) {
+                        self.nicknames.insert(cert.user_id, nickname);
+                    }
+                    if let Some(info) = self.peer_versions.remove(&cert.device_id) {
+                        self.peer_versions.insert(cert.user_id, info);
+                    }
                 }
                 None
             }
@@ -1021,20 +1057,39 @@ impl AppState {
     }
 
     /// Displays a sender as "you" for our own id; their pet name if one
-    /// has been assigned via `/alias`; else their last broadcast nickname
-    /// from `/nick`, suffixed with their hex prefix since a nickname is
-    /// spoofable and not unique (features.md's "Broadcast nicknames"); or,
-    /// absent both, a shortened hex id on its own.
+    /// has been assigned via `/alias` (keyed by their resolved
+    /// `canonical_id`, not necessarily the literal `sender`, so an alias
+    /// set against any one of a person's devices applies to all of them
+    /// once their certificates are known -- see `canonical_id`); else
+    /// their last broadcast nickname from `/nick`, suffixed with their hex
+    /// prefix since a nickname is spoofable and not unique (features.md's
+    /// "Broadcast nicknames"); or, absent both, a shortened hex id on its
+    /// own.
     pub fn display_name(&self, sender: &[u8; 32]) -> String {
         if *sender == self.self_id {
-            "you".to_string()
-        } else if let Some(name) = self.petnames.get(sender) {
+            return "you".to_string();
+        }
+        let id = self.canonical_id(sender);
+        if let Some(name) = self.petnames.get(&id) {
             name.clone()
-        } else if let Some(nickname) = self.nicknames.get(sender) {
+        } else if let Some(nickname) = self.nicknames.get(&id) {
             format!("{nickname} ({})", hex_prefix(sender))
         } else {
             hex_prefix(sender)
         }
+    }
+
+    /// Resolves `id` to the user identity it belongs to, if a verified
+    /// `crate::message::DeviceCert` has been seen for it (`device_to_user`)
+    /// -- otherwise `id` unchanged, which is also correct for our own id
+    /// and for any peer we have no cert for (an older build, or one not
+    /// yet verified). `display_name`, `/who`'s grouping
+    /// (`grouped_who_lines`), and `/alias` (`run_alias`) all resolve
+    /// through this first, so two of one person's devices collapse onto
+    /// whichever single petname/nickname has been recorded for that
+    /// person, instead of needing one recorded per device.
+    pub fn canonical_id(&self, id: &[u8; 32]) -> [u8; 32] {
+        self.device_to_user.get(id).copied().unwrap_or(*id)
     }
 
     /// The newest peer version we've heard (via `NetEvent::Version`) that's
@@ -1224,9 +1279,16 @@ impl AppState {
         }
         match self.resolve_id(prefix) {
             Ok(id) => {
-                self.petnames.insert(id, name.to_string());
+                // Store under the canonical id (the user id, if a
+                // certificate for `id` is already known) so the alias
+                // applies to every one of that person's known devices, not
+                // just the specific one whose hex prefix was typed --
+                // while still confirming against the device id actually
+                // typed, which is what the user recognizes.
+                let canonical = self.canonical_id(&id);
+                self.petnames.insert(canonical, name.to_string());
                 self.push_system(format!("aliased {} as {name}", hex_id(&id)));
-                Some(InputAction::Alias(id, name.to_string()))
+                Some(InputAction::Alias(canonical, name.to_string()))
             }
             Err(err) => {
                 self.push_system(err);
@@ -1296,11 +1358,46 @@ impl AppState {
             return None;
         }
         self.push_system(format!("peers in #{name} ({}):", peers.len()));
-        for id in &peers {
-            let line = self.who_line(id);
+        for line in self.grouped_who_lines(&peers) {
             self.push_system(line);
         }
         None
+    }
+
+    /// Groups `peers` (raw device ids, in `/who`'s existing per-channel
+    /// order) by `canonical_id`, so devices certified under the same user
+    /// key are shown together instead of as unrelated lines. A group of
+    /// exactly one device -- the common case, since this only groups once
+    /// a certificate has actually been seen -- renders identically to a
+    /// bare `who_line`, so an unpaired peer's `/who` output is unchanged
+    /// from before device certificates existed.
+    fn grouped_who_lines(&self, peers: &[[u8; 32]]) -> Vec<String> {
+        let mut groups: Vec<([u8; 32], Vec<[u8; 32]>)> = Vec::new();
+        for &id in peers {
+            let canonical = self.canonical_id(&id);
+            match groups
+                .iter_mut()
+                .find(|(group_id, _)| *group_id == canonical)
+            {
+                Some((_, devices)) => devices.push(id),
+                None => groups.push((canonical, vec![id])),
+            }
+        }
+        let mut lines = Vec::new();
+        for (canonical, devices) in groups {
+            match devices.as_slice() {
+                [only] => lines.push(self.who_line(only)),
+                _ => {
+                    lines.push(format!(
+                        "{} ({} devices):",
+                        self.display_name(&canonical),
+                        devices.len()
+                    ));
+                    lines.extend(devices.iter().map(|id| format!("  {}", self.who_line(id))));
+                }
+            }
+        }
+        lines
     }
 
     /// Formats one `/who` line for `id`: its full hex id, plus `nickname:
@@ -1893,7 +1990,8 @@ fn compose_message(sender: [u8; 32], text: &str, reply_to: Option<u64>) -> ChatM
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{IdentityAnnounce, VersionAnnounce};
+    use crate::message::{DeviceCert, IdentityAnnounce, VersionAnnounce};
+    use iroh::SecretKey;
 
     const SELF_ID: [u8; 32] = [9; 32];
     const PEER_ID: [u8; 32] = [7; 32];
@@ -2193,6 +2291,85 @@ mod tests {
         );
     }
 
+    fn device_cert(user_key: &SecretKey, device_id: [u8; 32]) -> DeviceCert {
+        DeviceCert::new(device_id, user_key, 1_000)
+    }
+
+    #[test]
+    fn canonical_id_is_unchanged_when_no_cert_is_known() {
+        let app = app();
+        assert_eq!(app.canonical_id(&PEER_ID), PEER_ID);
+    }
+
+    #[test]
+    fn a_peer_with_no_certificate_displays_exactly_as_before() {
+        let app = app();
+        assert_eq!(app.display_name(&PEER_ID), hex_prefix(&PEER_ID));
+    }
+
+    #[test]
+    fn device_event_makes_canonical_id_resolve_to_the_user_id() {
+        let mut app = app();
+        let user_key = SecretKey::generate();
+        let user_id = *user_key.public().as_bytes();
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID),
+        ));
+        assert_eq!(app.canonical_id(&PEER_ID), user_id);
+    }
+
+    #[test]
+    fn two_certified_devices_share_a_display_name() {
+        let mut app = app();
+        let user_key = SecretKey::generate();
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID),
+        ));
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID_2),
+        ));
+        app.load_contacts(HashMap::from([(
+            app.canonical_id(&PEER_ID),
+            "Jurgen".to_string(),
+        )]));
+
+        assert_eq!(app.display_name(&PEER_ID), "Jurgen");
+        assert_eq!(app.display_name(&PEER_ID_2), "Jurgen");
+    }
+
+    #[test]
+    fn device_event_migrates_a_nickname_seen_before_the_certificate() {
+        let mut app = app();
+        let user_key = SecretKey::generate();
+        let user_id = *user_key.public().as_bytes();
+        // The nickname arrives first -- gossip has no delivery ordering
+        // guarantee, so this must not get orphaned once the cert arrives.
+        app.handle_net_event(NetEvent::Identity(
+            "general".to_string(),
+            IdentityAnnounce {
+                sender: PEER_ID,
+                nickname: "alice".to_string(),
+            },
+        ));
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID),
+        ));
+
+        assert_eq!(
+            app.display_name(&PEER_ID),
+            format!("alice ({})", hex_prefix(&PEER_ID))
+        );
+        assert_eq!(
+            app.nicknames.get(&user_id).map(String::as_str),
+            Some("alice"),
+            "the nickname must be re-keyed onto the canonical user id"
+        );
+    }
+
     #[test]
     fn alias_assigns_a_petname_for_a_currently_online_peer() {
         let mut app = app();
@@ -2272,6 +2449,31 @@ mod tests {
         assert!(action.is_none());
         let last = as_system(app.active().messages.back().unwrap());
         assert!(last.starts_with("usage:"));
+    }
+
+    #[test]
+    fn alias_applies_to_a_second_device_once_its_certificate_is_known() {
+        let mut app = app();
+        let user_key = SecretKey::generate();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID),
+        ));
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID_2),
+        ));
+
+        let full_id = hex_id(&PEER_ID);
+        submit(&mut app, &format!("/alias {} Jurgen", &full_id[..8]));
+
+        assert_eq!(app.display_name(&PEER_ID), "Jurgen");
+        assert_eq!(
+            app.display_name(&PEER_ID_2),
+            "Jurgen",
+            "aliasing one of a person's devices must apply to the other once both certs are known"
+        );
     }
 
     #[test]
@@ -2923,6 +3125,35 @@ mod tests {
             last, "no peers currently in #random",
             "a peer in another joined channel must not show up"
         );
+    }
+
+    #[test]
+    fn who_groups_two_devices_certified_under_the_same_user_key() {
+        let mut app = app();
+        let user_key = SecretKey::generate();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID_2));
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID),
+        ));
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID_2),
+        ));
+
+        submit(&mut app, "/who");
+
+        let messages: Vec<&TranscriptLine> = app.active().messages.iter().collect();
+        let len = messages.len();
+        assert_eq!(as_system(messages[len - 4]), "peers in #general (2):");
+        assert!(
+            as_system(messages[len - 3]).contains("2 devices"),
+            "got: {}",
+            as_system(messages[len - 3])
+        );
+        assert!(as_system(messages[len - 2]).starts_with("  "));
+        assert!(as_system(messages[len - 1]).starts_with("  "));
     }
 
     #[test]

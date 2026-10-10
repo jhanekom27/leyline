@@ -75,6 +75,8 @@ async fn main() -> anyhow::Result<()> {
 
     let secret_key = identity::load_or_generate(&dirs.config_dir().join("identity"))
         .context("failed to load or generate identity")?;
+    let user_key = identity::load_or_generate(&dirs.config_dir().join("user_key"))
+        .context("failed to load or generate user key")?;
     let join_ticket = parse_join_arg()?;
 
     // What to rejoin from the previous session -- see channel_registry.rs
@@ -94,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
     let (net_tx, net_rx) = mpsc::channel(64);
     let (net, joined_channels, active_channel) = Net::start(
         secret_key,
+        user_key,
         join_ticket,
         known_channels,
         settings.nickname(),
@@ -454,6 +457,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
                     announce_history(&net, &backfill, channel);
                     net.announce_nickname(channel);
                     net.announce_version(channel);
+                    net.announce_device(channel);
                 }
 
                 // Also peek for a channel finishing a runtime `/join`, so

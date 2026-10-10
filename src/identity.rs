@@ -1,7 +1,13 @@
-//! Local identity: a persisted `iroh::SecretKey` that *is* the user's
-//! identity -- no accounts, no server. Loads the key from disk on startup,
-//! generating and persisting a new one on first run -- see concept.md's
-//! "Identity & channels" section.
+//! Local identity: a persisted `iroh::SecretKey`. Loads the key from disk
+//! on startup, generating and persisting a new one on first run -- see
+//! concept.md's "Identity & channels" section.
+//!
+//! Used for two distinct, differently-scoped keys that both need the same
+//! load-or-generate-once treatment: each device's own identity (its
+//! `EndpointId`), and a longer-lived user key shared across every device
+//! belonging to one person (`crate::message::DeviceCert`). `persist` is
+//! also reused by `pairing.rs` to write a user key *received* from
+//! another device rather than generated locally.
 
 use std::io::ErrorKind;
 use std::path::Path;
@@ -26,23 +32,32 @@ pub fn load_or_generate(path: &Path) -> anyhow::Result<SecretKey> {
             })?;
             Ok(SecretKey::from_bytes(&bytes))
         }
-        Err(err) if err.kind() == ErrorKind::NotFound => generate_and_persist(path),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            let key = SecretKey::generate();
+            persist(path, &key)?;
+            Ok(key)
+        }
         Err(err) => {
             Err(err).with_context(|| format!("failed to read identity from {}", path.display()))
         }
     }
 }
 
-fn generate_and_persist(path: &Path) -> anyhow::Result<SecretKey> {
-    let key = SecretKey::generate();
+/// Writes `key` to `path`, creating parent directories as needed and
+/// restricting the file to owner-only read/write on Unix.
+///
+/// Shared by `load_or_generate` (for a freshly generated key) and by
+/// device pairing (`pairing.rs`), which persists a user key *received*
+/// from another device -- both need the exact same on-disk shape so
+/// either can load it back via `load_or_generate` afterward.
+pub fn persist(path: &Path, key: &SecretKey) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     std::fs::write(path, key.to_bytes())
         .with_context(|| format!("failed to write identity to {}", path.display()))?;
-    restrict_permissions(path)?;
-    Ok(key)
+    restrict_permissions(path)
 }
 
 /// Restricts the identity file to owner-only read/write, since it's a secret
@@ -64,6 +79,18 @@ fn restrict_permissions(_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persist_writes_a_key_that_load_or_generate_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity");
+        let key = SecretKey::generate();
+
+        persist(&path, &key).unwrap();
+        let loaded = load_or_generate(&path).unwrap();
+
+        assert_eq!(loaded.to_bytes(), key.to_bytes());
+    }
 
     #[test]
     fn generates_and_persists_on_first_run() {

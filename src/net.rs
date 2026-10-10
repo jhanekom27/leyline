@@ -32,8 +32,8 @@ use tracing::{debug, info, warn};
 
 use crate::backfill::BackfillStore;
 use crate::message::{
-    ChatMessage, FileAttachment, GossipPayload, HistoryAnnounce, IdentityAnnounce, VersionAnnounce,
-    now_unix_ms,
+    ChatMessage, DeviceCert, FileAttachment, GossipPayload, HistoryAnnounce, IdentityAnnounce,
+    VersionAnnounce, now_unix_ms,
 };
 use crate::ticket::{ChannelTicket, RoomSecret};
 use crate::version;
@@ -103,6 +103,11 @@ pub enum NetEvent {
     /// A peer announced (or re-announced) their build version -- see
     /// `crate::message::VersionAnnounce`.
     Version(String, VersionAnnounce),
+    /// A peer announced (or re-announced) a certificate binding one of
+    /// their device ids to a user key -- see `crate::message::DeviceCert`.
+    /// Already verified (`DeviceCert::is_valid`) by the time this is
+    /// emitted -- see `forward_events` -- so `app.rs` never has to.
+    Device(String, DeviceCert),
     /// A history backfill fetch finished and decoded some messages, ready
     /// to be deduped, persisted, and merged into the transcript.
     HistoryFetched(String, Vec<ChatMessage>),
@@ -290,6 +295,12 @@ pub struct Net {
     /// Our own endpoint id, as raw bytes so callers don't need to depend on
     /// iroh types.
     pub our_id: [u8; 32],
+    /// This device's own certificate, binding `our_id` to the user key
+    /// passed into `Net::start` -- see `crate::message::DeviceCert`.
+    /// Computed once at startup and never changes for the life of this
+    /// process; re-broadcast by `announce_device` the same way
+    /// `nickname`/our build version already are.
+    our_cert: DeviceCert,
 }
 
 impl Net {
@@ -315,6 +326,7 @@ impl Net {
     /// given and usable, else "general").
     pub async fn start(
         secret_key: SecretKey,
+        user_key: SecretKey,
         join_ticket: Option<String>,
         known_channels: Vec<(String, RoomSecret, Vec<EndpointAddr>)>,
         nickname: Option<String>,
@@ -369,6 +381,8 @@ impl Net {
             .accept(iroh_blobs::ALPN, backfill.protocol_handler())
             .spawn();
 
+        let our_cert = DeviceCert::new(our_id, &user_key, now_unix_ms());
+
         let net = Self {
             router,
             gossip,
@@ -378,6 +392,7 @@ impl Net {
             backfill,
             nickname: Mutex::new(nickname),
             our_id,
+            our_cert,
         };
 
         // A ticket naming our own identity can't reach anyone -- an invite
@@ -867,6 +882,37 @@ impl Net {
         });
     }
 
+    /// Announces our device certificate (see `crate::message::DeviceCert`)
+    /// to `channel`'s direct gossip neighbors -- called whenever a channel
+    /// gains one, the same way `announce_nickname`/`announce_version` do.
+    /// Every device always has `our_cert` from the moment `Net::start`
+    /// finishes, so -- like `announce_version` -- there's no "nothing to
+    /// announce yet" case here. Fire-and-forget, like `announce_version`.
+    pub fn announce_device(&self, channel: &str) {
+        let Some(sender) = self
+            .channels
+            .lock()
+            .expect("channels lock poisoned")
+            .get(channel)
+            .map(|c| c.sender.clone())
+        else {
+            return;
+        };
+        let payload = GossipPayload::Device(self.our_cert.clone());
+        tokio::spawn(async move {
+            let bytes = match postcard::to_stdvec(&payload) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    warn!("failed to encode device cert announce: {err}");
+                    return;
+                }
+            };
+            if let Err(err) = sender.broadcast_neighbors(bytes.into()).await {
+                warn!("failed to broadcast device cert announce: {err}");
+            }
+        });
+    }
+
     /// Reacts to a received `HistoryAnnounce`: if its root differs from what
     /// we already have for `channel` (and it isn't an echo of our own
     /// announce), fetches and decodes the delta directly from the
@@ -1235,6 +1281,13 @@ async fn forward_events(
                     }
                     Ok(GossipPayload::Version(version)) => {
                         NetEvent::Version(channel.clone(), version)
+                    }
+                    Ok(GossipPayload::Device(cert)) if cert.is_valid() => {
+                        NetEvent::Device(channel.clone(), cert)
+                    }
+                    Ok(GossipPayload::Device(_)) => {
+                        warn!("dropping device certificate with an invalid signature");
+                        continue;
                     }
                     Err(err) => {
                         warn!("dropping malformed gossip message: {err}");

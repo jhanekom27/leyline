@@ -103,6 +103,19 @@ comes down to in a TUI.
   follows) lets the invited side record the same association, so both
   parties converge on reusing one channel per pair instead of drifting
   onto separate ones.
+- Each device also loads a second, longer-lived **user key**
+  (`identity.rs`, same load-or-generate-once treatment as the device
+  identity) and self-signs a `DeviceCert` binding its own `EndpointId` to
+  that user key's public half. Broadcast the same way `/nick`/version are
+  (`GossipPayload::Device`, re-sent on `NeighborUp`), this lets a peer who
+  has seen certificates for two different `EndpointId`s signed by the same
+  user key treat them as one person (`AppState::canonical_id`) in `/who`
+  and everywhere `display_name` is used -- just another self-asserted,
+  gossip-broadcast fact like a nickname, except cryptographically bound to
+  a stable key instead of spoofable free text. A second device starts out
+  sharing the same user key by copying its file over by hand; a pairing
+  flow to automate that, and keeping a person's devices' channel
+  memberships in sync, are tracked separately (LEY-20.2/.3).
 
 ## Room privacy
 
@@ -163,6 +176,7 @@ pub enum GossipPayload {
     Announce(HistoryAnnounce), // see "Persistence & history backfill" below
     Identity(IdentityAnnounce), // see "Identity & channels" above
     Version(VersionAnnounce), // see "Identity & channels" above
+    Device(DeviceCert), // see "Identity & channels" above
 }
 ```
 
