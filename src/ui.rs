@@ -805,7 +805,9 @@ fn user_color(id: &[u8; 32]) -> Color {
 
 fn render_peers(frame: &mut Frame, area: Rect, app: &AppState) {
     let channel = app.active();
-    let mut items: Vec<ListItem> = channel.peers.iter().map(|id| peer_item(app, id)).collect();
+    // One row per person, not per device -- see `AppState::unique_peer_ids`.
+    let peers = app.unique_peer_ids(&channel.peers);
+    let mut items: Vec<ListItem> = peers.iter().map(|id| peer_item(app, id)).collect();
     items.push(peer_item(app, &app.self_id));
 
     let list = List::new(items).block(

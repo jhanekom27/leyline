@@ -1209,6 +1209,23 @@ impl AppState {
         self.device_to_user.get(id).copied().unwrap_or(*id)
     }
 
+    /// Deduplicates `ids` by `canonical_id`, keeping the first device seen
+    /// for each distinct person and preserving their original relative
+    /// order -- the same grouping `grouped_who_lines` applies for `/who`,
+    /// just without that command's "(N devices)" breakdown text, which
+    /// stays exclusively `/who`'s. Used by `ui::render_peers` so the
+    /// sidebar shows one row per person instead of one per device once
+    /// their devices are certified under the same user key -- a peer with
+    /// no known certificate is simply its own one-member group, so this
+    /// changes nothing for it.
+    pub fn unique_peer_ids(&self, ids: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        let mut seen = HashSet::new();
+        ids.iter()
+            .filter(|id| seen.insert(self.canonical_id(id)))
+            .copied()
+            .collect()
+    }
+
     /// The newest peer version we've heard (via `NetEvent::Version`) that's
     /// actually newer than ours, if any -- used by `ui::render_header`'s
     /// persistent indicator and `/version`'s own report. Recomputed on
@@ -2536,6 +2553,60 @@ mod tests {
 
         assert_eq!(app.display_name(&PEER_ID), "Jurgen");
         assert_eq!(app.display_name(&PEER_ID_2), "Jurgen");
+    }
+
+    #[test]
+    fn unique_peer_ids_collapses_two_certified_devices_into_one() {
+        let mut app = app();
+        let user_key = SecretKey::generate();
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID),
+        ));
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID_2),
+        ));
+
+        let unique = app.unique_peer_ids(&[PEER_ID, PEER_ID_2]);
+
+        assert_eq!(
+            unique,
+            vec![PEER_ID],
+            "two devices certified under the same user key must collapse to one"
+        );
+    }
+
+    #[test]
+    fn unique_peer_ids_keeps_uncertified_peers_distinct() {
+        let app = app();
+        let unique = app.unique_peer_ids(&[PEER_ID, PEER_ID_2]);
+        assert_eq!(
+            unique,
+            vec![PEER_ID, PEER_ID_2],
+            "peers with no known certificate must never be merged"
+        );
+    }
+
+    #[test]
+    fn unique_peer_ids_preserves_original_order_including_mixed_groups() {
+        let mut app = app();
+        const PEER_ID_3: [u8; 32] = [6; 32];
+        let user_key = SecretKey::generate();
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID),
+        ));
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID_2),
+        ));
+
+        // PEER_ID and PEER_ID_2 are the same person's two devices;
+        // PEER_ID_3 has no certificate at all.
+        let unique = app.unique_peer_ids(&[PEER_ID, PEER_ID_3, PEER_ID_2]);
+
+        assert_eq!(unique, vec![PEER_ID, PEER_ID_3]);
     }
 
     #[test]
