@@ -11,11 +11,13 @@ use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use iroh_blobs::Hash;
+use iroh_tickets::Ticket;
 
 use crate::message::{ChatMessage, now_unix_ms};
 use crate::net::{DEVICE_SYNC_CHANNEL, NetEvent};
 use crate::search::{self, SearchOutcome, SearchResults};
 use crate::thread::{self, ThreadView};
+use crate::ticket::PairingTicket;
 use crate::version;
 
 /// Cap on in-memory scrollback per channel, per concept.md's guidance on
@@ -494,6 +496,21 @@ pub struct AppState {
     /// (`switch_channel`, `remove_channel`, `NetEvent::Joined`) -- a reply
     /// id only makes sense against the channel it was picked in.
     pub replying_to: Option<u64>,
+    /// A live `/pair <ticket>` redeem awaiting explicit confirmation (see
+    /// `run_pair`/`handle_redeem_confirmation_key`), already known to
+    /// decode successfully -- armed the moment the warning is shown, taken
+    /// (on `Enter`) into `restart_with_ticket`, or cleared outright (on
+    /// `Esc`). Checked first in `handle_key`, like `picking_reply`/
+    /// `picking_thread`, since confirming this is destructive enough to
+    /// warrant ignoring every other key while it's armed.
+    pending_redeem: Option<String>,
+    /// Set once a live pairing redeem is actually confirmed (`Enter` while
+    /// `pending_redeem` is armed) -- alongside `should_quit`, so the normal
+    /// quit path (main.rs's event loop ending, `Net::shutdown`, terminal
+    /// restore) runs unchanged first. main.rs checks this once the loop
+    /// exits to decide whether to wipe local state and restart into
+    /// `--pair <ticket>` instead of just exiting -- see main.rs's `run`.
+    pub restart_with_ticket: Option<String>,
 }
 
 impl AppState {
@@ -533,6 +550,8 @@ impl AppState {
             picking_reply: None,
             picking_thread: None,
             replying_to: None,
+            pending_redeem: None,
+            restart_with_ticket: None,
         }
     }
 
@@ -754,6 +773,10 @@ impl AppState {
     /// something different while picking) from having to be threaded
     /// through every arm of the match below.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<InputAction> {
+        if self.pending_redeem.is_some() {
+            self.handle_redeem_confirmation_key(key);
+            return None;
+        }
         if self.picking_reply.is_some() {
             self.handle_picking_key(key);
             return None;
@@ -827,6 +850,37 @@ impl AppState {
             _ => {}
         }
         None
+    }
+
+    /// Handles a keypress while confirming a live pairing redeem (`/pair
+    /// <ticket>`, see `run_pair`): `Enter` confirms -- taking
+    /// `pending_redeem` into `restart_with_ticket` and setting
+    /// `should_quit`, so main.rs's normal quit path (loop exit, `Net::
+    /// shutdown`, terminal restore) runs first, then wipes local state and
+    /// restarts into `--pair <ticket>` -- `Esc` cancels back to normal
+    /// typing. `Ctrl+C` still force-quits (a plain, non-pairing quit,
+    /// `restart_with_ticket` stays unset), mirroring `handle_picking_key`.
+    /// Every other key is ignored: confirming this is destructive enough
+    /// to warrant an explicit, narrow yes/no gate rather than letting a
+    /// stray keystroke do anything else.
+    fn handle_redeem_confirmation_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
+            return;
+        }
+        match key.code {
+            KeyCode::Enter => {
+                if let Some(ticket) = self.pending_redeem.take() {
+                    self.restart_with_ticket = Some(ticket);
+                    self.should_quit = true;
+                }
+            }
+            KeyCode::Esc => {
+                self.pending_redeem = None;
+                self.push_system("pairing cancelled");
+            }
+            _ => {}
+        }
     }
 
     /// Handles a keypress while picking a reply target (`Ctrl+R`, see
@@ -1295,11 +1349,14 @@ impl AppState {
     /// detail actually lives.
     fn run_help(&mut self) -> Option<InputAction> {
         self.push_system(
-            "commands: /join <name|ticket>, /invite, /pair, /forget-device <hex-prefix>, \
+            "commands: /join <name|ticket>, /invite, /pair [ticket], /forget-device <hex-prefix>, \
              /msg <alias|hex-prefix> [text], /leave [channel], /who, /send <path>, \
              /save <hash-prefix>, /paste, /alias <hex-prefix> <name>, /nick <name>, \
              /search <term> (or /s), /reply [text], \
-             /thread, /hints, /bell, /version, /help -- keys: Tab/Shift+Tab switch channels, \
+             /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
+             ticket for a new device to redeem, /pair <ticket> redeems one (after an \
+             Enter/Esc confirmation -- this replaces this device's identity and data) -- \
+             keys: Tab/Shift+Tab switch channels, \
              Alt+Enter/Ctrl+J newline, Ctrl+V paste, Ctrl+R reply (\u{2191}/\u{2193} pick, \
              Enter confirm), Ctrl+T thread (\u{2191}/\u{2193} pick, Enter confirm), \
              Up/Down scroll, Esc/Ctrl+C quit",
@@ -1368,22 +1425,44 @@ impl AppState {
         }
     }
 
-    /// Handles `/pair`: builds a one-time pairing ticket for a brand-new
-    /// device to redeem via `leyline --pair <ticket>` at startup (see
-    /// `net::Net::create_pairing_ticket` and `pairing.rs`), and reports it
-    /// back as a system notice, mirroring `/invite`. Takes no argument --
-    /// redeeming a ticket happens before a device has any session to type
-    /// a command into (see main.rs), so `/pair <ticket>` here just points
-    /// at the right flag instead of attempting anything itself.
+    /// Handles `/pair` with no argument: builds a one-time pairing ticket
+    /// for a brand-new device to redeem, and reports it back as a system
+    /// notice, mirroring `/invite`. See `run_pair_redeem` for `/pair
+    /// <ticket>`, which redeems one instead.
     fn run_pair(&mut self, arg: &str) -> Option<InputAction> {
-        if !arg.is_empty() {
-            self.push_system(
-                "usage: /pair (no argument) -- to redeem a pairing ticket on a brand-new \
-                 device, run `leyline --pair <ticket>` there instead",
-            );
-            return None;
+        if arg.is_empty() {
+            return Some(InputAction::Pair);
         }
-        Some(InputAction::Pair)
+        self.run_pair_redeem(arg)
+    }
+
+    /// Handles `/pair <ticket>`: validates `ticket` decodes (a pure parse,
+    /// no I/O -- see this module's doc comment) and, if it does, arms
+    /// `pending_redeem` and warns that confirming will replace this
+    /// device's current identity, channels, and message history with the
+    /// paired device's, naming how many channels are currently joined so
+    /// the stakes are concrete rather than abstract. Deliberately rejects
+    /// a malformed ticket immediately, before ever arming the
+    /// confirmation or touching anything -- see main.rs's `restart_for_
+    /// pairing` for what actually gets wiped once confirmed
+    /// (`handle_redeem_confirmation_key`).
+    fn run_pair_redeem(&mut self, ticket: &str) -> Option<InputAction> {
+        match PairingTicket::decode_string(ticket) {
+            Ok(_) => {
+                self.pending_redeem = Some(ticket.to_string());
+                self.push_system(format!(
+                    "redeeming this ticket will ERASE this device's current identity, {} \
+                     channel(s), and all local message history, replacing them with the \
+                     paired device's -- this cannot be undone. Press Enter to confirm, Esc \
+                     to cancel.",
+                    self.channels.len()
+                ));
+            }
+            Err(err) => {
+                self.push_system(format!("invalid pairing ticket: {err}"));
+            }
+        }
+        None
     }
 
     /// Handles `/forget-device <hex-prefix>`: resolves the prefix via
@@ -2106,9 +2185,11 @@ fn compose_message(sender: [u8; 32], text: &str, reply_to: Option<u64>) -> ChatM
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use super::*;
     use crate::message::{DeviceCert, IdentityAnnounce, VersionAnnounce};
-    use iroh::SecretKey;
+    use iroh::{EndpointAddr, SecretKey, TransportAddr};
 
     const SELF_ID: [u8; 32] = [9; 32];
     const PEER_ID: [u8; 32] = [7; 32];
@@ -2671,13 +2752,95 @@ mod tests {
         assert!(matches!(action, Some(InputAction::Pair)));
     }
 
+    fn sample_pairing_ticket() -> String {
+        let addr = EndpointAddr::from_parts(
+            SecretKey::generate().public(),
+            [TransportAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 4242)))],
+        );
+        PairingTicket {
+            addr,
+            secret: rand::random(),
+        }
+        .encode_string()
+    }
+
     #[test]
-    fn pair_with_an_argument_reports_usage_instead_of_the_pair_action() {
+    fn pair_with_a_valid_ticket_warns_instead_of_acting_immediately() {
         let mut app = app();
-        let action = submit(&mut app, "/pair some-ticket");
+        let ticket = sample_pairing_ticket();
+        let action = submit(&mut app, &format!("/pair {ticket}"));
+        assert!(action.is_none(), "must not act until explicitly confirmed");
+        assert!(!app.should_quit);
+        assert!(app.restart_with_ticket.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("ERASE"), "got: {last}");
+        assert!(
+            last.contains("1 channel(s)"),
+            "should name the current channel count, got: {last}"
+        );
+    }
+
+    #[test]
+    fn pair_with_a_malformed_ticket_reports_an_error_and_never_arms_confirmation() {
+        let mut app = app();
+        let action = submit(&mut app, "/pair not-a-real-ticket");
         assert!(action.is_none());
         let last = as_system(app.active().messages.back().unwrap());
-        assert!(last.contains("--pair"), "got: {last}");
+        assert!(last.contains("invalid pairing ticket"), "got: {last}");
+
+        // Confirmation must not have been armed -- a normal message typed
+        // right after still sends normally instead of being swallowed as
+        // a confirm/cancel keypress.
+        let sent = submit(&mut app, "hello");
+        assert!(matches!(sent, Some(InputAction::Send(..))));
+    }
+
+    #[test]
+    fn confirming_a_pending_pair_redeem_arms_restart_and_quits() {
+        let mut app = app();
+        let ticket = sample_pairing_ticket();
+        submit(&mut app, &format!("/pair {ticket}"));
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.restart_with_ticket, Some(ticket));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn canceling_a_pending_pair_redeem_clears_it_without_quitting() {
+        let mut app = app();
+        let ticket = sample_pairing_ticket();
+        submit(&mut app, &format!("/pair {ticket}"));
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(!app.should_quit);
+        assert!(app.restart_with_ticket.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "pairing cancelled");
+
+        // No longer armed -- typing now reaches the input box normally
+        // instead of being swallowed as a confirm/cancel keypress.
+        app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(app.active().input, "h");
+    }
+
+    #[test]
+    fn unrelated_keys_are_ignored_while_a_pair_redeem_is_pending() {
+        let mut app = app();
+        let ticket = sample_pairing_ticket();
+        submit(&mut app, &format!("/pair {ticket}"));
+
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert!(!app.should_quit);
+        assert!(app.restart_with_ticket.is_none());
+        assert_eq!(
+            app.active().input,
+            "",
+            "a stray keystroke must not leak into the input box while armed"
+        );
     }
 
     #[test]

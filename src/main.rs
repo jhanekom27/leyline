@@ -21,8 +21,8 @@ mod version;
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -142,7 +142,16 @@ async fn main() -> anyhow::Result<()> {
     let result = run(&mut terminal, session).await;
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
-    result
+    match result {
+        // A live `/pair <ticket>` redeem was confirmed (see
+        // `app::AppState::restart_with_ticket`) -- the TUI has already
+        // shut down cleanly above, so it's safe to wipe the state that
+        // would otherwise conflict with the incoming identity and restart
+        // into `--pair <ticket>`.
+        Ok(Some(ticket)) => restart_for_pairing(&dirs, &ticket),
+        Ok(None) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Parsed CLI arguments: an optional `--join <ticket>` to bootstrap into
@@ -197,6 +206,110 @@ fn channel_snapshot(registry: &ChannelRegistry) -> Vec<(String, RoomSecret, Vec<
             (name, secret, addrs)
         })
         .collect()
+}
+
+/// Local state that would otherwise conflict with or leak into the
+/// identity a confirmed live `/pair <ticket>` redeem is about to adopt --
+/// see `restart_for_pairing`. Paths are relative to `data_dir`/
+/// `config_dir` exactly as the rest of main.rs already resolves them
+/// (`MessageStore::new`, `ChannelRegistry::load`, etc.) -- kept as one
+/// explicit list, rather than wiping either directory wholesale, so this
+/// can never reach `identity` (this device's own keypair -- pairing
+/// changes the shared user key, not the device itself) or `leyline.log`,
+/// which on some platforms (macOS) live in the very same directory as
+/// everything here.
+fn paths_to_wipe_for_pairing(data_dir: &Path, config_dir: &Path) -> Vec<PathBuf> {
+    vec![
+        config_dir.join("user_key"),
+        data_dir.join("channels"),
+        data_dir.join("messages"),
+        data_dir.join("blobs"),
+        data_dir.join("contacts"),
+        data_dir.join("dms"),
+        data_dir.join("settings"),
+        data_dir.join("forgotten_devices"),
+    ]
+}
+
+/// Removes a file or directory at `path`, tolerating it already being
+/// absent -- e.g. a local cache (`contacts`, `forgotten_devices`) that was
+/// never written because the corresponding feature was never used on this
+/// device.
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Wipes every path `paths_to_wipe_for_pairing` names, stopping at the
+/// first failure rather than continuing best-effort -- a half-wiped,
+/// inconsistent state (e.g. channels gone but old messages still present)
+/// is worse than leaving everything as it was and failing loudly.
+fn wipe_superseded_state(data_dir: &Path, config_dir: &Path) -> anyhow::Result<()> {
+    for path in paths_to_wipe_for_pairing(data_dir, config_dir) {
+        remove_path(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Wipes the local state a confirmed live pairing redeem (see
+/// `app::AppState::restart_with_ticket`) would otherwise conflict with,
+/// then restarts this exact binary with `--pair <ticket>` so the actual
+/// redeem goes through the normal, already-tested startup bootstrap path
+/// (`pairing::bootstrap`) instead of a separate, independently-risky live
+/// code path -- see `pairing.rs`'s module doc comment for why pairing
+/// deliberately never tries to do this in place. Only ever called after
+/// the TUI has already shut down cleanly (`Net::shutdown`, `ratatui::
+/// restore`) -- see `main`'s call site.
+///
+/// On success this never returns: `exec_pair` replaces the process image
+/// outright on unix. The only way this returns `Err` is a wipe failure
+/// (nothing after it is touched) or the restart itself failing
+/// (vanishingly rare -- e.g. the binary was removed out from under
+/// itself); either way the ticket is still unredeemed and valid, so the
+/// error names the exact manual command that still finishes pairing.
+fn restart_for_pairing(dirs: &directories::ProjectDirs, ticket: &str) -> anyhow::Result<()> {
+    wipe_superseded_state(dirs.data_dir(), dirs.config_dir())?;
+
+    let exe = std::env::current_exe().context("failed to locate the current executable")?;
+    let err = exec_pair(&exe, ticket);
+    Err(err).with_context(|| {
+        format!(
+            "failed to restart automatically -- local state was already wiped; \
+             run `{} --pair {ticket}` manually to finish pairing",
+            exe.display()
+        )
+    })
+}
+
+/// Replaces this process outright with `<exe> --pair <ticket>` -- see
+/// `restart_for_pairing`. Never returns on success.
+#[cfg(unix)]
+fn exec_pair(exe: &Path, ticket: &str) -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+    std::process::Command::new(exe)
+        .arg("--pair")
+        .arg(ticket)
+        .exec()
+        .into()
+}
+
+/// Non-unix fallback for `exec_pair`: there's no process-image-replacing
+/// exec here, so spawn the new process and exit this one once it's
+/// launched.
+#[cfg(not(unix))]
+fn exec_pair(exe: &Path, ticket: &str) -> anyhow::Error {
+    match std::process::Command::new(exe)
+        .arg("--pair")
+        .arg(ticket)
+        .spawn()
+    {
+        Ok(_) => std::process::exit(0),
+        Err(err) => err.into(),
+    }
 }
 
 /// Resolves this app's OS-specific project directories, shared by logging
@@ -301,8 +414,13 @@ fn ring_bell() {
 /// The "snappy async event loop": crossterm's async `EventStream` and the
 /// network's `NetEvent`s merged via `tokio::select!`, redrawing only when
 /// something actually changed -- see concept.md's "snappy async event
-/// loop".
-async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyhow::Result<()> {
+/// loop". Returns the ticket from a confirmed live pairing redeem, if the
+/// loop ended that way (see `app::AppState::restart_with_ticket`) rather
+/// than a plain quit, for `main` to act on once the terminal is restored.
+async fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    session: Session,
+) -> anyhow::Result<Option<String>> {
     let Session {
         net,
         mut net_rx,
@@ -784,5 +902,78 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, session: Session) -> anyho
 
     net.shutdown().await?;
 
-    Ok(())
+    Ok(app.restart_with_ticket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_path_deletes_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("some_file");
+        std::fs::write(&path, b"data").unwrap();
+
+        remove_path(&path).unwrap();
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn remove_path_deletes_an_existing_directory_and_its_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("some_dir");
+        std::fs::create_dir_all(path.join("nested")).unwrap();
+        std::fs::write(path.join("nested").join("file"), b"data").unwrap();
+
+        remove_path(&path).unwrap();
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn remove_path_is_a_no_op_when_already_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never_existed");
+
+        remove_path(&path).unwrap();
+    }
+
+    #[test]
+    fn wipe_superseded_state_removes_every_listed_path_and_nothing_else() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        for path in paths_to_wipe_for_pairing(data_dir.path(), config_dir.path()) {
+            std::fs::write(&path, b"stale").unwrap();
+        }
+        // Stand in for `identity`/`leyline.log` -- never part of the wipe
+        // list, even though `identity` lives in the very same directory
+        // as `user_key` on some platforms (e.g. macOS, where `data_dir`
+        // and `config_dir` coincide).
+        let identity = config_dir.path().join("identity");
+        let log = data_dir.path().join("leyline.log");
+        std::fs::write(&identity, b"keep me").unwrap();
+        std::fs::write(&log, b"keep me too").unwrap();
+
+        wipe_superseded_state(data_dir.path(), config_dir.path()).unwrap();
+
+        for path in paths_to_wipe_for_pairing(data_dir.path(), config_dir.path()) {
+            assert!(
+                !path.exists(),
+                "{} should have been removed",
+                path.display()
+            );
+        }
+        assert!(identity.exists(), "identity must never be wiped by pairing");
+        assert!(log.exists(), "leyline.log must never be wiped by pairing");
+    }
+
+    #[test]
+    fn wipe_superseded_state_tolerates_paths_that_never_existed() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+
+        wipe_superseded_state(data_dir.path(), config_dir.path()).unwrap();
+    }
 }
