@@ -437,6 +437,7 @@ async fn run(
     } = session;
 
     let mut app = AppState::new(net.our_id, joined_channels.clone(), &active_channel);
+    app.load_self_user_id(net.our_user_id());
     app.load_contacts(contacts.all());
     app.load_settings(settings.bell_enabled());
     app.load_dm_registry(dm_registry.all());

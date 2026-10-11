@@ -615,6 +615,17 @@ impl Net {
             .map(|c| c.secret)
     }
 
+    /// Our own canonical user identity -- the shared user key's public
+    /// half embedded in `our_cert` (see `crate::message::DeviceCert::
+    /// user_id`), the same value every one of our certified sibling
+    /// devices broadcasts in their own `our_cert`. Handed to `AppState`
+    /// (`load_self_user_id`) so it can recognize a peer sharing this id as
+    /// one of our *own* other devices rather than an unrelated stranger --
+    /// see `app::AppState::canonical_id`'s doc comment.
+    pub fn our_user_id(&self) -> [u8; 32] {
+        self.our_cert.user_id
+    }
+
     /// Joins (or creates) a channel named by a bare name or an invite
     /// ticket string.
     ///

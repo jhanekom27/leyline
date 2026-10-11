@@ -424,6 +424,19 @@ pub enum InputAction {
 pub struct AppState {
     /// Our own identity, so we can tell our messages apart from peers'.
     pub self_id: [u8; 32],
+    /// Our own canonical user identity -- the shared user key's public
+    /// half (see `crate::net::Net::our_user_id` and `crate::message::
+    /// DeviceCert::user_id`), seeded once via `load_self_user_id` right
+    /// after `AppState::new`, before the event loop starts, mirroring
+    /// `load_contacts`. Lets `canonical_id` recognize a peer broadcasting
+    /// a certificate under this same user id as one of our *own* other
+    /// devices rather than an unrelated stranger -- see that method's and
+    /// `display_name`/`unique_peer_ids`'s doc comments, both of which rely
+    /// on it. Defaults to `self_id` until loaded; that can never collide
+    /// with a real peer's canonical id, since a cert claiming our own
+    /// device id as someone else's user id would fail `DeviceCert::
+    /// is_valid` before ever reaching `device_to_user`.
+    self_user_id: [u8; 32],
     pub channels: Vec<Channel>,
     pub active: usize,
     pub should_quit: bool,
@@ -536,6 +549,7 @@ impl AppState {
         let channels: Vec<Channel> = channel_names.into_iter().map(Channel::new).collect();
         Self {
             self_id,
+            self_user_id: self_id,
             channels,
             active,
             should_quit: false,
@@ -570,6 +584,14 @@ impl AppState {
     /// the event loop starts -- mirrors `load_history`.
     pub fn load_contacts(&mut self, petnames: HashMap<[u8; 32], String>) {
         self.petnames = petnames;
+    }
+
+    /// Seeds our own canonical user identity (see `self_user_id`), loaded
+    /// by the caller from `net::Net::our_user_id`. Intended to be called
+    /// once, right after `AppState::new`, before the event loop starts --
+    /// mirrors `load_contacts`.
+    pub fn load_self_user_id(&mut self, user_id: [u8; 32]) {
+        self.self_user_id = user_id;
     }
 
     /// Seeds the persisted bell preference loaded by the caller (see
@@ -1165,13 +1187,17 @@ impl AppState {
         compose_message(self.self_id, text, None)
     }
 
-    /// Displays a sender as "you" for our own id; their pet name if one
-    /// has been assigned via `/alias` (keyed by their resolved
-    /// `canonical_id`, not necessarily the literal `sender`, so an alias
-    /// set against any one of a person's devices applies to all of them
-    /// once their certificates are known -- see `canonical_id`); else
-    /// their last broadcast nickname from `/nick`, suffixed with their hex
-    /// prefix since a nickname is spoofable and not unique (features.md's
+    /// Displays a sender as "you" for our own id, or for *any* peer
+    /// certified under our own `self_user_id` -- i.e. one of our own other
+    /// devices, paired via `/pair` (see `canonical_id`) -- since from a
+    /// human's perspective a message or presence from your other device is
+    /// still just you, not a second stranger; their pet name if one has
+    /// been assigned via `/alias` (keyed by their resolved `canonical_id`,
+    /// not necessarily the literal `sender`, so an alias set against any
+    /// one of a person's devices applies to all of them once their
+    /// certificates are known -- see `canonical_id`); else their last
+    /// broadcast nickname from `/nick`, suffixed with their hex prefix
+    /// since a nickname is spoofable and not unique (features.md's
     /// "Broadcast nicknames"); or, absent both, a shortened hex id on its
     /// own.
     pub fn display_name(&self, sender: &[u8; 32]) -> String {
@@ -1179,6 +1205,9 @@ impl AppState {
             return "you".to_string();
         }
         let id = self.canonical_id(sender);
+        if id == self.self_user_id {
+            return "you".to_string();
+        }
         if let Some(name) = self.petnames.get(&id) {
             name.clone()
         } else if let Some(nickname) = self.nicknames.get(&id) {
@@ -1196,7 +1225,13 @@ impl AppState {
     /// (`grouped_who_lines`), and `/alias` (`run_alias`) all resolve
     /// through this first, so two of one person's devices collapse onto
     /// whichever single petname/nickname has been recorded for that
-    /// person, instead of needing one recorded per device.
+    /// person, instead of needing one recorded per device. Note that this
+    /// never maps our own `self_id` to `self_user_id` -- nothing ever
+    /// sends us a certificate for our own device id, since `announce_
+    /// device` only ever broadcasts outward -- so callers that need to
+    /// recognize *our own* sibling devices (`display_name`, `unique_
+    /// peer_ids`) compare a peer's `canonical_id` against `self_user_id`
+    /// directly instead of relying on this method alone.
     ///
     /// A forgotten device (`/forget-device`, see `forgotten`) is always
     /// treated as if no certificate were known for it, regardless of what
@@ -1213,14 +1248,17 @@ impl AppState {
     /// for each distinct person and preserving their original relative
     /// order -- the same grouping `grouped_who_lines` applies for `/who`,
     /// just without that command's "(N devices)" breakdown text, which
-    /// stays exclusively `/who`'s. Used by `ui::render_peers` so the
-    /// sidebar shows one row per person instead of one per device once
-    /// their devices are certified under the same user key -- a peer with
-    /// no known certificate is simply its own one-member group, so this
-    /// changes nothing for it.
+    /// stays exclusively `/who`'s. Also excludes any peer certified under
+    /// our own `self_user_id` entirely, rather than merging it into some
+    /// other group: one of our own other devices is already represented
+    /// by the sidebar's separate "you" row (`ui::render_peers`), so
+    /// listing it again here would just be the same person shown twice
+    /// under two different labels. A peer with no known certificate is
+    /// simply its own one-member group, so this changes nothing for it.
     pub fn unique_peer_ids(&self, ids: &[[u8; 32]]) -> Vec<[u8; 32]> {
         let mut seen = HashSet::new();
         ids.iter()
+            .filter(|id| self.canonical_id(id) != self.self_user_id)
             .filter(|id| seen.insert(self.canonical_id(id)))
             .copied()
             .collect()
@@ -2607,6 +2645,78 @@ mod tests {
         let unique = app.unique_peer_ids(&[PEER_ID, PEER_ID_3, PEER_ID_2]);
 
         assert_eq!(unique, vec![PEER_ID, PEER_ID_3]);
+    }
+
+    #[test]
+    fn display_name_shows_you_for_a_peer_certified_under_our_own_user_key() {
+        let mut app = app();
+        let user_key = SecretKey::generate();
+        let user_id = *user_key.public().as_bytes();
+        app.load_self_user_id(user_id);
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID),
+        ));
+
+        assert_eq!(
+            app.display_name(&PEER_ID),
+            "you",
+            "a paired sibling device is us, not a stranger"
+        );
+    }
+
+    #[test]
+    fn display_name_you_check_for_a_sibling_device_overrides_any_petname() {
+        let mut app = app();
+        let user_key = SecretKey::generate();
+        let user_id = *user_key.public().as_bytes();
+        app.load_self_user_id(user_id);
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID),
+        ));
+        app.load_contacts(HashMap::from([(user_id, "My Phone".to_string())]));
+
+        assert_eq!(
+            app.display_name(&PEER_ID),
+            "you",
+            "recognizing our own identity must win over a petname, mirroring the self_id check above it"
+        );
+    }
+
+    #[test]
+    fn unique_peer_ids_excludes_a_sibling_device_entirely() {
+        let mut app = app();
+        let user_key = SecretKey::generate();
+        let user_id = *user_key.public().as_bytes();
+        app.load_self_user_id(user_id);
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID),
+        ));
+
+        let unique = app.unique_peer_ids(&[PEER_ID, PEER_ID_2]);
+
+        assert_eq!(
+            unique,
+            vec![PEER_ID_2],
+            "our own sibling device is already shown as the sidebar's separate 'you' row, \
+             so it must not also appear as a peer"
+        );
+    }
+
+    #[test]
+    fn unique_peer_ids_is_empty_when_the_only_peer_is_a_sibling_device() {
+        let mut app = app();
+        let user_key = SecretKey::generate();
+        let user_id = *user_key.public().as_bytes();
+        app.load_self_user_id(user_id);
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID),
+        ));
+
+        assert!(app.unique_peer_ids(&[PEER_ID]).is_empty());
     }
 
     #[test]
