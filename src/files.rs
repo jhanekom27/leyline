@@ -2,7 +2,9 @@
 //! sharing" idea. Kept separate from backfill.rs (which only knows about
 //! content-addressed blobs, not real paths) and net.rs (transport): this is
 //! where a peer's announced filename turns into an actual, safe path on
-//! disk, and where "where did it go" gets answered with zero configuration.
+//! disk, where "where did it go" gets answered with zero configuration,
+//! and -- on the way out -- where a file someone wants to share is checked
+//! before it is staged (`stage_file`/`stage_image`).
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,12 @@ const SUBDIR: &str = "leyline";
 /// How many "name (n).ext" candidates to try before giving up -- a safety
 /// valve against a pathological loop, not a realistic limit.
 const MAX_COLLISION_ATTEMPTS: u32 = 1000;
+
+/// Largest file (or pasted image) that can be shared: a simple guardrail
+/// against an accidental huge share (e.g. a mistyped path to a large video
+/// file). `BackfillStore::add_file` copies the file into the local blob
+/// store, so a shared file's bytes are duplicated on disk locally.
+pub const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
 
 /// Where downloaded files land by default: the OS Downloads folder (via
 /// `directories::UserDirs`) under a `leyline/` subfolder, so a saved file
@@ -118,6 +126,116 @@ fn try_claim(dir: &Path, name: &str) -> std::io::Result<Option<PathBuf>> {
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
         Err(err) => Err(err),
     }
+}
+
+/// A file, or a pasted image, waiting in a channel's staging area to be
+/// shared -- see `app::Channel::staged`. Staging separates *choosing*
+/// something to share (`Ctrl+V`/`/paste`) from *sending* it, so what is
+/// about to go out is visible, can take a caption, and can still be
+/// withdrawn. Always built by `stage_file`/`stage_image`, the one place an
+/// outgoing file is checked, so everything downstream
+/// (`net::Net::send_staged`) can trust it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedAttachment {
+    /// The name it will be shared under.
+    pub filename: String,
+    /// Size in bytes as of staging -- what the strip above the input box
+    /// shows, and what peers see before deciding whether to `/save`.
+    pub size: u64,
+    /// Where the content comes from once it is sent.
+    pub source: StagedSource,
+}
+
+/// Where a `StagedAttachment`'s bytes come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StagedSource {
+    /// A file on disk, as an absolute path `stage_file` has already
+    /// checked. Read when sent, not when staged, so what goes out is
+    /// whatever the file holds at that moment.
+    Path(PathBuf),
+    /// Bytes with no file behind them: a clipboard image re-encoded as PNG
+    /// (see `net::encode_png`), which only ever exists in memory.
+    Bytes(Vec<u8>),
+}
+
+/// Expands a `/send`-typed path for the local filesystem: a leading `~`
+/// (bare, or `~/...`) to the user's home directory, and any relative path
+/// to absolute. Both matter because the path is typed directly into
+/// leyline's own input box, not a shell -- nothing else expands `~`
+/// here -- and because iroh-blobs' importer (`BackfillStore::add_file`)
+/// hard-requires an absolute path, rejecting a relative one outright.
+/// Falls back to the path as typed if the home or current directory can't
+/// be determined.
+pub fn expand_path(path: &str) -> PathBuf {
+    let expanded = if path == "~" {
+        directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(rest))
+    } else {
+        None
+    }
+    .unwrap_or_else(|| PathBuf::from(path));
+
+    std::path::absolute(&expanded).unwrap_or(expanded)
+}
+
+/// Checks `path` (already expanded, see `expand_path`) for sharing and
+/// stages it: it must exist, be a file rather than a directory, be
+/// readable, fit within `MAX_FILE_SIZE`, and have a name to share it
+/// under. Refusals read like the ones `/send` has always given, since
+/// `/send` and the clipboard both stage through here -- one boundary, so
+/// what each of them refuses and how it says so cannot drift apart.
+pub fn stage_file(path: &Path) -> Result<StagedAttachment, String> {
+    let metadata =
+        std::fs::metadata(path).map_err(|err| format!("can't send {}: {err}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("can't send {}: not a file", path.display()));
+    }
+    // `metadata` works on a file whose contents can't be read (no read
+    // permission), so try opening it: refusing now beats failing at import
+    // time, after a caption has been typed.
+    std::fs::File::open(path).map_err(|err| format!("can't send {}: {err}", path.display()))?;
+    if let Some(reason) = too_large(metadata.len()) {
+        return Err(format!("can't send {}: {reason}", path.display()));
+    }
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("can't send {}: can't determine a filename", path.display()))?;
+    Ok(StagedAttachment {
+        filename,
+        size: metadata.len(),
+        source: StagedSource::Path(path.to_path_buf()),
+    })
+}
+
+/// Stages already-in-hand bytes (a clipboard image re-encoded as PNG, see
+/// `net::Net::paste`) under `filename`, subject to the same
+/// `MAX_FILE_SIZE` cap as `stage_file` -- there is no path to inspect, so
+/// the size is the only thing to check.
+pub fn stage_image(filename: String, bytes: Vec<u8>) -> Result<StagedAttachment, String> {
+    let size = bytes.len() as u64;
+    if let Some(reason) = too_large(size) {
+        return Err(format!("can't paste image: {reason}"));
+    }
+    Ok(StagedAttachment {
+        filename,
+        size,
+        source: StagedSource::Bytes(bytes),
+    })
+}
+
+/// Why `size` bytes can't be shared, or `None` if they can -- the wording
+/// shared by `stage_file`'s and `stage_image`'s refusals.
+fn too_large(size: u64) -> Option<String> {
+    (size > MAX_FILE_SIZE).then(|| {
+        format!(
+            "too large ({}, max {})",
+            human_size(size),
+            human_size(MAX_FILE_SIZE)
+        )
+    })
 }
 
 /// Formats a byte count for display, e.g. `2.1 MB`. Binary (1024-based)
@@ -287,5 +405,131 @@ mod tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(1024), "1.0 KB");
         assert_eq!(human_size(2_150_000), "2.1 MB");
+    }
+
+    fn home_dir() -> PathBuf {
+        directories::BaseDirs::new()
+            .unwrap()
+            .home_dir()
+            .to_path_buf()
+    }
+
+    #[test]
+    fn expand_path_expands_a_bare_tilde_to_the_home_directory() {
+        assert_eq!(expand_path("~"), home_dir());
+    }
+
+    #[test]
+    fn expand_path_expands_a_tilde_prefixed_path() {
+        assert_eq!(
+            expand_path("~/Downloads/tilemap.png"),
+            home_dir().join("Downloads/tilemap.png")
+        );
+    }
+
+    #[test]
+    fn expand_path_makes_a_relative_path_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(expand_path("README.md"), cwd.join("README.md"));
+    }
+
+    #[test]
+    fn expand_path_leaves_an_already_absolute_path_alone() {
+        assert_eq!(expand_path("/tmp/foo.txt"), PathBuf::from("/tmp/foo.txt"));
+    }
+
+    #[test]
+    fn expand_path_does_not_expand_a_tilde_in_the_middle_of_a_path() {
+        // Only a leading `~` is special, mirroring shell tilde expansion --
+        // `foo/~/bar` is just a literal (if unusual) relative path.
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(expand_path("foo/~/bar"), cwd.join("foo/~/bar"));
+    }
+
+    #[test]
+    fn stage_file_reports_the_name_size_and_path_of_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.pdf");
+        std::fs::write(&path, b"twelve bytes").unwrap();
+
+        let staged = stage_file(&path).unwrap();
+
+        assert_eq!(
+            staged,
+            StagedAttachment {
+                filename: "report.pdf".to_string(),
+                size: 12,
+                source: StagedSource::Path(path),
+            }
+        );
+    }
+
+    #[test]
+    fn stage_file_refuses_a_missing_file_in_the_wording_send_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.txt");
+
+        let message = stage_file(&missing).unwrap_err();
+
+        assert!(
+            message.starts_with(&format!("can't send {}: ", missing.display())),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn stage_file_refuses_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let message = stage_file(dir.path()).unwrap_err();
+
+        assert_eq!(
+            message,
+            format!("can't send {}: not a file", dir.path().display())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_file_refuses_a_file_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.txt");
+        std::fs::write(&path, b"nope").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            // Running as root: permissions don't apply, so there is
+            // nothing to refuse.
+            return;
+        }
+
+        let message = stage_file(&path).unwrap_err();
+
+        assert!(
+            message.starts_with(&format!("can't send {}: ", path.display())),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn too_large_only_flags_sizes_over_the_limit() {
+        assert_eq!(too_large(MAX_FILE_SIZE), None);
+        let reason = too_large(MAX_FILE_SIZE + 1).unwrap();
+        assert!(reason.starts_with("too large ("), "got: {reason}");
+        assert!(reason.contains("max 500.0 MB"), "got: {reason}");
+    }
+
+    #[test]
+    fn stage_image_keeps_the_bytes_and_reports_their_size() {
+        let staged = stage_image("clipboard-1.png".to_string(), vec![1, 2, 3]).unwrap();
+
+        assert_eq!(
+            staged,
+            StagedAttachment {
+                filename: "clipboard-1.png".to_string(),
+                size: 3,
+                source: StagedSource::Bytes(vec![1, 2, 3]),
+            }
+        );
     }
 }

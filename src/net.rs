@@ -32,6 +32,7 @@ use tracing::{debug, info, warn};
 
 use crate::backfill::BackfillStore;
 use crate::direct::{self, Direct};
+use crate::files::{self, StagedAttachment, StagedSource};
 use crate::message::{
     ChannelSyncAnnounce, ChatMessage, DeviceCert, FileAttachment, GossipPayload, HistoryAnnounce,
     IdentityAnnounce, VersionAnnounce, now_unix_ms,
@@ -39,12 +40,6 @@ use crate::message::{
 use crate::pairing::{self, PairingProtocol};
 use crate::ticket::{ChannelTicket, PairingTicket, RoomSecret};
 use crate::version;
-
-/// Simple guardrail against an accidental huge `/send` (e.g. a mistyped
-/// path to a large video file): `BackfillStore::add_file` copies the file
-/// into the local blob store, so a sent file's bytes are duplicated on
-/// disk locally -- see net.rs's `send_file`.
-const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
 
 /// The channel every instance joins on startup.
 const DEFAULT_CHANNEL: &str = "general";
@@ -171,14 +166,15 @@ pub enum NetEvent {
     FileSaveFailed { filename: String, error: String },
     /// `/paste` found one or more real files on the OS clipboard (e.g. a
     /// Finder/Explorer copy) -- see `Net::paste`. Reported as paths, not
-    /// already-imported attachments, so the caller can share each one via
-    /// the exact same `Net::send_file` path `/send` uses -- this is what
-    /// keeps a copied file's original bytes (including a real animated
-    /// GIF) intact.
+    /// already-imported attachments, so the caller can stage each one via
+    /// the exact same `files::stage_file` check `/send` uses and send it
+    /// later through `Net::send_staged` -- this is what keeps a copied
+    /// file's original bytes (including a real animated GIF) intact.
     ClipboardFiles(String, Vec<PathBuf>),
     /// `/paste` found rendered image pixels on the OS clipboard (e.g. a
     /// screenshot, or a browser's "Copy Image") and re-encoded them as PNG
-    /// -- see `Net::paste` and `encode_png`. Always a single static frame:
+    /// -- see `Net::paste` and `encode_png`. The caller stages it
+    /// (`files::stage_image`) like a file. Always a single static frame:
     /// no OS clipboard image format carries multi-frame/animation data, so
     /// this is never a real animated GIF even if the source image was one
     /// -- only `ClipboardFiles` preserves that.
@@ -247,30 +243,9 @@ fn is_self(addr: &EndpointAddr, our_id: [u8; 32]) -> bool {
     *addr.id.as_bytes() == our_id
 }
 
-/// Expands a `/send`-typed path for the local filesystem: a leading `~`
-/// (bare, or `~/...`) to the user's home directory, and any relative path
-/// to absolute. Both matter because the path is typed directly into
-/// leyline's own input box, not a shell -- nothing else expands `~`
-/// here -- and because iroh-blobs' importer (`BackfillStore::add_file`)
-/// hard-requires an absolute path, rejecting a relative one outright.
-/// Falls back to the path as typed if the home or current directory can't
-/// be determined.
-fn expand_path(path: &str) -> PathBuf {
-    let expanded = if path == "~" {
-        directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(rest))
-    } else {
-        None
-    }
-    .unwrap_or_else(|| PathBuf::from(path));
-
-    std::path::absolute(&expanded).unwrap_or(expanded)
-}
-
 /// Encodes clipboard pixel data (`ImageData`'s raw RGBA8 buffer, row-major,
 /// no padding -- see `Net::paste`) as a PNG, the `/paste` counterpart to
-/// `expand_path`'s filesystem handling: clipboard image data has no
+/// `files::expand_path`'s filesystem handling: clipboard image data has no
 /// filename or original file format to preserve, so PNG (lossless,
 /// universally viewable) is what actually gets shared, not the raw pixel
 /// buffer itself. Always produces a single static frame -- `ImageData` has
@@ -1196,80 +1171,46 @@ impl Net {
         self.join_known(announce.name, announce.secret, announce.peers);
     }
 
-    /// Imports `path` into the shared blob store and prepares it to be
-    /// broadcast to `channel` as a `ChatMessage` with an attachment -- the
-    /// `/send` counterpart to `send`. Validates synchronously (existence,
-    /// that it's a file rather than a directory, a simple size cap, and
-    /// that a filename can be derived) so an obviously bad path is
-    /// reported immediately instead of after spawning work; the import
-    /// itself happens in a spawned task, reporting the outcome back as
-    /// `NetEvent::FileReady`/`FileSendFailed` since hashing a large file
-    /// can take a moment and must not block the caller's event loop.
-    /// Deliberately does *not* broadcast itself -- the caller (main.rs)
-    /// does that via `send` once it receives `FileReady`, the same place
-    /// every other locally-authored message is broadcast from.
+    /// Shares the file at `path` with `channel` right away -- the `/send`
+    /// counterpart to `send`. Checks it synchronously (`files::stage_file`:
+    /// existence, that it's a file rather than a directory, a simple size
+    /// cap, and that a filename can be derived) so an obviously bad path is
+    /// reported immediately instead of after spawning work, then hands it
+    /// to `send_staged`, the same import-and-announce path a staged
+    /// attachment takes -- just with no staging step in between, since
+    /// `/send` is an explicit command.
     pub fn send_file(&self, channel: String, path: String) -> Option<String> {
-        let path = expand_path(&path);
-        let metadata = match std::fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(err) => return Some(format!("can't send {}: {err}", path.display())),
-        };
-        if !metadata.is_file() {
-            return Some(format!("can't send {}: not a file", path.display()));
+        match files::stage_file(&files::expand_path(&path)) {
+            Ok(item) => {
+                self.send_staged(channel, vec![item], String::new());
+                None
+            }
+            Err(message) => Some(message),
         }
-        if metadata.len() > MAX_FILE_SIZE {
-            return Some(format!(
-                "can't send {}: too large ({}, max {})",
-                path.display(),
-                crate::files::human_size(metadata.len()),
-                crate::files::human_size(MAX_FILE_SIZE)
-            ));
-        }
-        let Some(filename) = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_string)
-        else {
-            return Some(format!(
-                "can't send {}: can't determine a filename",
-                path.display()
-            ));
-        };
+    }
 
-        let backfill = self.backfill.clone();
-        let events_tx = self.events_tx.clone();
-        let our_id = self.our_id;
-        let size = metadata.len();
-        tokio::spawn(async move {
-            let hash = match backfill.add_file(&path).await {
-                Ok(hash) => hash,
-                Err(err) => {
-                    let _ = events_tx
-                        .send(NetEvent::FileSendFailed {
-                            path: path.display().to_string(),
-                            error: err.to_string(),
-                        })
-                        .await;
-                    return;
-                }
-            };
-            let message = ChatMessage {
-                v: 3,
-                id: rand::random(),
-                sender: our_id,
-                ts_unix_ms: now_unix_ms(),
-                text: String::new(),
-                attachment: Some(FileAttachment {
-                    filename,
-                    size,
-                    hash,
-                }),
-                reply_to: None,
-            };
-            let _ = events_tx.send(NetEvent::FileReady(channel, message)).await;
-        });
-
-        None
+    /// Imports each of `items` into the shared blob store, in order, and
+    /// prepares it to be broadcast to `channel` as a `ChatMessage` with an
+    /// attachment. `caption` (empty for none) rides on the first item that
+    /// actually imports, so a bad first file doesn't swallow what was
+    /// typed. The imports happen in one spawned task, reporting each
+    /// outcome back as `NetEvent::FileReady`/`FileSendFailed`, since hashing
+    /// a large file can take a moment and must not block the caller's event
+    /// loop; doing them one after another also keeps the messages in
+    /// staging order. Deliberately does *not* broadcast itself -- the
+    /// caller (main.rs) does that via `send` once it receives `FileReady`,
+    /// the same place every other locally-authored message is broadcast
+    /// from. `items` come from `files::stage_file`/`stage_image`, which
+    /// already vetted them, so nothing is re-checked here.
+    pub fn send_staged(&self, channel: String, items: Vec<StagedAttachment>, caption: String) {
+        tokio::spawn(import_staged(
+            self.backfill.clone(),
+            self.events_tx.clone(),
+            self.our_id,
+            channel,
+            items,
+            caption,
+        ));
     }
 
     /// Reads the OS clipboard and reports back what it found -- for
@@ -1289,10 +1230,11 @@ impl Net {
     /// one just to read from it here.
     ///
     /// Tries, in priority order: a real file list (so a Finder/Explorer
-    /// copy -- including an actual animated GIF -- shares its exact
-    /// original bytes via the same path `/send` uses), then rendered image
-    /// pixels (always a single static frame once re-encoded, see
-    /// `encode_png`), then plain text (shared as an ordinary chat message).
+    /// copy -- including an actual animated GIF -- is staged with its exact
+    /// original bytes, checked the same way `/send` checks a path), then
+    /// rendered image pixels (staged too, always a single static frame once
+    /// re-encoded, see `encode_png`), then plain text (shared at once as an
+    /// ordinary chat message).
     pub fn paste(&self, channel: String) {
         let events_tx = self.events_tx.clone();
         tokio::spawn(async move {
@@ -1347,61 +1289,6 @@ impl Net {
                 .send(NetEvent::PasteFailed("clipboard is empty".to_string()))
                 .await;
         });
-    }
-
-    /// Imports already-in-hand bytes (a clipboard image re-encoded as PNG
-    /// by `paste`/`encode_png`) into the shared blob store and prepares
-    /// them to broadcast to `channel` as a `ChatMessage` with an
-    /// attachment -- mirrors `send_file`, minus the path-stat step, since
-    /// there's no real path to check; `bytes.len()` is checked against the
-    /// same `MAX_FILE_SIZE` cap instead.
-    pub fn send_clipboard_image(
-        &self,
-        channel: String,
-        filename: String,
-        bytes: Vec<u8>,
-    ) -> Option<String> {
-        let size = bytes.len() as u64;
-        if size > MAX_FILE_SIZE {
-            return Some(format!(
-                "can't paste image: too large ({}, max {})",
-                crate::files::human_size(size),
-                crate::files::human_size(MAX_FILE_SIZE)
-            ));
-        }
-
-        let backfill = self.backfill.clone();
-        let events_tx = self.events_tx.clone();
-        let our_id = self.our_id;
-        tokio::spawn(async move {
-            let hash = match backfill.add_bytes(bytes).await {
-                Ok(hash) => hash,
-                Err(err) => {
-                    let _ = events_tx
-                        .send(NetEvent::PasteFailed(format!(
-                            "failed to import clipboard image: {err}"
-                        )))
-                        .await;
-                    return;
-                }
-            };
-            let message = ChatMessage {
-                v: 3,
-                id: rand::random(),
-                sender: our_id,
-                ts_unix_ms: now_unix_ms(),
-                text: String::new(),
-                attachment: Some(FileAttachment {
-                    filename,
-                    size,
-                    hash,
-                }),
-                reply_to: None,
-            };
-            let _ = events_tx.send(NetEvent::FileReady(channel, message)).await;
-        });
-
-        None
     }
 
     /// Downloads a file previously shared in some joined channel and writes
@@ -1635,6 +1522,67 @@ async fn announce_learned_address(
         .await;
 }
 
+/// The work behind `Net::send_staged`, as a free function over just what
+/// it needs (the blob store, the event channel, our id) so it can be
+/// tested without standing up a whole `Net`. Imports `items` one after
+/// another -- which is what keeps them in staging order -- reporting each
+/// as `NetEvent::FileReady` (a composed message, with `caption` on the
+/// first that imports) or `NetEvent::FileSendFailed`.
+async fn import_staged(
+    backfill: BackfillStore,
+    events_tx: mpsc::Sender<NetEvent>,
+    our_id: [u8; 32],
+    channel: String,
+    items: Vec<StagedAttachment>,
+    caption: String,
+) {
+    let mut caption = Some(caption).filter(|text| !text.is_empty());
+    for StagedAttachment {
+        filename,
+        size,
+        source,
+    } in items
+    {
+        // What a failure report should call it: the path for a file, the
+        // made-up name for an image that has none.
+        let (label, imported) = match source {
+            StagedSource::Path(path) => {
+                let imported = backfill.add_file(&path).await;
+                (path.display().to_string(), imported)
+            }
+            StagedSource::Bytes(bytes) => (filename.clone(), backfill.add_bytes(bytes).await),
+        };
+        let hash = match imported {
+            Ok(hash) => hash,
+            Err(err) => {
+                let _ = events_tx
+                    .send(NetEvent::FileSendFailed {
+                        path: label,
+                        error: err.to_string(),
+                    })
+                    .await;
+                continue;
+            }
+        };
+        let message = ChatMessage {
+            v: 3,
+            id: rand::random(),
+            sender: our_id,
+            ts_unix_ms: now_unix_ms(),
+            text: caption.take().unwrap_or_default(),
+            attachment: Some(FileAttachment {
+                filename,
+                size,
+                hash,
+            }),
+            reply_to: None,
+        };
+        let _ = events_tx
+            .send(NetEvent::FileReady(channel.clone(), message))
+            .await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -1746,43 +1694,117 @@ mod tests {
         assert_eq!(topic_for_secret(&secret), topic_for_secret(&secret));
     }
 
-    fn home_dir() -> PathBuf {
-        directories::BaseDirs::new()
-            .unwrap()
-            .home_dir()
-            .to_path_buf()
+    /// Runs `import_staged` for `items` against a throwaway blob store and
+    /// returns everything it reported, in order.
+    async fn import_all(items: Vec<StagedAttachment>, caption: &str) -> Vec<NetEvent> {
+        let store_dir = tempfile::tempdir().unwrap();
+        let backfill = BackfillStore::new(store_dir.path()).await.unwrap();
+        let (events_tx, mut events_rx) = mpsc::channel(16);
+
+        import_staged(
+            backfill,
+            events_tx,
+            [7; 32],
+            "general".to_string(),
+            items,
+            caption.to_string(),
+        )
+        .await;
+
+        let mut events = Vec::new();
+        while let Some(event) = events_rx.recv().await {
+            events.push(event);
+        }
+        events
     }
 
-    #[test]
-    fn expand_path_expands_a_bare_tilde_to_the_home_directory() {
-        assert_eq!(expand_path("~"), home_dir());
+    /// The messages among `events` that finished importing, in order.
+    fn ready_messages(events: &[NetEvent]) -> Vec<&ChatMessage> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                NetEvent::FileReady(_, message) => Some(message),
+                _ => None,
+            })
+            .collect()
     }
 
-    #[test]
-    fn expand_path_expands_a_tilde_prefixed_path() {
+    #[tokio::test]
+    async fn import_staged_announces_each_file_in_order_with_the_caption_on_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a.txt");
+        let second = dir.path().join("b.txt");
+        std::fs::write(&first, b"alpha").unwrap();
+        std::fs::write(&second, b"bravo!").unwrap();
+        let items = vec![
+            files::stage_file(&first).unwrap(),
+            files::stage_file(&second).unwrap(),
+        ];
+
+        let events = import_all(items, "look at these").await;
+
+        let messages = ready_messages(&events);
+        assert_eq!(messages.len(), 2);
+        let a = messages[0].attachment.as_ref().unwrap();
+        assert_eq!((a.filename.as_str(), a.size), ("a.txt", 5));
+        assert_eq!(a.hash, Hash::new(b"alpha"));
+        assert_eq!(messages[0].text, "look at these");
+        assert_eq!(messages[0].sender, [7; 32]);
+        let b = messages[1].attachment.as_ref().unwrap();
+        assert_eq!((b.filename.as_str(), b.size), ("b.txt", 6));
+        assert_eq!(b.hash, Hash::new(b"bravo!"));
         assert_eq!(
-            expand_path("~/Downloads/tilemap.png"),
-            home_dir().join("Downloads/tilemap.png")
+            messages[1].text, "",
+            "only the first attachment carries the caption"
+        );
+        assert!(
+            events.iter().all(
+                |event| matches!(event, NetEvent::FileReady(channel, _) if channel == "general")
+            )
         );
     }
 
-    #[test]
-    fn expand_path_makes_a_relative_path_absolute() {
-        let cwd = std::env::current_dir().unwrap();
-        assert_eq!(expand_path("README.md"), cwd.join("README.md"));
+    #[tokio::test]
+    async fn import_staged_gives_the_caption_to_the_first_file_that_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        std::fs::write(&good, b"fine").unwrap();
+        // Staged earlier, deleted since: its import fails, and that must
+        // not swallow what was typed.
+        let gone = StagedAttachment {
+            filename: "gone.txt".to_string(),
+            size: 4,
+            source: StagedSource::Path(dir.path().join("gone.txt")),
+        };
+        let items = vec![gone, files::stage_file(&good).unwrap()];
+
+        let events = import_all(items, "still here").await;
+
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            NetEvent::FileSendFailed { path, .. } => {
+                assert!(path.ends_with("gone.txt"), "got: {path}");
+            }
+            _ => panic!("expected the missing file to be reported as failed"),
+        }
+        let messages = ready_messages(&events);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "still here");
     }
 
-    #[test]
-    fn expand_path_leaves_an_already_absolute_path_alone() {
-        assert_eq!(expand_path("/tmp/foo.txt"), PathBuf::from("/tmp/foo.txt"));
-    }
+    #[tokio::test]
+    async fn import_staged_imports_a_clipboard_image_from_its_bytes() {
+        let image = files::stage_image("clipboard-1.png".to_string(), vec![1, 2, 3]).unwrap();
 
-    #[test]
-    fn expand_path_does_not_expand_a_tilde_in_the_middle_of_a_path() {
-        // Only a leading `~` is special, mirroring shell tilde expansion --
-        // `foo/~/bar` is just a literal (if unusual) relative path.
-        let cwd = std::env::current_dir().unwrap();
-        assert_eq!(expand_path("foo/~/bar"), cwd.join("foo/~/bar"));
+        let events = import_all(vec![image], "").await;
+
+        let messages = ready_messages(&events);
+        assert_eq!(messages.len(), 1);
+        let attachment = messages[0].attachment.as_ref().unwrap();
+        assert_eq!(attachment.filename, "clipboard-1.png");
+        assert_eq!(attachment.size, 3);
+        assert_eq!(attachment.hash, Hash::new([1, 2, 3]));
+        assert_eq!(messages[0].text, "", "no caption was typed");
     }
 
     #[test]

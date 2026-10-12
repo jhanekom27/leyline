@@ -137,20 +137,20 @@ HOME=/tmp/leyline-b CARGO_HOME="$REAL_CARGO_HOME" cargo run
 | `Left` / `Right` | Move the cursor one character (across a line break too, in a multi-line message) |
 | `Home` / `Ctrl+A` | Jump to the start of the current line |
 | `End` / `Ctrl+E` | Jump to the end of the current line |
-| `Backspace` / `Delete` | Delete the character before / at the cursor |
+| `Backspace` / `Delete` | Delete the character before / at the cursor (on an empty input, `Backspace` instead takes the most recently staged attachment back out -- see `Ctrl+V`) |
 | `Ctrl+U` | Delete from the start of the current line to the cursor |
 | `Ctrl+K` | Delete from the cursor to the end of the current line |
 | `Ctrl+W` | Delete the word before the cursor |
 | `Alt+Enter` / `Ctrl+J` | Insert a newline in the message box without sending, for a longer, spaced-out message -- the box grows to fit (and scrolls, past a handful of lines) |
-| `Enter` | Send the composed message, or run a `/` command |
+| `Enter` | Send the composed message, or run a `/` command. With attachments staged (see `Ctrl+V`) it sends them all instead, the typed text becoming the caption of the first -- but a `/` command still runs as a command and leaves them staged |
 | (paste, e.g. `Cmd+V`/`Ctrl+V`) | Paste text from the terminal as one atomic edit, so a multi-line paste can't prematurely send a partial line or trigger a stray `/command` |
-| `Ctrl+V` | Share whatever's on the OS clipboard (a file, an image, or text) with the active channel -- same as `/paste`. `Cmd+V` also works if your terminal forwards it, but most (including this one) reserve it for their own text-paste above |
+| `Ctrl+V` | Share whatever's on the OS clipboard (a file, an image, or text) with the active channel -- same as `/paste`. A file or image is *staged* in a strip above the input box (name and size) rather than sent at once: `Enter` sends it, `Backspace` on an empty input removes the newest, `Esc` clears them all, and the staged files stay with their channel when you switch tabs. Plain text is sent at once. `Cmd+V` also works if your terminal forwards it, but most (including this one) reserve it for their own text-paste above |
 | `Ctrl+R` | Pick a message to reply to -- `Up`/`Down` move the highlight, `Enter` confirms, `Esc` cancels |
 | `Ctrl+T` | Pick a message to view its reply chain in isolation -- `Up`/`Down` move the highlight, `Enter` confirms, `Esc` cancels |
 | `Up` / `Down` | Scroll the message history (or move the highlight while picking a reply or thread target, see `Ctrl+R`/`Ctrl+T`) |
 | `Tab` / `Shift+Tab` | Switch to the next / previous channel in the left-hand panel (group channels first, then conversations), wrapping around |
 | `Ctrl+P` | Jump to a channel or conversation by name -- type to narrow the list to names containing what you typed (case-insensitive), `Up`/`Down` move the highlight, `Enter` switches to it, `Esc` cancels and leaves you where you were |
-| `Esc` / `Ctrl+C` | Close the `Ctrl+P` jump-to list, or cancel an in-progress reply or thread pick, or an armed reply, first, if any; otherwise leave an open thread view if one is active; otherwise quit |
+| `Esc` / `Ctrl+C` | Close the `Ctrl+P` jump-to list, or cancel an in-progress reply or thread pick, or an armed reply, first, if any; otherwise clear any staged attachments; otherwise leave an open thread view if one is active; otherwise quit |
 
 ## Commands
 
@@ -167,9 +167,9 @@ Typed into the message box and submitted with `Enter`:
 | `/leave <channel-name>` | Leave a specific joined channel without switching to it, by the name shown for it in the left-hand panel (a DM or point-to-point chat shows the peer's current name). Add its badge -- `#general`, `@Alice`, `⚡Alice` -- to pick between a `/msg` DM and a `/dm` chat with the same person, which share a name |
 | `/rename <name>` | Give the active group channel a local display name -- to shorten a long one, or tell two similar ones apart -- shown everywhere the channel is named and kept across restarts. Local only: peers still see the original name, and so does any invite ticket. With no name, restores the original. Refused on a DM or point-to-point chat (use `/alias` for those) and for a name another channel already goes by. Leaving the channel forgets its name |
 | `/who` | List the active channel's peers, showing each one's full endpoint id, broadcast nickname (if any), and local alias (if any) |
-| `/send <path>` | Share a local file with the active channel; peers see its name and size and can fetch it with `/save`, never automatically |
+| `/send <path>` | Share a local file with the active channel right away (unlike `/paste`, nothing is staged first); peers see its name and size and can fetch it with `/save`, never automatically |
 | `/save <hash-prefix>` | Download a file previously shared in any joined channel to your Downloads folder (in a `leyline` subfolder) |
-| `/paste` | Share whatever's on the OS clipboard with the active channel: a real file (e.g. copied in Finder/Explorer, including an animated GIF, byte-for-byte) if there is one, else a screenshot or other copied image (always shared as a single static PNG frame -- no OS clipboard format carries multi-frame/animation data), else plain copied text as a chat message. Same as the `Ctrl+V` keybinding |
+| `/paste` | Share whatever's on the OS clipboard with the active channel: a real file (e.g. copied in Finder/Explorer, including an animated GIF, byte-for-byte) if there is one, else a screenshot or other copied image (always shared as a single static PNG frame -- no OS clipboard format carries multi-frame/animation data), else plain copied text as a chat message. A file or image is staged above the input box for review rather than sent at once -- `Enter` sends it (any typed text becomes its caption), `Backspace` on an empty input removes the newest, `Esc` clears them -- while text is sent immediately. Same as the `Ctrl+V` keybinding |
 | `/alias <hex-prefix> <name>` | Assign a local pet name to the peer whose endpoint id starts with `<hex-prefix>`, shown in place of their hex id from then on (local only, never sent to peers) |
 | `/nick <name>` | Broadcast a chosen display name to every joined channel (spoofable -- shown as `name (hex-prefix)` until you `/alias` that peer) |
 | `/search <term>` (alias `/s`) | Filter the active channel's messages down to ones containing `<term>` (instant for what's loaded, extended in the background with a scan of the full on-disk history); the pane title reminds you it's active and that `/search`/`/s` with no argument clears it |

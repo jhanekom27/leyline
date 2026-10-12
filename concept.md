@@ -223,6 +223,9 @@ pub struct ChatMessage {
 }
 ```
 
+A file share is a `ChatMessage` whose `attachment` is set; its `text` is the
+caption typed with it (empty for none), so a caption needs no wire change.
+
 Everything actually broadcast over a channel's topic is wrapped in an
 envelope, so the wire format can grow without disturbing `ChatMessage`
 itself:
@@ -385,6 +388,6 @@ src/
   search.rs           // shared match predicate + on-disk scan for /search
   thread.rs           // reply-chain (ancestors + descendants) builder for /thread
   backfill.rs         // iroh-blobs history manifests for offline backfill
-  files.rs            // /save destination resolution, filename safety, sizes
+  files.rs            // /save destination resolution, filename safety, sizes, outgoing-file checks + staged attachments
   version.rs          // build version/git-hash constants, newer-than-ours comparison
 ```

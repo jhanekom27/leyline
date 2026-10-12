@@ -14,7 +14,7 @@ use ratatui::widgets::{
 use textwrap::wrap;
 
 use crate::app::{AppState, Channel, TranscriptLine, hex_id};
-use crate::files::human_size;
+use crate::files::{StagedAttachment, human_size};
 use crate::hyperlink;
 use crate::markdown;
 use crate::message::ChatMessage;
@@ -34,6 +34,12 @@ const SEPARATOR: &str = " │ ";
 /// vertically (see `render_input`) -- keeps a long composed or pasted
 /// message from growing the input box to swallow the whole terminal.
 const MAX_INPUT_VISIBLE_LINES: usize = 6;
+
+/// Most rows the staged-attachments strip (`render_staged`) shows at once
+/// -- keeps a big multi-file stage from pushing the transcript off screen.
+/// When more are staged, the oldest collapse into a single "and N more"
+/// row (`staged_rows`).
+const MAX_STAGED_ROWS: usize = 4;
 
 /// Width of the navigation panel on the left (`render_nav`), borders
 /// included.
@@ -93,15 +99,17 @@ const USER_PALETTE: [Color; 8] = [
 ];
 
 pub fn render(frame: &mut Frame, app: &AppState) {
-    let [header, body, input] = Layout::vertical([
+    let [header, body, staged, input] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(staged_strip_height(app.active().staged.len())),
         Constraint::Length(input_box_height(&app.active().input)),
     ])
     .areas(frame.area());
 
     render_header(frame, header, app);
     render_body(frame, body, app);
+    render_staged(frame, staged, app);
     render_input(frame, input, app);
     // Last, so the overlay sits over everything else -- and so its cursor
     // wins over the input box's.
@@ -116,6 +124,19 @@ pub fn render(frame: &mut Frame, app: &AppState) {
 fn input_box_height(input: &str) -> u16 {
     let lines = input.split('\n').count().max(1);
     lines.min(MAX_INPUT_VISIBLE_LINES) as u16 + 2
+}
+
+/// Height (in terminal rows, including the 2 border rows) of the strip of
+/// staged attachments above the input box -- zero when nothing is staged,
+/// so the strip takes no room until there's something to show. Computed
+/// before laying out the rest of the frame (`render`), like
+/// `input_box_height`, so the message pane gives up exactly that much.
+fn staged_strip_height(staged: usize) -> u16 {
+    if staged == 0 {
+        0
+    } else {
+        staged.min(MAX_STAGED_ROWS) as u16 + 2
+    }
 }
 
 /// The one-row strip above the body: who you are (your full endpoint id,
@@ -726,26 +747,30 @@ fn push_chat_rows(
     let name = fit_name(&app.display_name(&message.sender), NAME_WIDTH);
     let time = format_time(message.ts_unix_ms);
 
-    // A synthesized attachment caption (e.g. a filename) is plain text,
-    // never markdown -- only an actual message body goes through
-    // `markdown::render`.
-    let caption = attachment_caption(app, message);
-    let mut bodies: Vec<Vec<Span<'static>>> = match &caption {
-        Some(caption) => {
-            let mut wrapped = wrap(caption, layout.wrap_width);
-            if wrapped.is_empty() {
-                wrapped.push(std::borrow::Cow::Borrowed(""));
-            }
+    // What was typed -- an ordinary message's whole body, or the caption of
+    // a shared file -- goes through `markdown::render`; a captionless file
+    // has none. A file's own line follows it, and is synthesized plain
+    // text (a filename and a size), never markdown.
+    let attachment = attachment_line(app, message);
+    let mut bodies: Vec<Vec<Span<'static>>> = Vec::new();
+    if !message.text.is_empty() || attachment.is_none() {
+        bodies.extend(
+            markdown::render(&message.text, layout.wrap_width)
+                .into_iter()
+                .map(|row| highlight_spans(row, term_lower)),
+        );
+    }
+    if let Some(line) = &attachment {
+        let mut wrapped = wrap(line, layout.wrap_width);
+        if wrapped.is_empty() {
+            wrapped.push(std::borrow::Cow::Borrowed(""));
+        }
+        bodies.extend(
             wrapped
                 .iter()
-                .map(|chunk| highlighted_spans(chunk, term_lower))
-                .collect()
-        }
-        None => markdown::render(&message.text, layout.wrap_width)
-            .into_iter()
-            .map(|row| highlight_spans(row, term_lower))
-            .collect(),
-    };
+                .map(|chunk| highlighted_spans(chunk, term_lower)),
+        );
+    }
 
     // A reply's quoted preview (`reply_preview_spans`), if any, renders as
     // its own single, unwrapped row ahead of the message's own text -- it
@@ -786,9 +811,10 @@ fn push_chat_rows(
 /// Builds the display line for a message's file attachment, if any --
 /// filename, human-readable size, and (for anyone else's message) the
 /// exact `/save` command to fetch it. Your own messages omit the hint
-/// since the file is already local. `None` for a plain text message, in
-/// which case `push_chat_rows` falls back to `message.text` unchanged.
-fn attachment_caption(app: &AppState, message: &ChatMessage) -> Option<String> {
+/// since the file is already local. `None` for a plain text message.
+/// `push_chat_rows` shows it after the message's own text, which for a
+/// shared file is the caption its sender typed, if any.
+fn attachment_line(app: &AppState, message: &ChatMessage) -> Option<String> {
     let attachment = message.attachment.as_ref()?;
     let size = human_size(attachment.size);
     if message.sender == app.self_id {
@@ -1156,6 +1182,66 @@ fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
     }
 }
 
+/// The strip of attachments staged on the active channel
+/// (`Channel::staged`), drawn just above the input box so what is about to
+/// go out -- and how to take it back -- is in plain sight before `Enter`.
+/// Draws nothing when nothing is staged (`staged_strip_height` gave it no
+/// room). The key hints live in the border title, like the other panels'.
+fn render_staged(frame: &mut Frame, area: Rect, app: &AppState) {
+    let staged = &app.active().staged;
+    if staged.is_empty() {
+        return;
+    }
+    let block = Block::bordered()
+        .title(" staged · Enter send · Backspace remove last · Esc clear ")
+        .border_type(BorderType::Rounded);
+    let rows = staged_rows(
+        staged,
+        block.inner(area).width as usize,
+        user_color(&app.self_id),
+    );
+    frame.render_widget(Paragraph::new(rows).block(block), area);
+}
+
+/// One row per staged attachment, oldest first, so the newest sits nearest
+/// the input box. When they don't all fit (`MAX_STAGED_ROWS`), the oldest
+/// collapse into one "and N more" row on top: the newest -- the one
+/// `Backspace` takes back next -- always stays visible.
+fn staged_rows(staged: &[StagedAttachment], width: usize, marker: Color) -> Vec<Line<'static>> {
+    let (hidden, shown) = if staged.len() > MAX_STAGED_ROWS {
+        let hidden = staged.len() - (MAX_STAGED_ROWS - 1);
+        (hidden, &staged[hidden..])
+    } else {
+        (0, staged)
+    };
+    let mut rows = Vec::with_capacity(MAX_STAGED_ROWS);
+    if hidden > 0 {
+        rows.push(Line::from(Span::styled(
+            format!("   … and {hidden} more"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    rows.extend(shown.iter().map(|item| staged_row(item, width, marker)));
+    rows
+}
+
+/// A staged attachment's row: a marker, its name (truncated with an
+/// ellipsis if it would overflow `width`, so the size beside it always
+/// stays visible), and its size.
+fn staged_row(item: &StagedAttachment, width: usize, marker: Color) -> Line<'static> {
+    let size = human_size(item.size);
+    // " + " before the name and two spaces before the size.
+    let name_width = width.saturating_sub(3 + 2 + size.chars().count()).max(1);
+    Line::from(vec![
+        Span::styled(" + ", Style::default().fg(marker)),
+        Span::styled(
+            truncate_chars(&item.filename, name_width),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {size}"), Style::default().fg(Color::DarkGray)),
+    ])
+}
+
 /// Maps a flat char-index cursor position into (line index, column within
 /// that line) against `input`'s `\n`-delimited lines -- used by
 /// `render_input` to decide which logical line's horizontal scroll
@@ -1273,31 +1359,31 @@ mod tests {
     }
 
     #[test]
-    fn attachment_caption_includes_a_save_hint_for_someone_elses_file() {
+    fn attachment_line_includes_a_save_hint_for_someone_elses_file() {
         let app = AppState::new([1; 32], vec!["general".to_string()], "general");
         let message = file_message([2; 32], "report.pdf", 2_150_000);
 
-        let caption = attachment_caption(&app, &message).unwrap();
+        let line = attachment_line(&app, &message).unwrap();
 
-        assert!(caption.contains("report.pdf"), "got: {caption}");
-        assert!(caption.contains("2.1 MB"), "got: {caption}");
-        assert!(caption.contains("/save"), "got: {caption}");
+        assert!(line.contains("report.pdf"), "got: {line}");
+        assert!(line.contains("2.1 MB"), "got: {line}");
+        assert!(line.contains("/save"), "got: {line}");
     }
 
     #[test]
-    fn attachment_caption_omits_the_save_hint_for_your_own_file() {
+    fn attachment_line_omits_the_save_hint_for_your_own_file() {
         let self_id = [1; 32];
         let app = AppState::new(self_id, vec!["general".to_string()], "general");
         let message = file_message(self_id, "report.pdf", 10);
 
-        let caption = attachment_caption(&app, &message).unwrap();
+        let line = attachment_line(&app, &message).unwrap();
 
-        assert!(caption.contains("report.pdf"));
-        assert!(!caption.contains("/save"), "got: {caption}");
+        assert!(line.contains("report.pdf"));
+        assert!(!line.contains("/save"), "got: {line}");
     }
 
     #[test]
-    fn attachment_caption_is_none_for_a_plain_text_message() {
+    fn attachment_line_is_none_for_a_plain_text_message() {
         let app = AppState::new([1; 32], vec!["general".to_string()], "general");
         let message = ChatMessage {
             v: 2,
@@ -1309,7 +1395,153 @@ mod tests {
             reply_to: None,
         };
 
-        assert_eq!(attachment_caption(&app, &message), None);
+        assert_eq!(attachment_line(&app, &message), None);
+    }
+
+    #[test]
+    fn a_shared_files_caption_is_shown_above_its_attachment_line() {
+        let app = AppState::new([1; 32], vec!["general".to_string()], "general");
+        let mut message = file_message([2; 32], "report.pdf", 2_150_000);
+        message.text = "the numbers from Q3".to_string();
+        let mut rows = Vec::new();
+
+        push_chat_rows(
+            &mut rows,
+            &app,
+            &message,
+            true,
+            &row_layout(80),
+            None,
+            false,
+        );
+
+        let text: Vec<String> = rows.iter().map(row_text).collect();
+        let caption = text
+            .iter()
+            .position(|row| row.contains("the numbers from Q3"));
+        let file = text
+            .iter()
+            .position(|row| row.contains("shared report.pdf"));
+        assert!(
+            caption.is_some() && file.is_some() && caption < file,
+            "expected the caption row, then the file row; got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_captionless_file_shows_only_its_attachment_line() {
+        let app = AppState::new([1; 32], vec!["general".to_string()], "general");
+        let message = file_message([2; 32], "report.pdf", 2_150_000);
+        let mut rows = Vec::new();
+
+        push_chat_rows(
+            &mut rows,
+            &app,
+            &message,
+            true,
+            &row_layout(80),
+            None,
+            false,
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert!(row_text(&rows[0]).contains("shared report.pdf"));
+    }
+
+    fn staged_item(filename: &str, size: u64) -> StagedAttachment {
+        StagedAttachment {
+            filename: filename.to_string(),
+            size,
+            source: crate::files::StagedSource::Bytes(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn staged_strip_takes_no_room_when_nothing_is_staged_and_is_capped_otherwise() {
+        assert_eq!(staged_strip_height(0), 0);
+        assert_eq!(staged_strip_height(1), 3, "one row plus the two borders");
+        let full = MAX_STAGED_ROWS as u16 + 2;
+        assert_eq!(staged_strip_height(MAX_STAGED_ROWS), full);
+        assert_eq!(staged_strip_height(MAX_STAGED_ROWS + 10), full);
+    }
+
+    #[test]
+    fn staged_rows_show_each_attachments_name_and_size() {
+        let staged = [
+            staged_item("report.pdf", 2_150_000),
+            staged_item("map.png", 480),
+        ];
+
+        let rows = staged_rows(&staged, 60, Color::Cyan);
+
+        assert_eq!(rows.len(), 2);
+        let first = row_text(&rows[0]);
+        assert!(
+            first.contains("report.pdf") && first.contains("2.1 MB"),
+            "got: {first}"
+        );
+        let second = row_text(&rows[1]);
+        assert!(
+            second.contains("map.png") && second.contains("480 B"),
+            "got: {second}"
+        );
+    }
+
+    #[test]
+    fn staged_rows_collapse_the_oldest_so_the_newest_stays_visible() {
+        let staged: Vec<StagedAttachment> = (1..=6)
+            .map(|n| staged_item(&format!("file{n}.txt"), 1))
+            .collect();
+
+        let rows = staged_rows(&staged, 60, Color::Cyan);
+
+        assert_eq!(rows.len(), MAX_STAGED_ROWS);
+        assert!(row_text(&rows[0]).contains("and 3 more"), "got: {rows:?}");
+        assert!(row_text(&rows[MAX_STAGED_ROWS - 1]).contains("file6.txt"));
+        assert!(
+            !rows.iter().any(|row| row_text(row).contains("file1.txt")),
+            "the oldest is folded into the overflow row"
+        );
+    }
+
+    #[test]
+    fn staged_rows_truncate_a_long_name_but_keep_the_size() {
+        let long = "a-very-long-file-name-that-will-not-fit-in-the-strip.png";
+
+        let rows = staged_rows(&[staged_item(long, 480)], 30, Color::Cyan);
+
+        let text = row_text(&rows[0]);
+        assert!(text.chars().count() <= 30, "got: {text}");
+        assert!(text.contains('…'), "got: {text}");
+        assert!(text.ends_with("480 B"), "got: {text}");
+    }
+
+    #[test]
+    fn render_draws_the_staged_strip_above_the_input_box() {
+        let mut app = AppState::new([1; 32], vec!["general".to_string()], "general");
+        app.stage_attachment("general", staged_item("report.pdf", 2_150_000));
+
+        let rows = render_to_rows(&app);
+
+        let strip = rows
+            .iter()
+            .position(|row| row.contains("report.pdf"))
+            .expect("the staged file is on screen");
+        let input = rows
+            .iter()
+            .position(|row| row.contains("you ›"))
+            .expect("the input box is on screen");
+        assert!(strip < input, "strip at row {strip}, input at row {input}");
+        assert!(rows[strip].contains("2.1 MB"), "got: {}", rows[strip]);
+    }
+
+    #[test]
+    fn render_draws_no_strip_when_nothing_is_staged() {
+        let app = AppState::new([1; 32], vec!["general".to_string()], "general");
+
+        let rows = render_to_rows(&app);
+
+        assert!(!rows.iter().any(|row| row.contains("staged")));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use iroh_blobs::Hash;
 use iroh_tickets::Ticket;
 
+use crate::files::StagedAttachment;
 use crate::message::{ChatMessage, now_unix_ms};
 use crate::net::{DEVICE_SYNC_CHANNEL, NetEvent};
 use crate::search::{self, SearchOutcome, SearchResults};
@@ -147,6 +148,15 @@ pub struct Channel {
     /// Character index (not byte offset -- see `byte_index`) of the
     /// cursor within `input`.
     pub cursor: usize,
+    /// Files and images chosen to share (`Ctrl+V`/`/paste`) but not yet
+    /// sent, shown in a strip above the input box (`ui::render_staged`)
+    /// until `Enter` sends them all (`AppState::send_staged`), `Backspace`
+    /// on an empty input takes the newest back out, or `Esc` clears the
+    /// lot. Kept per channel, like `input`, so switching tabs
+    /// (`AppState::switch_channel`) neither loses them nor leaks them into
+    /// another channel's `Enter`. In-memory only, like `input`, and
+    /// dropped with the channel.
+    pub staged: Vec<StagedAttachment>,
 }
 
 impl Channel {
@@ -162,6 +172,7 @@ impl Channel {
             thread: None,
             input: String::new(),
             cursor: 0,
+            staged: Vec::new(),
         }
     }
 
@@ -478,6 +489,17 @@ pub enum InputAction {
     /// `/send ` (see `run_send`). The caller (`net::Net::send_file`)
     /// validates and imports it; app.rs never touches the filesystem.
     SendFile { channel: String, path: String },
+    /// Share everything staged on `channel` (see `Channel::staged`), with
+    /// `caption` -- whatever was typed when `Enter` was pressed, empty for
+    /// none -- on the first attachment. The caller
+    /// (`net::Net::send_staged`) imports and announces each one, much as
+    /// for `SendFile`; app.rs never touches the filesystem. The stage is
+    /// already empty by the time this is returned.
+    SendStaged {
+        channel: String,
+        items: Vec<StagedAttachment>,
+        caption: String,
+    },
     /// Fetch a previously shared file and save it locally -- `hash`,
     /// `filename`, and `sender` already resolved from a typed hash-prefix
     /// by `run_save` (see `resolve_attachment`). The caller
@@ -1064,12 +1086,14 @@ impl AppState {
         match key.code {
             // Backs out one level at a time: cancel an armed reply first
             // (mirroring `handle_picking_key`'s own Esc, which cancels a
-            // pick-in-progress instead of confirming it), then leave an
-            // open thread view if there's no armed reply either, only
-            // quitting once neither is active.
+            // pick-in-progress instead of confirming it), then drop any
+            // staged attachments, then leave an open thread view, only
+            // quitting once none of those is active.
             KeyCode::Esc => {
                 if self.replying_to.take().is_some() {
                     // cancelled the armed reply, nothing further to do
+                } else if self.clear_staged() {
+                    // dropped the staged attachments, nothing further to do
                 } else if !self.close_thread() {
                     self.should_quit = true;
                 }
@@ -1106,7 +1130,17 @@ impl AppState {
                 return self.run_paste();
             }
             KeyCode::Enter => return self.submit_input(),
-            KeyCode::Backspace => self.active_mut().delete_backward(),
+            // With an empty input there is no character to delete, so the
+            // key takes back the newest staged attachment instead -- like
+            // removing the last chip from an address field.
+            KeyCode::Backspace => {
+                let channel = self.active_mut();
+                if channel.input.is_empty() && !channel.staged.is_empty() {
+                    channel.staged.pop();
+                } else {
+                    channel.delete_backward();
+                }
+            }
             KeyCode::Delete => self.active_mut().delete_forward(),
             KeyCode::Home => self.active_mut().move_home(),
             KeyCode::End => self.active_mut().move_end(),
@@ -1463,8 +1497,9 @@ impl AppState {
             // `tracing::warn!` (unlike the other system notices here, a
             // failed file transfer is worth a trace in leyline.log too),
             // `ClipboardFiles`/`ClipboardImage`/`ClipboardText`/
-            // `PasteFailed` (see `net::Net::paste`) are turned into the
-            // same `FileReady`/plain-`Send` treatment or a logged error,
+            // `PasteFailed` (see `net::Net::paste`) are turned into a
+            // staged attachment (`stage_attachment`), a plain `Send`, or
+            // a logged error,
             // and `DirectJoined` is turned into a background tab via
             // `background_direct_channel` (main.rs needs to conditionally
             // load persisted history alongside it, which this method's
@@ -1548,6 +1583,19 @@ impl AppState {
             && channel.remember_seen(message.id)
         {
             channel.push(TranscriptLine::Chat(message));
+        }
+    }
+
+    /// Stages `item` -- already vetted by `files::stage_file`/
+    /// `stage_image` -- on `channel`, ready for review and `Enter`. Called
+    /// by main.rs when a clipboard read (`net::NetEvent::ClipboardFiles`/
+    /// `ClipboardImage`) comes back, which may be after the user has moved
+    /// to another tab; the event names the channel the paste was for, so
+    /// the attachment lands there rather than wherever focus is now. A
+    /// no-op if `channel` isn't currently joined.
+    pub fn stage_attachment(&mut self, channel: &str, item: StagedAttachment) {
+        if let Some(channel) = self.channel_mut(channel) {
+            channel.staged.push(item);
         }
     }
 
@@ -1683,9 +1731,15 @@ impl AppState {
         self.finish_activating_channel();
     }
 
+    /// `Enter`: runs a `/command`, or sends what was typed -- as a plain
+    /// message or, with attachments staged on the active channel
+    /// (`Channel::staged`), as the caption of the first of them. A
+    /// `/command` runs as one even then (the stage is left alone), so a
+    /// command can't be swallowed as a caption; and with nothing typed,
+    /// staged attachments still go out on their own.
     fn submit_input(&mut self) -> Option<InputAction> {
         let channel = self.active_mut();
-        if channel.input.trim().is_empty() {
+        if channel.input.trim().is_empty() && channel.staged.is_empty() {
             return None;
         }
         let text = std::mem::take(&mut channel.input);
@@ -1694,6 +1748,10 @@ impl AppState {
 
         if let Some(rest) = text.strip_prefix('/') {
             return self.run_command(rest.trim());
+        }
+
+        if !self.active().staged.is_empty() {
+            return Some(self.send_staged(text));
         }
 
         let reply_to = self
@@ -1734,6 +1792,42 @@ impl AppState {
         self.active_mut()
             .push(TranscriptLine::Chat(message.clone()));
         InputAction::Send(channel, message)
+    }
+
+    /// Sends everything staged on the active channel: takes the stage (so
+    /// it is empty from here on), leaves a breadcrumb per file the way
+    /// `run_send` does -- importing and announcing happen in the
+    /// background and may take a moment -- and returns the `InputAction`
+    /// for the caller to act on. `text` is whatever was typed; unless it is
+    /// only whitespace it becomes the caption of the first attachment. An
+    /// armed reply or open thread is left as it was: a shared file is
+    /// never a reply, same as `/send` today.
+    fn send_staged(&mut self, text: String) -> InputAction {
+        let channel = self.active().name.clone();
+        let items = std::mem::take(&mut self.active_mut().staged);
+        for item in &items {
+            self.push_system(format!("sending {}...", item.filename));
+        }
+        let caption = if text.trim().is_empty() {
+            String::new()
+        } else {
+            text
+        };
+        InputAction::SendStaged {
+            channel,
+            items,
+            caption,
+        }
+    }
+
+    /// Drops everything staged on the active channel -- `Esc`'s second
+    /// level, see `handle_key`. Returns whether there was anything to drop,
+    /// so the caller knows whether the key was used up.
+    fn clear_staged(&mut self) -> bool {
+        let staged = &mut self.active_mut().staged;
+        let had_any = !staged.is_empty();
+        staged.clear();
+        had_any
     }
 
     /// Parses a `/command [args]` line (the text after the leading `/`,
@@ -1818,7 +1912,9 @@ impl AppState {
              /dm connects directly to a peer's endpoint id with no ticket or gossip channel, \
              unlike /msg -- keys: Tab/Shift+Tab switch channels, \
              Ctrl+P jump to a channel (type to filter, \u{2191}/\u{2193} pick, Enter confirm), \
-             Alt+Enter/Ctrl+J newline, Ctrl+V paste, Ctrl+R reply (\u{2191}/\u{2193} pick, \
+             Alt+Enter/Ctrl+J newline, Ctrl+V share the clipboard (a file or image is staged \
+             first: Enter sends it, Backspace on an empty input unstages, Esc clears), \
+             Ctrl+R reply (\u{2191}/\u{2193} pick, \
              Enter confirm), Ctrl+T thread (\u{2191}/\u{2193} pick, Enter confirm), \
              Up/Down scroll, Esc/Ctrl+C quit",
         );
@@ -4142,6 +4238,215 @@ mod tests {
         assert_eq!(message.sender, SELF_ID);
         assert_eq!(message.text, "hello from clipboard");
         assert!(message.attachment.is_none());
+    }
+
+    /// A staged attachment named `filename`, as `files::stage_image` would
+    /// build it -- the tests below only care that attachments are kept,
+    /// ordered, and sent, not where their bytes come from.
+    fn staged(filename: &str) -> StagedAttachment {
+        StagedAttachment {
+            filename: filename.to_string(),
+            size: 10,
+            source: crate::files::StagedSource::Bytes(vec![0; 10]),
+        }
+    }
+
+    #[test]
+    fn staging_an_attachment_puts_it_on_the_named_channel_only() {
+        let mut app = multi_channel_app(); // active: "random"
+        app.stage_attachment("general", staged("map.png"));
+
+        assert_eq!(app.channels[0].name, "general");
+        assert_eq!(app.channels[0].staged, vec![staged("map.png")]);
+        assert!(app.channels[1].staged.is_empty());
+    }
+
+    #[test]
+    fn staging_for_a_channel_that_is_gone_is_a_no_op() {
+        let mut app = app();
+        app.stage_attachment("left-meanwhile", staged("map.png"));
+        assert!(app.active().staged.is_empty());
+    }
+
+    #[test]
+    fn enter_sends_every_staged_attachment_and_clears_the_stage() {
+        let mut app = app();
+        app.stage_attachment("general", staged("a.png"));
+        app.stage_attachment("general", staged("b.pdf"));
+
+        let action = app.handle_key(key(KeyCode::Enter));
+
+        match action.expect("Enter with staged attachments returns an action") {
+            InputAction::SendStaged {
+                channel,
+                items,
+                caption,
+            } => {
+                assert_eq!(channel, "general");
+                assert_eq!(items, vec![staged("a.png"), staged("b.pdf")]);
+                assert_eq!(caption, "", "nothing was typed, so no caption");
+            }
+            _ => panic!("expected InputAction::SendStaged"),
+        }
+        assert!(app.active().staged.is_empty());
+    }
+
+    #[test]
+    fn typed_text_becomes_the_caption_of_the_staged_attachments() {
+        let mut app = app();
+        app.stage_attachment("general", staged("map.png"));
+
+        let action = submit(&mut app, "the new tilemap");
+
+        match action.expect("returns an action") {
+            InputAction::SendStaged { items, caption, .. } => {
+                assert_eq!(caption, "the new tilemap");
+                assert_eq!(items.len(), 1);
+            }
+            _ => panic!("expected InputAction::SendStaged"),
+        }
+        assert_eq!(
+            app.active().input,
+            "",
+            "the caption is consumed from the input box"
+        );
+    }
+
+    #[test]
+    fn sending_staged_attachments_leaves_a_breadcrumb_per_file_and_no_chat_message() {
+        let mut app = app();
+        app.stage_attachment("general", staged("a.png"));
+        app.stage_attachment("general", staged("b.pdf"));
+        let before = app.active().messages.len();
+
+        submit(&mut app, "hello");
+
+        // Only system breadcrumbs: the attachments' chat messages arrive
+        // later from the importer (`NetEvent::FileReady`), with the caption
+        // riding on the first of them.
+        let added: Vec<&TranscriptLine> = app.active().messages.iter().skip(before).collect();
+        assert_eq!(added.len(), 2);
+        assert_eq!(as_system(added[0]), "sending a.png...");
+        assert_eq!(as_system(added[1]), "sending b.pdf...");
+    }
+
+    #[test]
+    fn whitespace_only_input_still_sends_staged_attachments_without_a_caption() {
+        let mut app = app();
+        app.stage_attachment("general", staged("map.png"));
+        app.paste_text("   ");
+
+        let action = app.handle_key(key(KeyCode::Enter));
+
+        match action.expect("returns an action") {
+            InputAction::SendStaged { caption, .. } => assert_eq!(caption, ""),
+            _ => panic!("expected InputAction::SendStaged"),
+        }
+        assert_eq!(app.active().input, "");
+    }
+
+    #[test]
+    fn a_slash_command_runs_as_a_command_and_leaves_the_stage_alone() {
+        let mut app = app();
+        app.stage_attachment("general", staged("map.png"));
+
+        let action = submit(&mut app, "/who");
+
+        assert!(action.is_none(), "/who is a local command, not a send");
+        assert_eq!(app.active().staged, vec![staged("map.png")]);
+    }
+
+    #[test]
+    fn slash_send_still_sends_immediately_even_with_attachments_staged() {
+        let mut app = app();
+        app.stage_attachment("general", staged("staged.png"));
+
+        let action = submit(&mut app, "/send ~/other.png");
+
+        match action.expect("/send returns an action") {
+            InputAction::SendFile { channel, path } => {
+                assert_eq!(channel, "general");
+                assert_eq!(path, "~/other.png");
+            }
+            _ => panic!("expected InputAction::SendFile"),
+        }
+        assert_eq!(app.active().staged.len(), 1, "the stage is untouched");
+    }
+
+    #[test]
+    fn backspace_on_an_empty_input_unstages_the_newest_attachment() {
+        let mut app = app();
+        app.stage_attachment("general", staged("first.png"));
+        app.stage_attachment("general", staged("second.png"));
+
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.active().staged, vec![staged("first.png")]);
+
+        app.handle_key(key(KeyCode::Backspace));
+        assert!(app.active().staged.is_empty());
+    }
+
+    #[test]
+    fn backspace_with_text_typed_edits_the_text_and_keeps_the_stage() {
+        let mut app = app();
+        app.stage_attachment("general", staged("map.png"));
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Char('i')));
+
+        app.handle_key(key(KeyCode::Backspace));
+
+        assert_eq!(app.active().input, "h");
+        assert_eq!(app.active().staged.len(), 1);
+    }
+
+    #[test]
+    fn esc_clears_the_stage_before_it_quits() {
+        let mut app = app();
+        app.stage_attachment("general", staged("a.png"));
+        app.stage_attachment("general", staged("b.png"));
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.active().staged.is_empty());
+        assert!(!app.should_quit, "the first Esc only clears the stage");
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn esc_cancels_an_armed_reply_before_clearing_the_stage() {
+        let mut app = app();
+        app.stage_attachment("general", staged("a.png"));
+        app.replying_to = Some(1);
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.replying_to.is_none());
+        assert_eq!(
+            app.active().staged.len(),
+            1,
+            "the reply is backed out of first; the stage survives"
+        );
+    }
+
+    #[test]
+    fn staged_attachments_stay_with_their_channel_across_tab_switches() {
+        let mut app = multi_channel_app(); // starts on "random"
+        app.stage_attachment("random", staged("map.png"));
+
+        app.handle_key(key(KeyCode::Tab)); // wraps around to "general"
+        assert_eq!(app.active().name, "general");
+        assert!(
+            app.active().staged.is_empty(),
+            "another channel's stage must not show up here"
+        );
+
+        // Enter in "general" sends plain text, never random's attachment.
+        let action = submit(&mut app, "hi");
+        assert!(matches!(action, Some(InputAction::Send(..))));
+
+        app.handle_key(key(KeyCode::Tab)); // back to "random"
+        assert_eq!(app.active().staged, vec![staged("map.png")]);
     }
 
     #[test]

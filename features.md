@@ -133,6 +133,22 @@ mechanisms, not one, since they trade off differently:
   terminal text-paste is inserted as one atomic edit instead of a burst of
   key events, fixing a premature-submit bug on multi-line pastes
   (`AppState::paste_text`).
+- [x] **Staged attachments** -- `Ctrl+V`/`/paste` no longer broadcasts a
+  clipboard file or image the instant it is read: it lands in a
+  per-channel staging area (`Channel::staged`), drawn as a strip above
+  the input box with each file's name and size. `Enter` sends everything
+  staged, the typed text becoming the caption of the first -- a
+  `ChatMessage` already carried both `text` and `attachment`, so no wire
+  change, and the transcript now shows a caption above the attachment
+  line. `Backspace` on an empty input takes the newest back out and `Esc`
+  clears the lot (after an armed reply, before leaving a thread or
+  quitting). Clipboard text still sends at once, `/send <path>` stays an
+  explicit send-now, and a `/command` typed while files are staged runs
+  as a command and leaves them staged. One validation boundary
+  (`files::stage_file`/`stage_image`) serves both `/send` and staging, so
+  what each refuses -- and how it says so -- can't drift apart. It is the
+  one place the other ways of choosing a file (drag-and-drop, a picker)
+  are meant to land.
 
 ## Networking & sharing
 

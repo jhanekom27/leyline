@@ -49,7 +49,7 @@ use channel_renames::ChannelRenames;
 use contacts::Contacts;
 use direct_registry::DirectRegistry;
 use dm_registry::DmRegistry;
-use files::{downloads_dir, resolve_destination};
+use files::{downloads_dir, resolve_destination, stage_file, stage_image};
 use forgotten_devices::ForgottenDevices;
 use message::ChatMessage;
 use net::{DEVICE_SYNC_CHANNEL, Net, NetEvent};
@@ -430,6 +430,34 @@ fn route_send(net: &Net, app: &AppState, channel: &str, message: ChatMessage) {
     }
 }
 
+/// Stages the real files a `Ctrl+V`/`/paste` found on the clipboard
+/// (`NetEvent::ClipboardFiles`, e.g. a Finder/Explorer copy) on `channel`,
+/// the channel the paste was for -- which may no longer be the active one
+/// by the time the clipboard read comes back. Each path is checked exactly
+/// like a `/send`ed one (`files::stage_file`); one that is refused is
+/// reported as a system notice without affecting the rest, so a multi-file
+/// copy stages whatever it can. Nothing is shared yet: that waits for
+/// `Enter` (`app::AppState::send_staged`).
+fn stage_clipboard_files(app: &mut AppState, channel: &str, paths: &[PathBuf]) {
+    for path in paths {
+        match stage_file(path) {
+            Ok(item) => app.stage_attachment(channel, item),
+            Err(message) => app.push_system(message),
+        }
+    }
+}
+
+/// Stages a clipboard image (`NetEvent::ClipboardImage`, already
+/// re-encoded as PNG) the same way `stage_clipboard_files` stages files;
+/// the one thing to check -- the size cap -- is reported immediately, like
+/// a refused `/send`.
+fn stage_clipboard_image(app: &mut AppState, channel: &str, filename: String, bytes: Vec<u8>) {
+    match stage_image(filename, bytes) {
+        Ok(item) => app.stage_attachment(channel, item),
+        Err(message) => app.push_system(message),
+    }
+}
+
 /// Rings the terminal bell (ASCII BEL) to signal a newly-arrived message --
 /// see `AppState::bell_enabled`, toggled via `/bell` and persisted through
 /// settings.rs. A plain control byte, so it's safe to write straight to
@@ -700,6 +728,14 @@ async fn run(
                                     app.push_system(message);
                                 }
                             }
+                            // `Enter` with attachments staged (see
+                            // `app::Channel::staged`): importing and
+                            // announcing them happens in the background,
+                            // each finished file coming back as
+                            // `FileReady` below, just like a `/send`.
+                            Some(InputAction::SendStaged { channel, items, caption }) => {
+                                net.send_staged(channel, items, caption);
+                            }
                             Some(InputAction::SaveFile { hash, filename, sender }) => {
                                 let destination_dir = downloads_dir(&data_dir);
                                 match resolve_destination(&destination_dir, &filename) {
@@ -908,27 +944,17 @@ async fn run(
                     }
                     // `/paste` found real file(s) on the clipboard (e.g. a
                     // Finder/Explorer copy) -- see `net::Net::paste`.
-                    // Shared exactly like `/send`, one message per path,
-                    // so a multi-file clipboard copy lands as one message
-                    // each.
+                    // Staged for review, not shared: see
+                    // `stage_clipboard_files`.
                     NetEvent::ClipboardFiles(channel, paths) => {
-                        for path in paths {
-                            if let Some(message) = net.send_file(channel.clone(), path.display().to_string()) {
-                                app.push_system(message);
-                            }
-                        }
+                        stage_clipboard_files(&mut app, &channel, &paths);
                     }
                     // `/paste` found rendered image pixels (e.g. a
                     // screenshot) and already re-encoded them as PNG --
-                    // see `net::Net::paste`/`net::encode_png`. Any
-                    // synchronous error (e.g. too large) is reported
-                    // immediately, mirroring `InputAction::SendFile`;
-                    // success eventually arrives back as `FileReady`,
-                    // handled above like any other locally-authored file.
+                    // see `net::Net::paste`/`net::encode_png`. Staged
+                    // like a file: see `stage_clipboard_image`.
                     NetEvent::ClipboardImage(channel, filename, bytes) => {
-                        if let Some(message) = net.send_clipboard_image(channel, filename, bytes) {
-                            app.push_system(message);
-                        }
+                        stage_clipboard_image(&mut app, &channel, filename, bytes);
                     }
                     // `/paste` found no file or image, but did find plain
                     // text -- share it exactly like a typed-and-sent
@@ -1106,5 +1132,67 @@ mod tests {
         let paths = paths_to_wipe_for_pairing(data_dir, Path::new("/config"));
 
         assert!(paths.contains(&data_dir.join("channel_renames")));
+    }
+
+    #[test]
+    fn clipboard_files_are_staged_on_the_channel_they_were_pasted_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.pdf");
+        std::fs::write(&path, b"pdf bytes").unwrap();
+        // Pasted in #general, but the user has since moved to #random.
+        let mut app = AppState::new(
+            [1; 32],
+            vec!["general".to_string(), "random".to_string()],
+            "random",
+        );
+
+        stage_clipboard_files(&mut app, "general", &[path]);
+
+        let staged = &app.channels[0].staged;
+        assert_eq!(staged.len(), 1);
+        assert_eq!(
+            (staged[0].filename.as_str(), staged[0].size),
+            ("report.pdf", 9)
+        );
+        assert!(app.channels[1].staged.is_empty());
+    }
+
+    #[test]
+    fn a_refused_clipboard_file_is_reported_and_the_rest_are_still_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        std::fs::write(&good, b"ok").unwrap();
+        let missing = dir.path().join("missing.txt");
+        let mut app = AppState::new([1; 32], vec!["general".to_string()], "general");
+
+        stage_clipboard_files(&mut app, "general", &[missing.clone(), good]);
+
+        assert_eq!(app.active().staged.len(), 1);
+        match app.active().messages.back() {
+            Some(app::TranscriptLine::System(text)) => assert!(
+                text.starts_with(&format!("can't send {}", missing.display())),
+                "got: {text}"
+            ),
+            _ => panic!("expected a system notice about the missing file"),
+        }
+    }
+
+    #[test]
+    fn a_clipboard_image_is_staged_under_its_generated_name() {
+        let mut app = AppState::new([1; 32], vec!["general".to_string()], "general");
+
+        stage_clipboard_image(
+            &mut app,
+            "general",
+            "clipboard-1.png".to_string(),
+            vec![1, 2, 3],
+        );
+
+        let staged = &app.active().staged;
+        assert_eq!(staged.len(), 1);
+        assert_eq!(
+            (staged[0].filename.as_str(), staged[0].size),
+            ("clipboard-1.png", 3)
+        );
     }
 }
