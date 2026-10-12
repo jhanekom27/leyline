@@ -275,6 +275,13 @@ Why this is fast:
 - Scrollback is capped per channel (`MAX_SCROLLBACK`, `app.rs`) so
   render/memory cost doesn't grow unbounded in a long-lived session
 
+Terminal input reaches the loop through `term_events::TermEvents`, a thin
+wrapper over `EventStream` with one addition. Warp types a dropped file's path
+out as ordinary key presses instead of pasting it, so keys that arrive
+together and spell nothing but existing files are handed out as the one
+`Event::Paste` a bracketing terminal would have sent -- which `handle_paste`
+then stages like any other drop. Everything else passes through untouched.
+
 Each joined channel's gossip receive loop runs on its own `tokio::spawn`
 (`net::forward_events`), forwarding parsed `NetEvent`s into one bounded
 `mpsc` channel that the select loop above owns. The channel has a modest,
@@ -388,6 +395,7 @@ src/
   search.rs           // shared match predicate + on-disk scan for /search
   thread.rs           // reply-chain (ancestors + descendants) builder for /thread
   backfill.rs         // iroh-blobs history manifests for offline backfill
-  files.rs            // /save destination resolution, filename safety, sizes, outgoing-file checks + staged attachments
+  files.rs            // /save destination resolution, filename safety, sizes, outgoing-file checks + staged attachments, drag-and-drop paste detection
+  term_events.rs      // crossterm EventStream wrapper: a drop a terminal types out (Warp) becomes one paste
   version.rs          // build version/git-hash constants, newer-than-ours comparison
 ```

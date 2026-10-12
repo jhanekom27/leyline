@@ -2846,6 +2846,20 @@ impl AppState {
         result
     }
 
+    /// Whether keys -- and pastes -- currently go to the message box. False
+    /// while a live pairing redeem is awaiting confirmation, a reply or
+    /// thread pick is in progress, or the `Ctrl+P` switcher is open: each
+    /// takes over input ahead of normal typing (see `handle_key`). main.rs
+    /// only treats a pasted file path as a dropped file while this is true,
+    /// since staging files while the user is in the middle of something
+    /// else would put them somewhere they are not looking.
+    pub fn is_composing(&self) -> bool {
+        self.pending_redeem.is_none()
+            && self.picking_reply.is_none()
+            && self.picking_thread.is_none()
+            && self.switching.is_none()
+    }
+
     /// Inserts a terminal bracketed-paste's full text at the cursor as one
     /// atomic edit (see main.rs's `Event::Paste` handling, enabled via
     /// `EnableBracketedPaste`). Without bracketed paste, a multi-line
@@ -2853,7 +2867,9 @@ impl AppState {
     /// embedded newline mid-paste would hit `submit_input` partway through
     /// -- prematurely sending a partial line or running a stray
     /// `/command`. `paste_text` never submits, so a pasted newline just
-    /// becomes a real line break (`insert_newline`) instead.
+    /// becomes a real line break (`insert_newline`) instead. A paste that is
+    /// really a dropped file never gets here -- main.rs's `handle_paste`
+    /// diverts it first.
     pub fn paste_text(&mut self, text: &str) {
         // An open switcher owns input: a paste filters it rather than
         // landing, unseen, in the draft underneath. Its query is one line,
@@ -4447,6 +4463,36 @@ mod tests {
 
         app.handle_key(key(KeyCode::Tab)); // back to "random"
         assert_eq!(app.active().staged, vec![staged("map.png")]);
+    }
+
+    #[test]
+    fn a_fresh_session_is_composing() {
+        assert!(app().is_composing());
+    }
+
+    #[test]
+    fn composing_stops_while_the_switcher_is_open() {
+        let mut app = app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(!app.is_composing());
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.is_composing());
+    }
+
+    #[test]
+    fn composing_stops_during_a_reply_or_thread_pick_and_a_pairing_confirmation() {
+        let mut picking_reply = app();
+        picking_reply.picking_reply = Some(1);
+        assert!(!picking_reply.is_composing());
+
+        let mut picking_thread = app();
+        picking_thread.picking_thread = Some(1);
+        assert!(!picking_thread.is_composing());
+
+        let mut redeeming = app();
+        redeeming.pending_redeem = Some("ticket".to_string());
+        assert!(!redeeming.is_composing());
     }
 
     #[test]

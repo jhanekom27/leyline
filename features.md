@@ -149,6 +149,32 @@ mechanisms, not one, since they trade off differently:
   what each refuses -- and how it says so -- can't drift apart. It is the
   one place the other ways of choosing a file (drag-and-drop, a picker)
   are meant to land.
+- [x] **Drag-and-drop** -- a terminal has no drop protocol: dropping a file
+  onto its window just pastes the file's path, which leyline used to type
+  into the message box as text. `Event::Paste` now goes through main.rs's
+  `handle_paste`, which asks `files::dropped_files` whether the paste is
+  nothing but existing files and, if so, stages them on the active channel
+  exactly like a `Ctrl+V` of a copied file. Terminals spell the path
+  differently -- backslash-escaped (Terminal.app, iTerm2, Ghostty), quoted
+  (iTerm2's option, GNOME Terminal, WezTerm's Posix mode), as `file://`
+  URIs, newline-joined, or raw (kitty) -- so the paste is read as shell
+  words first and as one raw path per line second. The decision is all or
+  nothing with the filesystem as arbiter: every path must be absolute and
+  an existing regular file, or the whole paste is ordinary text, so a
+  sentence that mentions a path, a relative name like README.md, a
+  directory, or a missing path is never swallowed. Words split on ASCII
+  whitespace only, so a macOS screenshot name with a narrow no-break space
+  stays one path. A drop is not staged while the switcher, a pick or a
+  pairing confirmation owns input (`AppState::is_composing`).
+  Not every terminal pastes the path, though: Warp writes the escaped paths
+  to the pty as if they were typed -- no bracketed-paste markers, unlike its
+  `Cmd+V` -- so all leyline sees is a key press per character. The event
+  loop reads the terminal through `term_events::TermEvents`, a wrapper over
+  crossterm's `EventStream` that gathers the key presses that arrived
+  together and, when they spell nothing but existing files, hands them out
+  as the one `Event::Paste` a bracketing terminal would have sent. Typing a
+  path by hand never qualifies: one key arrives at a time, and the files
+  must exist besides.
 
 ## Networking & sharing
 

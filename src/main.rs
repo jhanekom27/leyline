@@ -17,6 +17,7 @@ mod pairing;
 mod search;
 mod settings;
 mod storage;
+mod term_events;
 mod thread;
 mod ticket;
 mod ui;
@@ -31,11 +32,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use arboard::Clipboard;
-use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
-};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
 use crossterm::execute;
-use futures::StreamExt;
 use iroh::EndpointAddr;
 use iroh_tickets::Ticket;
 use tokio::sync::mpsc;
@@ -49,13 +47,14 @@ use channel_renames::ChannelRenames;
 use contacts::Contacts;
 use direct_registry::DirectRegistry;
 use dm_registry::DmRegistry;
-use files::{downloads_dir, resolve_destination, stage_file, stage_image};
+use files::{downloads_dir, dropped_files, resolve_destination, stage_file, stage_image};
 use forgotten_devices::ForgottenDevices;
 use message::ChatMessage;
 use net::{DEVICE_SYNC_CHANNEL, Net, NetEvent};
 use search::{SearchOutcome, run_on_disk_scan};
 use settings::Settings;
 use storage::MessageStore;
+use term_events::TermEvents;
 use ticket::RoomSecret;
 
 #[tokio::main]
@@ -430,15 +429,17 @@ fn route_send(net: &Net, app: &AppState, channel: &str, message: ChatMessage) {
     }
 }
 
-/// Stages the real files a `Ctrl+V`/`/paste` found on the clipboard
-/// (`NetEvent::ClipboardFiles`, e.g. a Finder/Explorer copy) on `channel`,
-/// the channel the paste was for -- which may no longer be the active one
-/// by the time the clipboard read comes back. Each path is checked exactly
-/// like a `/send`ed one (`files::stage_file`); one that is refused is
-/// reported as a system notice without affecting the rest, so a multi-file
-/// copy stages whatever it can. Nothing is shared yet: that waits for
-/// `Enter` (`app::AppState::send_staged`).
-fn stage_clipboard_files(app: &mut AppState, channel: &str, paths: &[PathBuf]) {
+/// Stages real files on `channel` for review: the ones a `Ctrl+V`/`/paste`
+/// found on the clipboard (`NetEvent::ClipboardFiles`, e.g. a
+/// Finder/Explorer copy) -- on the channel the paste was for, which may no
+/// longer be the active one by the time the clipboard read comes back --
+/// and the ones a drag-and-drop pasted as paths (`handle_paste`). Each path
+/// is checked exactly like a `/send`ed one (`files::stage_file`); one that
+/// is refused (unreadable, too large) is reported as a system notice
+/// without affecting the rest, so a multi-file copy or drop stages whatever
+/// it can. Nothing is shared yet: that waits for `Enter`
+/// (`app::AppState::send_staged`).
+fn stage_files(app: &mut AppState, channel: &str, paths: &[PathBuf]) {
     for path in paths {
         match stage_file(path) {
             Ok(item) => app.stage_attachment(channel, item),
@@ -448,13 +449,35 @@ fn stage_clipboard_files(app: &mut AppState, channel: &str, paths: &[PathBuf]) {
 }
 
 /// Stages a clipboard image (`NetEvent::ClipboardImage`, already
-/// re-encoded as PNG) the same way `stage_clipboard_files` stages files;
-/// the one thing to check -- the size cap -- is reported immediately, like
-/// a refused `/send`.
+/// re-encoded as PNG) the same way `stage_files` stages files; the one
+/// thing to check -- the size cap -- is reported immediately, like a
+/// refused `/send`.
 fn stage_clipboard_image(app: &mut AppState, channel: &str, filename: String, bytes: Vec<u8>) {
     match stage_image(filename, bytes) {
         Ok(item) => app.stage_attachment(channel, item),
         Err(message) => app.push_system(message),
+    }
+}
+
+/// Handles a bracketed paste (`Event::Paste`). A terminal turns a
+/// drag-and-drop into a paste of the dropped files' paths (or, in Warp's
+/// case, types them out -- `term_events::TermEvents` turns that into the
+/// same `Event::Paste`), so a paste that is nothing but existing files
+/// (`files::dropped_files`) is a drop: the files are staged on the active
+/// channel, like a `Ctrl+V` of a Finder copy, instead of landing in the
+/// message box as a wall of path text.
+/// Anything else is text for the message box, as it always was --
+/// including a paste while the switcher, a pick or a pairing confirmation
+/// has taken over input (`AppState::is_composing`), where staging files
+/// would put them somewhere the user is not looking.
+fn handle_paste(app: &mut AppState, text: &str) {
+    if app.is_composing()
+        && let Some(paths) = dropped_files(text)
+    {
+        let channel = app.active().name.clone();
+        stage_files(app, &channel, &paths);
+    } else {
+        app.paste_text(text);
     }
 }
 
@@ -577,7 +600,7 @@ async fn run(
     // `PendingDm` and `InputAction::StartDm`'s handling below.
     let mut pending_dms: HashMap<String, PendingDm> = HashMap::new();
 
-    let mut term_events = EventStream::new();
+    let mut term_events = TermEvents::new();
     let mut tick = interval(Duration::from_millis(250));
     let mut history_heartbeat = interval(HISTORY_ANNOUNCE_INTERVAL);
     // Reports for `/search`'s background on-disk scans (see search.rs and
@@ -763,7 +786,7 @@ async fn run(
                     }
                     Event::Resize(_, _) => dirty = true,
                     Event::Paste(text) => {
-                        app.paste_text(&text);
+                        handle_paste(&mut app, &text);
                         dirty = true;
                     }
                     _ => {}
@@ -944,10 +967,9 @@ async fn run(
                     }
                     // `/paste` found real file(s) on the clipboard (e.g. a
                     // Finder/Explorer copy) -- see `net::Net::paste`.
-                    // Staged for review, not shared: see
-                    // `stage_clipboard_files`.
+                    // Staged for review, not shared: see `stage_files`.
                     NetEvent::ClipboardFiles(channel, paths) => {
-                        stage_clipboard_files(&mut app, &channel, &paths);
+                        stage_files(&mut app, &channel, &paths);
                     }
                     // `/paste` found rendered image pixels (e.g. a
                     // screenshot) and already re-encoded them as PNG --
@@ -1053,6 +1075,8 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
     use super::*;
 
     #[test]
@@ -1146,7 +1170,7 @@ mod tests {
             "random",
         );
 
-        stage_clipboard_files(&mut app, "general", &[path]);
+        stage_files(&mut app, "general", &[path]);
 
         let staged = &app.channels[0].staged;
         assert_eq!(staged.len(), 1);
@@ -1165,7 +1189,7 @@ mod tests {
         let missing = dir.path().join("missing.txt");
         let mut app = AppState::new([1; 32], vec!["general".to_string()], "general");
 
-        stage_clipboard_files(&mut app, "general", &[missing.clone(), good]);
+        stage_files(&mut app, "general", &[missing.clone(), good]);
 
         assert_eq!(app.active().staged.len(), 1);
         match app.active().messages.back() {
@@ -1194,5 +1218,124 @@ mod tests {
             (staged[0].filename.as_str(), staged[0].size),
             ("clipboard-1.png", 3)
         );
+    }
+
+    /// Writes a small file called `name` into `dir`; returns its path and
+    /// the path escaped the way Terminal.app and iTerm2 paste a dropped
+    /// file (a backslash before each space).
+    fn dropped(dir: &Path, name: &str) -> (PathBuf, String) {
+        let path = dir.join(name);
+        std::fs::write(&path, b"contents").unwrap();
+        let escaped = path.to_str().unwrap().replace(' ', "\\ ");
+        (path, escaped)
+    }
+
+    #[test]
+    fn a_pasted_file_path_is_staged_on_the_active_channel_not_typed_into_the_box() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, pasted) = dropped(dir.path(), "My Report.pdf");
+        let mut app = AppState::new(
+            [1; 32],
+            vec!["general".to_string(), "random".to_string()],
+            "random",
+        );
+
+        handle_paste(&mut app, &format!("{pasted} "));
+
+        assert_eq!(app.channels[1].staged.len(), 1);
+        assert_eq!(app.channels[1].staged[0].filename, "My Report.pdf");
+        assert!(app.channels[0].staged.is_empty());
+        assert_eq!(app.channels[1].input, "", "nothing is typed into the box");
+    }
+
+    #[test]
+    fn ordinary_pasted_text_goes_into_the_box_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (real, _) = dropped(dir.path(), "real.txt");
+        let texts = [
+            // A sentence that merely mentions a real file.
+            format!("see {} for the details", real.display()),
+            // A path that is not there.
+            dir.path().join("missing.txt").display().to_string(),
+            // A directory.
+            dir.path().display().to_string(),
+            "line one\nline two".to_string(),
+        ];
+
+        for text in texts {
+            let mut app = AppState::new([1; 32], vec!["general".to_string()], "general");
+
+            handle_paste(&mut app, &text);
+
+            assert_eq!(app.active().input, text);
+            assert!(app.active().staged.is_empty(), "text: {text:?}");
+        }
+    }
+
+    #[test]
+    fn several_dropped_files_are_staged_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, first) = dropped(dir.path(), "a.txt");
+        let (_, second) = dropped(dir.path(), "b b.txt");
+        let mut app = AppState::new([1; 32], vec!["general".to_string()], "general");
+
+        handle_paste(&mut app, &format!("{first} {second} "));
+
+        let names: Vec<&str> = app
+            .active()
+            .staged
+            .iter()
+            .map(|item| item.filename.as_str())
+            .collect();
+        assert_eq!(names, ["a.txt", "b b.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_file_that_cannot_be_read_is_reported_and_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (_, readable) = dropped(dir.path(), "ok.txt");
+        let (locked_path, locked) = dropped(dir.path(), "locked.txt");
+        std::fs::set_permissions(&locked_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&locked_path).is_ok() {
+            // Running as root: permissions don't apply, so nothing is refused.
+            return;
+        }
+        let mut app = AppState::new([1; 32], vec!["general".to_string()], "general");
+
+        handle_paste(&mut app, &format!("{locked} {readable}"));
+
+        assert_eq!(app.active().staged.len(), 1);
+        assert_eq!(app.active().staged[0].filename, "ok.txt");
+        match app.active().messages.back() {
+            Some(app::TranscriptLine::System(text)) => assert!(
+                text.starts_with(&format!("can't send {}", locked_path.display())),
+                "got: {text}"
+            ),
+            _ => panic!("expected a system notice about the unreadable file"),
+        }
+        assert_eq!(
+            app.active().input,
+            "",
+            "it was still a drop, so nothing is typed"
+        );
+    }
+
+    #[test]
+    fn a_drop_while_the_switcher_is_open_is_a_plain_paste() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, pasted) = dropped(dir.path(), "report.pdf");
+        let mut app = AppState::new([1; 32], vec!["general".to_string()], "general");
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        handle_paste(&mut app, &pasted);
+
+        assert!(
+            app.active().staged.is_empty(),
+            "files must not be staged behind an open overlay"
+        );
+        let switcher = app.switching.as_ref().expect("the switcher is still open");
+        assert_eq!(switcher.query, path.to_str().unwrap());
     }
 }
