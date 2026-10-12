@@ -610,7 +610,8 @@ async fn run(
                                     clipboard.set_text(ticket.clone()).is_ok()
                                 });
                                 let suffix = if copied { " (copied to clipboard)" } else { "" };
-                                app.push_system(format!("invite for #{channel}: {ticket}{suffix}"));
+                                let label = app.channel_label(&channel);
+                                app.push_system(format!("invite for #{label}: {ticket}{suffix}"));
                             }
                             Some(InputAction::Pair) => {
                                 let snapshot = channel_snapshot(&registry);
@@ -646,7 +647,6 @@ async fn run(
                                         if let Err(err) = direct_registry.forget(peer) {
                                             warn!(%channel, "failed to remove direct peer registry entry: {err}");
                                         }
-                                        app.forget_direct_channel(&channel);
                                     }
                                     None => net.leave(&channel),
                                 }

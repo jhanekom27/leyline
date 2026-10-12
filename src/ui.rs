@@ -117,7 +117,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
             Style::default()
         };
         spans.push(Span::styled(
-            format!(" #{}{unread_marker} ", channel.name),
+            format!(" #{}{unread_marker} ", app.channel_label(&channel.name)),
             style,
         ));
     }
@@ -177,6 +177,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &AppState) {
 
 fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
     let channel = app.active();
+    let label = app.channel_label(&channel.name);
     let visible_rows = area.height.saturating_sub(2).max(1) as usize; // minus borders
     let inner_width = (area.width as usize).saturating_sub(2).max(1); // minus borders
 
@@ -221,7 +222,7 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
     } else if let Some(thread) = &channel.thread {
         format!(
             "#{} · thread from {}: {} ({}) · /thread or Esc to leave",
-            channel.name,
+            label,
             app.display_name(&thread.origin.sender),
             reply_snippet(&thread.origin),
             thread.messages.len()
@@ -236,12 +237,12 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
                 };
                 format!(
                     "#{} · search '{}' ({}{status}) · /s to clear",
-                    channel.name,
+                    label,
                     search.term,
                     search.messages.len()
                 )
             }
-            None => format!("#{} · {} peer(s)", channel.name, channel.peers.len()),
+            None => format!("#{} · {} peer(s)", label, channel.peers.len()),
         }
     };
     let block = Block::bordered()
@@ -1365,6 +1366,95 @@ mod tests {
                 .iter()
                 .any(|span| span.style.add_modifier.contains(Modifier::REVERSED)),
             "the picked row must be rendered reversed"
+        );
+    }
+
+    use std::collections::HashMap;
+
+    /// Renders `app` into an off-screen terminal and returns the text of
+    /// every screen row, so a test can assert on what a user would
+    /// actually see rather than on the state that drives it.
+    fn render_to_rows(app: &AppState) -> Vec<String> {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+            .expect("a test backend never fails");
+        terminal
+            .draw(|frame| render(frame, app))
+            .expect("drawing to a test backend never fails");
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// An app with `general` active plus a `/msg` DM tab and a `/dm`
+    /// point-to-point tab for the same peer, both stored under hex-prefix
+    /// names -- as they would have been named before the peer was.
+    fn app_with_both_dm_kinds() -> AppState {
+        let peer = [7; 32];
+        let mut app = AppState::new(
+            [9; 32],
+            vec!["general".to_string(), "dm-07070707".to_string()],
+            "general",
+        );
+        app.record_dm_channel(peer, "dm-07070707".to_string());
+        app.background_direct_channel("p2p-07070707".to_string(), peer);
+        app
+    }
+
+    #[test]
+    fn the_tab_bar_shows_a_peers_current_alias_not_the_stored_channel_name() {
+        let mut app = app_with_both_dm_kinds();
+        app.load_contacts(HashMap::from([([7; 32], "Alice".to_string())]));
+
+        let tabs = &render_to_rows(&app)[0];
+
+        assert!(tabs.contains("#dm-Alice"), "got: {tabs}");
+        assert!(tabs.contains("#p2p-Alice"), "got: {tabs}");
+        assert!(!tabs.contains("07070707"), "stored name leaked: {tabs}");
+        assert!(
+            tabs.contains("#general"),
+            "a group channel keeps its stored name: {tabs}"
+        );
+    }
+
+    #[test]
+    fn the_tab_bar_shows_the_hex_prefix_until_a_peer_is_named() {
+        let app = app_with_both_dm_kinds();
+
+        let tabs = &render_to_rows(&app)[0];
+
+        assert!(tabs.contains("#dm-07070707"), "got: {tabs}");
+        assert!(tabs.contains("#p2p-07070707"), "got: {tabs}");
+    }
+
+    #[test]
+    fn the_pane_title_shows_a_peers_current_alias() {
+        let mut app = app_with_both_dm_kinds();
+        app.load_contacts(HashMap::from([([7; 32], "Alice".to_string())]));
+        app.active = 1; // the /msg DM tab
+
+        let rows = render_to_rows(&app);
+
+        assert!(
+            rows.iter().any(|row| row.contains("#dm-Alice · 0 peer(s)")),
+            "got: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn the_pane_title_shows_a_group_channel_by_its_stored_name() {
+        let mut app = app_with_both_dm_kinds();
+        app.load_contacts(HashMap::from([([7; 32], "Alice".to_string())]));
+
+        let rows = render_to_rows(&app); // `general` is active
+
+        assert!(
+            rows.iter().any(|row| row.contains("#general · 0 peer(s)")),
+            "got: {rows:#?}"
         );
     }
 }

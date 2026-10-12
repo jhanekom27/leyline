@@ -103,6 +103,20 @@ comes down to in a TUI.
   follows) lets the invited side record the same association, so both
   parties converge on reusing one channel per pair instead of drifting
   onto separate ones.
+- A channel's `name` is its *identity* -- the key behind its storage file,
+  registry entries, and gossip subscription -- and never changes. What the
+  UI *shows* is `AppState::channel_label`: a group channel shows its name,
+  while a DM or point-to-point chat shows whoever it's with, resolved
+  through `display_name` on every draw so it follows `/alias` and `/nick`
+  instead of freezing at whatever was known when the channel was created.
+  Which kind a channel is comes from one query, `AppState::channel_kind`
+  (group, `/msg` DM, or `/dm` point-to-point chat, plus the peer for the
+  latter two), a reverse lookup over `dm_channels`/`direct_channels` --
+  never from the shape of the name, so a group channel someone happened to
+  call `#dm-alice` stays a group channel. A `dm-`/`p2p-` text prefix
+  keeps the two 1:1 kinds distinguishable for now. `/leave <name>` accepts
+  a channel's raw name or the label shown for it, and refuses a label
+  shared by several channels rather than guessing.
 - Each device also loads a second, longer-lived **user key**
   (`identity.rs`, same load-or-generate-once treatment as the device
   identity) and self-signs a `DeviceCert` binding its own `EndpointId` to
@@ -292,13 +306,14 @@ endpoint id.
   enough for chat traffic, and avoids needing any manual length-prefix
   framing on top of what QUIC streams already give for free.
 - **Channel reuse**: a conversation is just an ordinary `app::Channel`
-  tab, named deterministically as `p2p-<hex-prefix>` (`direct::
+  tab, identified deterministically as `p2p-<hex-prefix>` (`direct::
   channel_name`, the single source of truth both sides compute
   independently so they converge on one tab regardless of who connects
-  first) and persisted through the exact same `storage::MessageStore`
-  every other channel uses. `backfill.rs` is deliberately not involved —
-  that store only matters for gossip's `Announce`/history-sync flow,
-  which a 2-party connection has no use for.
+  first; the tab *displays* the peer's resolved name instead, see
+  "Identity & channels") and persisted through the exact same
+  `storage::MessageStore` every other channel uses. `backfill.rs` is
+  deliberately not involved — that store only matters for gossip's
+  `Announce`/history-sync flow, which a 2-party connection has no use for.
 - **Restart behavior**: `direct_registry.rs` persists the set of known
   point-to-point peers (just their ids — the channel name is always
   recomputable), and `main.rs` restores each one's tab, history, and
