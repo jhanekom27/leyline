@@ -268,6 +268,46 @@ Backfill only rides a channel's existing gossip topic, so it only ever
 covers channels already joined — a name or ticket is still needed to join
 a channel before its history can sync to you.
 
+## Point-to-point messaging
+
+`/dm <alias|hex-prefix|endpoint-id> [text]` (`direct.rs`) is a second,
+deliberately separate way to message one peer 1:1, alongside `/msg`'s
+gossip-based DM: a direct QUIC connection to their `EndpointId`, with no
+gossip topic, `RoomSecret`, or invite ticket at all — not even a shared
+channel to have met them in first, as long as you already know their full
+endpoint id.
+
+- **Connection lifecycle**: one background actor per peer (`direct::
+  run_actor`), registered on the shared `Router` under its own ALPN
+  (`leyline/direct/1`). It dials `Endpoint::connect(peer_id, ALPN)`
+  directly — iroh resolves a bare `EndpointId` via the same discovery
+  service a ticket-based `/join` already falls back to — and retries with
+  a capped exponential backoff on failure or disconnect. If the peer
+  reaches us first instead, the registered `ProtocolHandler::accept`
+  spawns the same actor and hands it the inbound connection; whichever
+  side's connection is current most recently simply wins, with no
+  simultaneous-open tie-breaking.
+- **Message framing**: one QUIC uni-directional stream per `ChatMessage`
+  (postcard-encoded), rather than a persistent framed stream — cheap
+  enough for chat traffic, and avoids needing any manual length-prefix
+  framing on top of what QUIC streams already give for free.
+- **Channel reuse**: a conversation is just an ordinary `app::Channel`
+  tab, named deterministically as `p2p-<hex-prefix>` (`direct::
+  channel_name`, the single source of truth both sides compute
+  independently so they converge on one tab regardless of who connects
+  first) and persisted through the exact same `storage::MessageStore`
+  every other channel uses. `backfill.rs` is deliberately not involved —
+  that store only matters for gossip's `Announce`/history-sync flow,
+  which a 2-party connection has no use for.
+- **Restart behavior**: `direct_registry.rs` persists the set of known
+  point-to-point peers (just their ids — the channel name is always
+  recomputable), and `main.rs` restores each one's tab, history, and
+  connection attempt at startup, mirroring `channel_registry.rs`'s role
+  for gossip channels.
+
+See LEY-12 for the fuller design rationale, including why this stayed a
+separate command and prototype rather than replacing `/msg`.
+
 ## Project layout
 
 ```
@@ -284,6 +324,8 @@ src/
   channel_registry.rs // persisted channel list, room secrets, known peers
   contacts.rs         // persisted local pet names for peers
   dm_registry.rs      // persisted peer id <-> 1:1 DM channel name, for /msg
+  direct.rs           // point-to-point (non-gossip) 1:1 messaging: connection lifecycle, framing
+  direct_registry.rs  // persisted set of known point-to-point peers, for /dm
   settings.rs         // persisted local preferences: message bell, broadcast nickname
   storage.rs          // local per-channel message log persistence
   search.rs           // shared match predicate + on-disk scan for /search

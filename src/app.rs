@@ -360,6 +360,18 @@ pub enum InputAction {
         channel: String,
         text: Option<String>,
     },
+    /// Starts (or resumes) a point-to-point conversation with `peer` --
+    /// see `run_dm`. Unlike `StartDm`, the caller (main.rs) never needs to
+    /// create the tab itself first: `net::Net::open_direct` is fully
+    /// synchronous (no gossip-style subscribe to await), and the
+    /// recipient side converges on the same tab via
+    /// `net::NetEvent::DirectJoined` regardless of who connects first, so
+    /// `run_dm` only needs to say who this is for and what (if anything)
+    /// to send once ready.
+    OpenDirect {
+        peer: [u8; 32],
+        text: Option<String>,
+    },
     /// Build an invite ticket for the named channel and report it back
     /// (via `AppState::push_system`) once built.
     Invite(String),
@@ -491,6 +503,18 @@ pub struct AppState {
     /// current as new DMs are started or accepted this session (see
     /// `NetEvent::DmJoined` and `run_msg`'s creation path).
     dm_channels: HashMap<[u8; 32], String>,
+    /// Peer id -> local point-to-point channel name (see `direct.rs`),
+    /// mirroring `dm_channels`'s role for `/msg` but for `/dm`'s
+    /// point-to-point conversations instead of gossip-based ones. Unlike
+    /// `dm_channels`, the name is always `direct::channel_name(&peer)` --
+    /// deterministic, not cosmetic -- so this map exists purely to answer
+    /// "do we already have a tab for this peer" (`run_dm`) and "which
+    /// peer does this channel name belong to" (`direct_peer_for`, used by
+    /// main.rs to route a send to `net::Net::send_direct` instead of
+    /// `net::Net::send`). Populated either synchronously when we initiate
+    /// (`activate_direct_channel`) or via `NetEvent::DirectJoined` when a
+    /// peer reaches us first (`background_direct_channel`).
+    direct_channels: HashMap<[u8; 32], String>,
     /// The in-progress candidate while picking a reply target with
     /// `Ctrl+R` (see `start_reply_pick`/`move_reply_pick`), by message id.
     /// `None` when not picking -- `handle_key` checks this first, before
@@ -561,6 +585,7 @@ impl AppState {
             device_to_user: HashMap::new(),
             forgotten: HashSet::new(),
             dm_channels: HashMap::new(),
+            direct_channels: HashMap::new(),
             picking_reply: None,
             picking_thread: None,
             replying_to: None,
@@ -782,6 +807,56 @@ impl AppState {
     /// itself instead of needing this).
     pub fn record_dm_channel(&mut self, peer: [u8; 32], channel: String) {
         self.dm_channels.insert(peer, channel);
+    }
+
+    /// The peer a point-to-point channel belongs to, if `channel` is one
+    /// -- see `direct_channels`. Used by main.rs to decide whether a send
+    /// (or a `/leave`) should go through `net::Net::send_direct`/
+    /// `close_direct` instead of the gossip-based `send`/`leave`.
+    pub fn direct_peer_for(&self, channel: &str) -> Option<[u8; 32]> {
+        self.direct_channels
+            .iter()
+            .find(|(_, name)| name.as_str() == channel)
+            .map(|(id, _)| *id)
+    }
+
+    /// Switches to (creating if necessary) `peer`'s point-to-point
+    /// channel, named `channel` (see `direct::channel_name`), and records
+    /// the association in `direct_channels`. Returns whether this is a
+    /// brand-new tab -- the caller (main.rs) only needs to load persisted
+    /// history (`storage::MessageStore`) in that case, mirroring how
+    /// startup only loads each gossip channel's history once. Backs the
+    /// user-initiated path (`run_dm`'s `InputAction::OpenDirect`): the
+    /// local user explicitly asked to go here, so -- like
+    /// `activate_or_create_channel` -- this switches focus.
+    pub fn activate_direct_channel(&mut self, channel: String, peer: [u8; 32]) -> bool {
+        let is_new = !self.channels.iter().any(|c| c.name == channel);
+        self.activate_or_create_channel(channel.clone());
+        self.direct_channels.insert(peer, channel);
+        is_new
+    }
+
+    /// Adds `peer`'s point-to-point channel as a background tab without
+    /// switching focus, and records the association in `direct_channels`
+    /// -- the recipient-side counterpart to `activate_direct_channel`,
+    /// for a peer who reached us first with no prior contact on our side
+    /// (`net::NetEvent::DirectJoined`). Mirrors `add_background_channel`'s
+    /// "don't yank focus" reasoning: the local user never asked for this
+    /// conversation to appear. Returns whether this is a brand-new tab,
+    /// like `activate_direct_channel`.
+    pub fn background_direct_channel(&mut self, channel: String, peer: [u8; 32]) -> bool {
+        let is_new = !self.channels.iter().any(|c| c.name == channel);
+        self.add_background_channel(channel.clone());
+        self.direct_channels.insert(peer, channel);
+        is_new
+    }
+
+    /// Forgets `channel`'s point-to-point association -- called alongside
+    /// `/leave`ing one (see `InputAction::Leave`'s handling in main.rs),
+    /// mirroring `dm_registry::DmRegistry::forget_channel`. A no-op if
+    /// `channel` isn't a point-to-point one.
+    pub fn forget_direct_channel(&mut self, channel: &str) {
+        self.direct_channels.retain(|_, name| name != channel);
     }
 
     /// Pure key handling: no I/O, no network. Returns the action to
@@ -1102,11 +1177,15 @@ impl AppState {
             // `FileSendFailed`/`FileSaveFailed` are also logged there via
             // `tracing::warn!` (unlike the other system notices here, a
             // failed file transfer is worth a trace in leyline.log too),
-            // and `ClipboardFiles`/`ClipboardImage`/`ClipboardText`/
+            // `ClipboardFiles`/`ClipboardImage`/`ClipboardText`/
             // `PasteFailed` (see `net::Net::paste`) are turned into the
-            // same `FileReady`/plain-`Send` treatment or a logged error.
-            // None of these are transcript or presence state handled here
-            // directly.
+            // same `FileReady`/plain-`Send` treatment or a logged error,
+            // and `DirectJoined` is turned into a background tab via
+            // `background_direct_channel` (main.rs needs to conditionally
+            // load persisted history alongside it, which this method's
+            // `Option<(String, ChatMessage)>` return shape has no room to
+            // express). None of these are transcript or presence state
+            // handled here directly.
             NetEvent::Announce(..)
             | NetEvent::HistoryFetched(..)
             | NetEvent::PeerAddressLearned(..)
@@ -1116,7 +1195,8 @@ impl AppState {
             | NetEvent::ClipboardFiles(..)
             | NetEvent::ClipboardImage(..)
             | NetEvent::ClipboardText(..)
-            | NetEvent::PasteFailed(..) => None,
+            | NetEvent::PasteFailed(..)
+            | NetEvent::DirectJoined { .. } => None,
         }
     }
 
@@ -1373,10 +1453,11 @@ impl AppState {
                     Some(InputAction::Join(arg.to_string()))
                 }
             }
-            "invite" => Some(InputAction::Invite(self.active().name.clone())),
+            "invite" => self.run_invite(),
             "pair" => self.run_pair(arg.trim()),
             "forget-device" => self.run_forget_device(arg.trim()),
             "msg" => self.run_msg(arg.trim()),
+            "dm" => self.run_dm(arg.trim()),
             "alias" => self.run_alias(arg.trim()),
             "nick" => self.run_nick(arg.trim()),
             "leave" => self.run_leave(arg.trim()),
@@ -1398,6 +1479,22 @@ impl AppState {
         }
     }
 
+    /// Handles `/invite`: builds an invite ticket for the active channel,
+    /// unless it's a point-to-point one (see `direct_channels`) -- those
+    /// have no ticket or room secret at all (`net::Net::ticket_for` would
+    /// panic if asked for one), so this refuses with a clear message
+    /// instead of ever reaching the caller's network layer.
+    fn run_invite(&mut self) -> Option<InputAction> {
+        let channel = self.active().name.clone();
+        if self.direct_peer_for(&channel).is_some() {
+            self.push_system(
+                "point-to-point conversations have no invite ticket -- share your endpoint id directly instead",
+            );
+            return None;
+        }
+        Some(InputAction::Invite(channel))
+    }
+
     /// Handles `/help`: pushes the full command/keybinding reference as a
     /// system notice. The input box's border only shows a short hint (see
     /// `ui::render_input`) to stay uncluttered, so this is where that
@@ -1405,13 +1502,15 @@ impl AppState {
     fn run_help(&mut self) -> Option<InputAction> {
         self.push_system(
             "commands: /join <name|ticket>, /invite, /pair [ticket], /forget-device <hex-prefix>, \
-             /msg <alias|hex-prefix> [text], /leave [channel], /who, /send <path>, \
+             /msg <alias|hex-prefix> [text], /dm <alias|hex-prefix|endpoint-id> [text], \
+             /leave [channel], /who, /send <path>, \
              /save <hash-prefix>, /paste, /alias <hex-prefix> <name>, /nick <name>, \
              /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
              ticket for a new device to redeem, /pair <ticket> redeems one (after an \
              Enter/Esc confirmation -- this replaces this device's identity and data) -- \
-             keys: Tab/Shift+Tab switch channels, \
+             /dm connects directly to a peer's endpoint id with no ticket or gossip channel, \
+             unlike /msg -- keys: Tab/Shift+Tab switch channels, \
              Alt+Enter/Ctrl+J newline, Ctrl+V paste, Ctrl+R reply (\u{2191}/\u{2193} pick, \
              Enter confirm), Ctrl+T thread (\u{2191}/\u{2193} pick, Enter confirm), \
              Up/Down scroll, Esc/Ctrl+C quit",
@@ -2034,6 +2133,62 @@ impl AppState {
         })
     }
 
+    /// Handles `/dm <alias|hex-prefix|endpoint-id> [text]`: a true
+    /// point-to-point conversation, with no gossip channel, room secret,
+    /// or invite ticket involved (see `direct.rs`) -- `/msg` is the
+    /// gossip-based equivalent. `arg` is everything after `/dm ` (already
+    /// trimmed), split the same way `run_msg` splits its argument.
+    /// Resolves the target via `resolve_dm_target`, which -- unlike
+    /// `resolve_msg_target` -- also accepts a full endpoint id for a peer
+    /// never otherwise observed, so two people who already know each
+    /// other's id can start talking without having shared a channel
+    /// first. If a point-to-point tab is already open for that peer
+    /// (`direct_channels`), just switches to it -- else returns
+    /// `InputAction::OpenDirect` for the caller (main.rs) to ensure the
+    /// connection and create the tab, since unlike `run_msg`'s gossip
+    /// subscribe, there's nothing here worth doing synchronously ahead of
+    /// that (`net::Net::open_direct` is itself synchronous).
+    fn run_dm(&mut self, arg: &str) -> Option<InputAction> {
+        if arg.is_empty() {
+            self.push_system("usage: /dm <alias|hex-prefix|endpoint-id> [text]");
+            return None;
+        }
+        let (target, text) = match arg.split_once(' ') {
+            Some((target, rest)) => (target, Some(rest.trim()).filter(|s| !s.is_empty())),
+            None => (arg, None),
+        };
+        let id = match self.resolve_dm_target(target) {
+            Ok(id) => id,
+            Err(err) => {
+                self.push_system(err);
+                return None;
+            }
+        };
+        if id == self.self_id {
+            self.push_system("you can't start a point-to-point chat with yourself");
+            return None;
+        }
+
+        if let Some(name) = self.direct_channels.get(&id).cloned()
+            && self.activate_existing_channel(&name)
+        {
+            self.push_system(format!(
+                "switched to your point-to-point chat with {}",
+                self.display_name(&id)
+            ));
+            return text.map(|text| self.send_text(text, None));
+        }
+
+        self.push_system(format!(
+            "starting a point-to-point chat with {}...",
+            self.display_name(&id)
+        ));
+        Some(InputAction::OpenDirect {
+            peer: id,
+            text: text.map(str::to_string),
+        })
+    }
+
     /// Resolves a `/msg` target: an exact (case-insensitive) local pet
     /// name first -- checked against every saved pet name, not just
     /// `known_ids()`, since you should be able to `/msg` someone you've
@@ -2054,6 +2209,21 @@ impl AppState {
             _ => Err(format!(
                 "'{target}' matches multiple aliased peers, use a hex prefix instead"
             )),
+        }
+    }
+
+    /// Resolves a `/dm` target: `resolve_msg_target`'s pet-name/hex-prefix
+    /// resolution first, falling back to parsing `target` itself as a
+    /// full, not-necessarily-already-known endpoint id (exactly 64 hex
+    /// characters) if that fails. This fallback is what lets `/dm` reach
+    /// a peer who's never appeared in any joined channel or been
+    /// `/alias`ed -- the whole point of a point-to-point connection being
+    /// usable the moment two people already know each other's endpoint
+    /// id, with nothing else shared yet.
+    fn resolve_dm_target(&self, target: &str) -> Result<[u8; 32], String> {
+        match self.resolve_msg_target(target) {
+            Ok(id) => Ok(id),
+            Err(err) => decode_hex_id(target).ok_or(err),
         }
     }
 
@@ -2211,6 +2381,22 @@ fn hex_prefix(bytes: &[u8; 32]) -> String {
 /// another instance's `--connect` flag.
 pub fn hex_id(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Decodes a full, 64-character hex endpoint id (as typed after `/dm`) into
+/// raw bytes -- the inverse of `hex_id`. `None` for anything else (wrong
+/// length, non-hex characters), including a mere hex *prefix* -- only a
+/// complete id can be dialed with no other information, so a partial one
+/// is never silently accepted here (see `resolve_dm_target`).
+fn decode_hex_id(target: &str) -> Option<[u8; 32]> {
+    if target.len() != 64 || !target.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    for (i, byte) in id.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&target[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(id)
 }
 
 /// Strips one layer of matching leading/trailing quotes from a `/send`
@@ -5206,5 +5392,190 @@ mod tests {
 
         assert!(action.is_none());
         assert_eq!(app.active().name, "dm-Alice");
+    }
+
+    #[test]
+    fn dm_reports_usage_with_no_argument() {
+        let mut app = app();
+        let action = submit(&mut app, "/dm");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.starts_with("usage:"), "got: {last}");
+    }
+
+    #[test]
+    fn dm_reports_no_known_peer_for_an_unknown_short_hex_prefix() {
+        let mut app = app();
+        let action = submit(&mut app, "/dm ffffffff");
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("no known peer"), "got: {last}");
+    }
+
+    #[test]
+    fn dm_accepts_a_full_endpoint_id_even_if_never_seen() {
+        // The whole point of /dm: a peer never observed in any channel
+        // and never /alias-ed can still be reached directly, as long as
+        // their full endpoint id is known -- unlike /msg, which has
+        // nothing but `known_ids()` to resolve a hex prefix against.
+        let mut app = app();
+        let full_id = hex_id(&PEER_ID);
+
+        let action = submit(&mut app, &format!("/dm {full_id}"));
+
+        match action.expect("/dm with a full endpoint id returns an action") {
+            InputAction::OpenDirect { peer, text } => {
+                assert_eq!(peer, PEER_ID);
+                assert!(text.is_none());
+            }
+            _ => panic!("expected InputAction::OpenDirect"),
+        }
+    }
+
+    #[test]
+    fn dm_by_alias_starts_a_new_conversation_when_none_exists() {
+        let mut app = app();
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+
+        let action = submit(&mut app, "/dm alice");
+
+        match action.expect("/dm with no existing conversation returns an action") {
+            InputAction::OpenDirect { peer, text } => {
+                assert_eq!(peer, PEER_ID);
+                assert!(text.is_none());
+            }
+            _ => panic!("expected InputAction::OpenDirect"),
+        }
+    }
+
+    #[test]
+    fn dm_with_inline_text_queues_it_on_the_open_direct_action() {
+        let mut app = app();
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+
+        let action = submit(&mut app, "/dm alice hey there");
+
+        match action.expect("a successful /dm returns an action") {
+            InputAction::OpenDirect { text, .. } => {
+                assert_eq!(text, Some("hey there".to_string()));
+            }
+            _ => panic!("expected InputAction::OpenDirect"),
+        }
+    }
+
+    #[test]
+    fn dm_refuses_to_message_yourself() {
+        let mut app = app();
+        let full_id = hex_id(&SELF_ID);
+
+        let action = submit(&mut app, &format!("/dm {full_id}"));
+
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("yourself"), "got: {last}");
+    }
+
+    #[test]
+    fn dm_switches_to_an_already_open_direct_chat_instead_of_starting_another() {
+        let mut app = app();
+        app.activate_direct_channel("p2p-alice".to_string(), PEER_ID);
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+        app.active = 0; // switch away, so /dm has to switch back
+
+        let action = submit(&mut app, "/dm alice");
+
+        assert!(action.is_none(), "no inline text means nothing to send");
+        assert_eq!(app.active().name, "p2p-alice");
+    }
+
+    #[test]
+    fn dm_switches_to_an_existing_direct_chat_and_sends_inline_text() {
+        let mut app = app();
+        app.activate_direct_channel("p2p-alice".to_string(), PEER_ID);
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+        app.active = 0;
+
+        let action = submit(&mut app, "/dm alice hello again");
+
+        assert_eq!(app.active().name, "p2p-alice");
+        match action.expect("inline text should send immediately") {
+            InputAction::Send(channel, message) => {
+                assert_eq!(channel, "p2p-alice");
+                assert_eq!(message.text, "hello again");
+            }
+            _ => panic!("expected InputAction::Send"),
+        }
+    }
+
+    #[test]
+    fn activate_direct_channel_reports_whether_the_tab_is_new() {
+        let mut app = app();
+        assert!(app.activate_direct_channel("p2p-alice".to_string(), PEER_ID));
+        assert!(
+            !app.activate_direct_channel("p2p-alice".to_string(), PEER_ID),
+            "an already-open point-to-point tab is not new"
+        );
+    }
+
+    #[test]
+    fn activate_direct_channel_switches_focus_and_records_the_peer() {
+        let mut app = app();
+        app.activate_direct_channel("p2p-alice".to_string(), PEER_ID);
+        assert_eq!(app.active().name, "p2p-alice");
+        assert_eq!(app.direct_peer_for("p2p-alice"), Some(PEER_ID));
+    }
+
+    #[test]
+    fn background_direct_channel_does_not_switch_focus() {
+        let mut app = app();
+        assert_eq!(app.active().name, "general");
+
+        let is_new = app.background_direct_channel("p2p-alice".to_string(), PEER_ID);
+
+        assert!(is_new);
+        assert_eq!(
+            app.active().name,
+            "general",
+            "a background direct channel must not steal focus"
+        );
+        assert!(app.channels.iter().any(|c| c.name == "p2p-alice"));
+        assert_eq!(app.direct_peer_for("p2p-alice"), Some(PEER_ID));
+    }
+
+    #[test]
+    fn background_direct_channel_on_an_already_known_peer_does_not_duplicate() {
+        let mut app = app();
+        app.background_direct_channel("p2p-alice".to_string(), PEER_ID);
+        let is_new = app.background_direct_channel("p2p-alice".to_string(), PEER_ID);
+        assert!(!is_new);
+        assert_eq!(app.channels.len(), 2, "must not duplicate an existing tab");
+    }
+
+    #[test]
+    fn forget_direct_channel_removes_the_association() {
+        let mut app = app();
+        app.activate_direct_channel("p2p-alice".to_string(), PEER_ID);
+        app.forget_direct_channel("p2p-alice");
+        assert_eq!(app.direct_peer_for("p2p-alice"), None);
+    }
+
+    #[test]
+    fn forget_direct_channel_is_a_no_op_for_an_unknown_channel() {
+        let mut app = app();
+        app.activate_direct_channel("p2p-alice".to_string(), PEER_ID);
+        app.forget_direct_channel("p2p-bob");
+        assert_eq!(app.direct_peer_for("p2p-alice"), Some(PEER_ID));
+    }
+
+    #[test]
+    fn invite_is_refused_on_a_point_to_point_channel() {
+        let mut app = app();
+        app.activate_direct_channel("p2p-alice".to_string(), PEER_ID);
+
+        let action = submit(&mut app, "/invite");
+
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("point-to-point"), "got: {last}");
     }
 }

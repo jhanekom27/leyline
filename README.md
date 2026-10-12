@@ -153,6 +153,7 @@ Typed into the message box and submitted with `Enter`:
 | `/join <ticket>` | Join the channel named in a pasted invite ticket |
 | `/invite` | Show the active channel's invite ticket in the transcript (and copy it to your clipboard, if one is available) to share with others |
 | `/msg <alias-or-hex-prefix> [text]` | Message a specific peer 1:1: switches to (or auto-creates) a private channel just for the two of you, named `dm-<alias-or-hex-prefix>`; share its invite ticket the same way as any new channel so they can join it too. With `[text]`, sends it immediately once the channel is ready |
+| `/dm <alias-or-hex-prefix-or-endpoint-id> [text]` | Message a peer directly over a point-to-point QUIC connection -- no gossip channel, room secret, or invite ticket, unlike `/msg`. Switches to (or auto-creates) a `p2p-<hex-prefix>` tab; accepts a full endpoint id for a peer you've never shared a channel with, as long as you already know their id. Reconnects automatically on disconnect, and the conversation's tab, history, and connection attempt all come back after a restart. With `[text]`, sends it immediately once connected |
 | `/leave` | Leave the active channel |
 | `/leave <channel-name>` | Leave a specific joined channel without switching to it |
 | `/who` | List the active channel's peers, showing each one's full endpoint id, broadcast nickname (if any), and local alias (if any) |

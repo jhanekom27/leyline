@@ -2,6 +2,8 @@ mod app;
 mod backfill;
 mod channel_registry;
 mod contacts;
+mod direct;
+mod direct_registry;
 mod dm_registry;
 mod files;
 mod forgotten_devices;
@@ -43,9 +45,11 @@ use app::{AppState, InputAction};
 use backfill::BackfillStore;
 use channel_registry::ChannelRegistry;
 use contacts::Contacts;
+use direct_registry::DirectRegistry;
 use dm_registry::DmRegistry;
 use files::{downloads_dir, resolve_destination};
 use forgotten_devices::ForgottenDevices;
+use message::ChatMessage;
 use net::{DEVICE_SYNC_CHANNEL, Net, NetEvent};
 use search::{SearchOutcome, run_on_disk_scan};
 use settings::Settings;
@@ -76,6 +80,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize contacts")?;
     let dm_registry = DmRegistry::load(dirs.data_dir().join("dms"))
         .context("failed to initialize DM registry")?;
+    let direct_registry = DirectRegistry::load(dirs.data_dir().join("direct_peers"))
+        .context("failed to initialize direct-peer registry")?;
     let settings = Settings::load(dirs.data_dir().join("settings"))
         .context("failed to initialize settings")?;
     let forgotten_devices = ForgottenDevices::load(dirs.data_dir().join("forgotten_devices"))
@@ -127,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         registry,
         contacts,
         dm_registry,
+        direct_registry,
         settings,
         forgotten_devices,
         data_dir,
@@ -226,6 +233,7 @@ fn paths_to_wipe_for_pairing(data_dir: &Path, config_dir: &Path) -> Vec<PathBuf>
         data_dir.join("blobs"),
         data_dir.join("contacts"),
         data_dir.join("dms"),
+        data_dir.join("direct_peers"),
         data_dir.join("settings"),
         data_dir.join("forgotten_devices"),
     ]
@@ -356,6 +364,7 @@ struct Session {
     registry: ChannelRegistry,
     contacts: Contacts,
     dm_registry: DmRegistry,
+    direct_registry: DirectRegistry,
     settings: Settings,
     forgotten_devices: ForgottenDevices,
     /// leyline's own data directory (`dirs.data_dir()`), needed so a
@@ -398,6 +407,22 @@ fn announce_history(net: &Net, backfill: &BackfillStore, channel: &str) {
     }
 }
 
+/// Sends a locally-authored `message` to `channel` via whichever transport
+/// it actually belongs to: a point-to-point connection
+/// (`net::Net::send_direct`) if `channel` is one (`app::AppState::
+/// direct_peer_for`), else the ordinary gossip broadcast (`net::Net::
+/// send`). Centralizing this one decision here, rather than duplicating it
+/// at every call site that broadcasts a locally-authored message, is what
+/// lets `/send`, `/paste`, and a plain typed message all work unmodified
+/// over a point-to-point conversation -- none of them depend on gossip
+/// specifically, only on reaching the right peer.
+fn route_send(net: &Net, app: &AppState, channel: &str, message: ChatMessage) {
+    match app.direct_peer_for(channel) {
+        Some(peer) => net.send_direct(peer, message),
+        None => net.send(channel, message),
+    }
+}
+
 /// Rings the terminal bell (ASCII BEL) to signal a newly-arrived message --
 /// see `AppState::bell_enabled`, toggled via `/bell` and persisted through
 /// settings.rs. A plain control byte, so it's safe to write straight to
@@ -431,6 +456,7 @@ async fn run(
         mut registry,
         mut contacts,
         mut dm_registry,
+        mut direct_registry,
         mut settings,
         mut forgotten_devices,
         data_dir,
@@ -478,6 +504,24 @@ async fn run(
         warn!("failed to persist device-sync channel: {err}");
     }
 
+    // Restores every known point-to-point conversation (see
+    // direct_registry.rs): starts trying to (re)connect immediately
+    // (`Net::open_direct`), recreates its tab in the background so it
+    // doesn't steal focus from `active_channel`, and reloads its
+    // persisted history -- mirroring the gossip-channel startup loop
+    // above, so a restart behaves the same way for either kind of
+    // channel. No `backfill` seeding here: that store only matters for
+    // gossip's history-sync flow, which point-to-point channels never use.
+    for peer in direct_registry.all() {
+        let channel = net.open_direct(peer);
+        if app.background_direct_channel(channel.clone(), peer) {
+            match store.load(&channel) {
+                Ok(history) => app.load_history(&channel, history),
+                Err(err) => warn!(%channel, "failed to load message history: {err}"),
+            }
+        }
+    }
+
     // `None` if no clipboard is available (e.g. a headless SSH session) --
     // `/invite` still prints the ticket either way, this just skips the
     // auto-copy. Held for the whole session rather than recreated per
@@ -521,10 +565,32 @@ async fn run(
                                 if let Err(err) = store.append(&channel, &message) {
                                     warn!(%channel, "failed to persist sent message: {err}");
                                 }
-                                if let Err(err) = backfill.record_message(&channel, &message).await {
+                                if app.direct_peer_for(&channel).is_none()
+                                    && let Err(err) = backfill.record_message(&channel, &message).await
+                                {
                                     warn!(%channel, "failed to record sent message for backfill: {err}");
                                 }
-                                net.send(&channel, message);
+                                route_send(&net, &app, &channel, message);
+                            }
+                            Some(InputAction::OpenDirect { peer, text }) => {
+                                let channel = net.open_direct(peer);
+                                if app.activate_direct_channel(channel.clone(), peer) {
+                                    if let Err(err) = direct_registry.record(peer) {
+                                        warn!(%channel, "failed to persist direct peer registry entry: {err}");
+                                    }
+                                    match store.load(&channel) {
+                                        Ok(history) => app.load_history(&channel, history),
+                                        Err(err) => warn!(%channel, "failed to load message history: {err}"),
+                                    }
+                                }
+                                if let Some(text) = text {
+                                    let message = app.compose_own_message(&text);
+                                    net.send_direct(peer, message.clone());
+                                    if let Err(err) = store.append(&channel, &message) {
+                                        warn!(%channel, "failed to persist sent message: {err}");
+                                    }
+                                    app.record_sent_message(&channel, message);
+                                }
                             }
                             Some(InputAction::Join(arg)) => {
                                 if let Some(message) = net.join(arg) {
@@ -574,7 +640,16 @@ async fn run(
                                 net.set_nickname(name);
                             }
                             Some(InputAction::Leave(channel)) => {
-                                net.leave(&channel);
+                                match app.direct_peer_for(&channel) {
+                                    Some(peer) => {
+                                        net.close_direct(peer);
+                                        if let Err(err) = direct_registry.forget(peer) {
+                                            warn!(%channel, "failed to remove direct peer registry entry: {err}");
+                                        }
+                                        app.forget_direct_channel(&channel);
+                                    }
+                                    None => net.leave(&channel),
+                                }
                                 if let Err(err) = registry.forget_channel(&channel) {
                                     warn!(%channel, "failed to remove channel from registry: {err}");
                                 }
@@ -759,6 +834,23 @@ async fn run(
                             net.sync_channel(&tag, announce);
                         }
                     }
+                    // A peer reached us over a point-to-point connection
+                    // for the first time this session (see `direct.rs`) --
+                    // create (or confirm) its background tab, mirroring
+                    // `ChannelSyncJoined`'s "don't steal focus" semantics,
+                    // and load its persisted history the first time, the
+                    // same way the startup restore loop above does.
+                    NetEvent::DirectJoined { channel, peer } => {
+                        if app.background_direct_channel(channel.clone(), peer) {
+                            if let Err(err) = direct_registry.record(peer) {
+                                warn!(%channel, "failed to persist direct peer registry entry: {err}");
+                            }
+                            match store.load(&channel) {
+                                Ok(history) => app.load_history(&channel, history),
+                                Err(err) => warn!(%channel, "failed to load message history: {err}"),
+                            }
+                        }
+                    }
                     // A `/send`ed file failed to import -- see
                     // `net::Net::send_file`. Logged (unlike most other
                     // system notices, which app.rs pushes on its own)
@@ -782,11 +874,13 @@ async fn run(
                     // same `net.send` call, the same way `InputAction::Send`
                     // above does for typed text.
                     NetEvent::FileReady(channel, message) => {
-                        net.send(&channel, message.clone());
+                        route_send(&net, &app, &channel, message.clone());
                         if let Err(err) = store.append(&channel, &message) {
                             warn!(%channel, "failed to persist sent file: {err}");
                         }
-                        if let Err(err) = backfill.record_message(&channel, &message).await {
+                        if app.direct_peer_for(&channel).is_none()
+                            && let Err(err) = backfill.record_message(&channel, &message).await
+                        {
                             warn!(%channel, "failed to record sent file for backfill: {err}");
                         }
                         app.record_sent_message(&channel, message);
@@ -822,11 +916,13 @@ async fn run(
                     // together for a locally-authored message).
                     NetEvent::ClipboardText(channel, text) => {
                         let message = app.compose_own_message(&text);
-                        net.send(&channel, message.clone());
+                        route_send(&net, &app, &channel, message.clone());
                         if let Err(err) = store.append(&channel, &message) {
                             warn!(%channel, "failed to persist pasted message: {err}");
                         }
-                        if let Err(err) = backfill.record_message(&channel, &message).await {
+                        if app.direct_peer_for(&channel).is_none()
+                            && let Err(err) = backfill.record_message(&channel, &message).await
+                        {
                             warn!(%channel, "failed to record pasted message for backfill: {err}");
                         }
                         app.record_sent_message(&channel, message);
@@ -844,7 +940,9 @@ async fn run(
                             if let Err(err) = store.append(&channel, &message) {
                                 warn!(%channel, "failed to persist received message: {err}");
                             }
-                            if let Err(err) = backfill.record_message(&channel, &message).await {
+                            if app.direct_peer_for(&channel).is_none()
+                                && let Err(err) = backfill.record_message(&channel, &message).await
+                            {
                                 warn!(%channel, "failed to record received message for backfill: {err}");
                             }
                             if app.bell_enabled {

@@ -31,6 +31,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::backfill::BackfillStore;
+use crate::direct::{self, Direct};
 use crate::message::{
     ChannelSyncAnnounce, ChatMessage, DeviceCert, FileAttachment, GossipPayload, HistoryAnnounce,
     IdentityAnnounce, VersionAnnounce, now_unix_ms,
@@ -113,6 +114,16 @@ pub enum NetEvent {
     /// same activation responsibility `Joined` does
     /// (`app::AppState::handle_net_event`).
     DmJoined { channel: String, peer: [u8; 32] },
+    /// A peer reached us over a direct point-to-point connection
+    /// (`direct.rs`) for the first time this session -- either because we
+    /// dialed them (`Net::open_direct`) or because they dialed us with no
+    /// prior contact on our side. Reported once per conversation's
+    /// lifetime, not on every reconnect (see `PeerJoined`/`PeerLeft` for
+    /// that): `app.rs` reacts by creating a background tab for `channel`
+    /// (`direct::channel_name`), mirroring `ChannelSyncJoined`'s "don't
+    /// steal focus" semantics, since the local user never asked for this
+    /// conversation to appear.
+    DirectJoined { channel: String, peer: [u8; 32] },
     /// A channel failed to join.
     JoinFailed(String, String),
     /// A peer announced its current history root hash for a channel -- see
@@ -346,6 +357,11 @@ pub struct Net {
     /// mirrors how `gossip` is both registered on `router` and kept as its
     /// own field for later calls.
     pairing: Arc<PairingProtocol>,
+    /// Registered on `router` under `direct::DIRECT_ALPN`, and also kept
+    /// here so `open_direct`/`send_direct`/`close_direct` can reach it --
+    /// mirrors `pairing` above. See `direct.rs` for the point-to-point
+    /// connection lifecycle this owns.
+    direct: Arc<Direct>,
 }
 
 impl Net {
@@ -425,10 +441,12 @@ impl Net {
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let pairing = Arc::new(PairingProtocol::new());
+        let direct = Arc::new(Direct::new(endpoint.clone(), events_tx.clone()));
         let router = Router::builder(endpoint)
             .accept(GOSSIP_ALPN, gossip.clone())
             .accept(iroh_blobs::ALPN, backfill.protocol_handler())
             .accept(pairing::PAIRING_ALPN, pairing.clone())
+            .accept(direct::DIRECT_ALPN, direct.clone())
             .spawn();
 
         let our_cert = DeviceCert::new(our_id, &user_key, now_unix_ms());
@@ -446,6 +464,7 @@ impl Net {
             our_cert,
             user_key_bytes,
             pairing,
+            direct,
         };
 
         // A ticket naming our own identity can't reach anyone -- an invite
@@ -699,7 +718,10 @@ impl Net {
 
         if existing_secret.is_some() {
             let event = match dm_peer {
-                Some(peer) => NetEvent::DmJoined { channel: name, peer },
+                Some(peer) => NetEvent::DmJoined {
+                    channel: name,
+                    peer,
+                },
                 None => NetEvent::Joined(name),
             };
             let _ = self.events_tx.try_send(event);
@@ -748,7 +770,10 @@ impl Net {
                         },
                     );
                     let event = match dm_peer {
-                        Some(peer) => NetEvent::DmJoined { channel: name, peer },
+                        Some(peer) => NetEvent::DmJoined {
+                            channel: name,
+                            peer,
+                        },
                         None => NetEvent::Joined(name),
                     };
                     let _ = events_tx.send(event).await;
@@ -1477,6 +1502,26 @@ impl Net {
             dm,
         }
         .encode_string()
+    }
+
+    /// Ensures a point-to-point connection attempt to `peer` is running
+    /// and returns its channel name (`direct::channel_name`) -- the
+    /// point-to-point counterpart to `join`, but synchronous: see
+    /// `direct::Direct::open`.
+    pub fn open_direct(&self, peer: [u8; 32]) -> String {
+        self.direct.open(peer)
+    }
+
+    /// Queues `message` to be sent to `peer` over its point-to-point
+    /// connection, starting one first if needed -- see `direct::Direct::send`.
+    pub fn send_direct(&self, peer: [u8; 32], message: ChatMessage) {
+        self.direct.send(peer, message);
+    }
+
+    /// Stops `peer`'s point-to-point connection outright -- e.g.
+    /// `/leave`ing a point-to-point channel. See `direct::Direct::close`.
+    pub fn close_direct(&self, peer: [u8; 32]) {
+        self.direct.close(peer);
     }
 
     /// Leaves every channel and closes the endpoint gracefully.
