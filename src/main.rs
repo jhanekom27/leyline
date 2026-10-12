@@ -1,6 +1,7 @@
 mod app;
 mod backfill;
 mod channel_registry;
+mod channel_renames;
 mod contacts;
 mod direct;
 mod direct_registry;
@@ -44,6 +45,7 @@ use tracing::{debug, info, warn};
 use app::{AppState, InputAction};
 use backfill::BackfillStore;
 use channel_registry::ChannelRegistry;
+use channel_renames::ChannelRenames;
 use contacts::Contacts;
 use direct_registry::DirectRegistry;
 use dm_registry::DmRegistry;
@@ -78,6 +80,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize channel registry")?;
     let contacts = Contacts::load(dirs.data_dir().join("contacts"))
         .context("failed to initialize contacts")?;
+    let channel_renames = ChannelRenames::load(dirs.data_dir().join("channel_renames"))
+        .context("failed to initialize channel renames")?;
     let dm_registry = DmRegistry::load(dirs.data_dir().join("dms"))
         .context("failed to initialize DM registry")?;
     let direct_registry = DirectRegistry::load(dirs.data_dir().join("direct_peers"))
@@ -132,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
         backfill,
         registry,
         contacts,
+        channel_renames,
         dm_registry,
         direct_registry,
         settings,
@@ -232,6 +237,7 @@ fn paths_to_wipe_for_pairing(data_dir: &Path, config_dir: &Path) -> Vec<PathBuf>
         data_dir.join("messages"),
         data_dir.join("blobs"),
         data_dir.join("contacts"),
+        data_dir.join("channel_renames"),
         data_dir.join("dms"),
         data_dir.join("direct_peers"),
         data_dir.join("settings"),
@@ -363,6 +369,7 @@ struct Session {
     backfill: BackfillStore,
     registry: ChannelRegistry,
     contacts: Contacts,
+    channel_renames: ChannelRenames,
     dm_registry: DmRegistry,
     direct_registry: DirectRegistry,
     settings: Settings,
@@ -455,6 +462,7 @@ async fn run(
         backfill,
         mut registry,
         mut contacts,
+        mut channel_renames,
         mut dm_registry,
         mut direct_registry,
         mut settings,
@@ -465,6 +473,7 @@ async fn run(
     let mut app = AppState::new(net.our_id, joined_channels.clone(), &active_channel);
     app.load_self_user_id(net.our_user_id());
     app.load_contacts(contacts.all());
+    app.load_renames(channel_renames.all());
     app.load_settings(settings.bell_enabled());
     app.load_dm_registry(dm_registry.all());
     app.load_forgotten_devices(forgotten_devices.all());
@@ -629,6 +638,15 @@ async fn run(
                                     warn!("failed to persist pet name: {err}");
                                 }
                             }
+                            Some(InputAction::Rename { channel, name }) => {
+                                let persisted = match name {
+                                    Some(name) => channel_renames.set(channel.clone(), name),
+                                    None => channel_renames.forget(&channel),
+                                };
+                                if let Err(err) = persisted {
+                                    warn!(%channel, "failed to persist channel rename: {err}");
+                                }
+                            }
                             Some(InputAction::ForgetDevice(id)) => {
                                 if let Err(err) = forgotten_devices.forget(id) {
                                     warn!("failed to persist forgotten device: {err}");
@@ -655,6 +673,9 @@ async fn run(
                                 }
                                 if let Err(err) = dm_registry.forget_channel(&channel) {
                                     warn!(%channel, "failed to remove DM registry entry: {err}");
+                                }
+                                if let Err(err) = channel_renames.forget(&channel) {
+                                    warn!(%channel, "failed to remove channel rename: {err}");
                                 }
                                 if let Err(err) = store.delete(&channel) {
                                     warn!(%channel, "failed to delete channel history: {err}");
@@ -1074,5 +1095,16 @@ mod tests {
         let config_dir = tempfile::tempdir().unwrap();
 
         wipe_superseded_state(data_dir.path(), config_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn pairing_wipes_the_local_channel_renames() {
+        // Display names keyed by the channels a redeem is about to replace
+        // would otherwise outlive them and mislabel whatever reuses a name.
+        let data_dir = Path::new("/data");
+
+        let paths = paths_to_wipe_for_pairing(data_dir, Path::new("/config"));
+
+        assert!(paths.contains(&data_dir.join("channel_renames")));
     }
 }

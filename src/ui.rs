@@ -63,6 +63,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/invite",
     "/msg <alias|hex> [text]",
     "/leave [channel]",
+    "/rename <name>",
     "/who",
     "/send <path>",
     "/save <hash>",
@@ -2259,5 +2260,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_renamed_group_channel_shows_its_local_name_in_the_panel_and_the_pane_title() {
+        let mut app = app_with_every_kind();
+        app.active = 2; // project-x
+        type_text(&mut app, "/rename proj");
+        press(&mut app, KeyCode::Enter);
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        nav_row(&buffer, "#", "proj");
+        let panel = nav_rows(&buffer).join("\n");
+        assert!(
+            !panel.contains("project-x"),
+            "the stored name leaked:\n{panel}"
+        );
+        let rows = screen_rows(&buffer);
+        assert!(
+            rows.iter().any(|row| row.contains("#proj · 0 peer(s)")),
+            "got: {rows:#?}"
+        );
     }
 }

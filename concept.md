@@ -72,6 +72,17 @@ comes down to in a TUI.
 - `contacts.rs` persists local pet names (`/alias <hex-prefix> <name>`)
   assigned to specific endpoint ids -- checked by `AppState::display_name`
   before its hex-prefix fallback, and never sent to peers.
+- `channel_renames.rs` is its counterpart for group channels: local display
+  names (`/rename <name>`) keyed by a channel's stored name, applied by
+  `AppState::channel_label`, and never sent to peers -- an invite ticket
+  still carries the stored name. Leaving a channel forgets its name, so a
+  later channel under the same stored name starts clean. A DM or
+  point-to-point chat can't be renamed: its label already follows
+  `/alias`, and two independent overrides for one conversation would only
+  confuse. `/rename` also refuses a name that could be mistaken for
+  another channel, including another channel's stored name -- `/leave`
+  matches stored names first, so one hidden behind a rename would
+  otherwise shadow the name on screen.
 - `/nick <name>` broadcasts a chosen display name to every joined channel
   (a `GossipPayload::Identity`, re-sent on `NeighborUp` the same way a
   `HistoryAnnounce` is -- see "Message wire format" below). Unlike a pet
@@ -105,8 +116,9 @@ comes down to in a TUI.
   onto separate ones.
 - A channel's `name` is its *identity* -- the key behind its storage file,
   registry entries, and gossip subscription -- and never changes. What the
-  UI *shows* is `AppState::channel_label`: a group channel shows its name,
-  while a DM or point-to-point chat shows whoever it's with, resolved
+  UI *shows* is `AppState::channel_label`: a group channel shows its name
+  (or the local one `/rename` gave it), while a DM or point-to-point chat
+  shows whoever it's with, resolved
   through `display_name` on every draw so it follows `/alias` and `/nick`
   instead of freezing at whatever was known when the channel was created.
   Which kind a channel is comes from one query, `AppState::channel_kind`
@@ -363,6 +375,7 @@ src/
   ticket.rs           // RoomSecret + invite/pairing ticket encode/decode
   pairing.rs          // device pairing: one-time ticket exchange protocol
   channel_registry.rs // persisted channel list, room secrets, known peers
+  channel_renames.rs  // persisted local display names for group channels, for /rename
   contacts.rs         // persisted local pet names for peers
   dm_registry.rs      // persisted peer id <-> 1:1 DM channel name, for /msg
   direct.rs           // point-to-point (non-gossip) 1:1 messaging: connection lifecycle, framing

@@ -449,6 +449,14 @@ pub enum InputAction {
     /// a typed hex-prefix by `/alias` (see `run_command` and
     /// `crate::contacts`).
     Alias([u8; 32], String),
+    /// Persist a local display name for a group channel -- or, with `None`,
+    /// forget it -- from `/rename` (see `run_rename` and
+    /// `crate::channel_renames`). Already applied to `AppState`; the caller
+    /// only needs to persist it.
+    Rename {
+        channel: String,
+        name: Option<String>,
+    },
     /// Broadcast a chosen display nickname to every joined channel, as
     /// typed after `/nick` (see `run_command` and
     /// `crate::net::Net::set_nickname`).
@@ -576,6 +584,14 @@ pub struct AppState {
     /// (`activate_direct_channel`) or via `NetEvent::DirectJoined` when a
     /// peer reaches us first (`background_direct_channel`).
     direct_channels: HashMap<[u8; 32], String>,
+    /// Local display names given to group channels via `/rename`, keyed by
+    /// the channel's stored name (its identity, which never changes) --
+    /// checked by `channel_label`, the channel counterpart to `petnames`.
+    /// Seeded once at startup from `crate::channel_renames::ChannelRenames`
+    /// (see `load_renames`); never sent over the wire, and dropped with the
+    /// channel by `remove_channel` so a later channel under the same stored
+    /// name doesn't inherit it.
+    renames: HashMap<String, String>,
     /// The in-progress candidate while picking a reply target with
     /// `Ctrl+R` (see `start_reply_pick`/`move_reply_pick`), by message id.
     /// `None` when not picking -- `handle_key` checks this first, before
@@ -652,6 +668,7 @@ impl AppState {
             forgotten: HashSet::new(),
             dm_channels: HashMap::new(),
             direct_channels: HashMap::new(),
+            renames: HashMap::new(),
             picking_reply: None,
             picking_thread: None,
             switching: None,
@@ -708,6 +725,14 @@ impl AppState {
     /// `load_contacts`.
     pub fn load_forgotten_devices(&mut self, forgotten: HashSet<[u8; 32]>) {
         self.forgotten = forgotten;
+    }
+
+    /// Seeds the local channel display names persisted by the caller (see
+    /// `crate::channel_renames`). Intended to be called once, right after
+    /// `AppState::new`, before the event loop starts -- mirrors
+    /// `load_contacts`.
+    pub fn load_renames(&mut self, renames: HashMap<String, String>) {
+        self.renames = renames;
     }
 
     /// Merges a batch of possibly-historical messages fetched via backfill
@@ -896,7 +921,8 @@ impl AppState {
     /// The name to *show* a user for `channel`, as opposed to its `name`,
     /// which is its identity (storage file, registry key, gossip map
     /// entry) and must never change. A group channel shows its stored
-    /// name. A DM or point-to-point chat shows whoever it's with, resolved
+    /// name, or the local one `/rename` gave it (`renames`). A DM or
+    /// point-to-point chat shows whoever it's with, resolved
     /// through `display_name` on every call, so it follows `/alias` and
     /// `/nick` immediately instead of staying frozen at whatever was known
     /// when the channel was created. That frozen name was worse than stale
@@ -910,7 +936,11 @@ impl AppState {
     /// that says which kind it is.
     pub fn channel_label(&self, channel: &str) -> String {
         match self.channel_kind(channel) {
-            ChannelKind::Group => channel.to_string(),
+            ChannelKind::Group => self
+                .renames
+                .get(channel)
+                .cloned()
+                .unwrap_or_else(|| channel.to_string()),
             ChannelKind::GossipDm { peer } | ChannelKind::Direct { peer } => {
                 self.display_name(&peer)
             }
@@ -1456,9 +1486,10 @@ impl AppState {
     }
 
     /// Removes `channel`'s tab and all its in-memory state (transcript,
-    /// presence, dedupe buffers, and any DM or point-to-point association
-    /// -- left behind, the latter would misclassify a later channel that
-    /// happens to reuse the name, see `channel_kind`) -- called once the
+    /// presence, dedupe buffers, any DM or point-to-point association, and
+    /// any `/rename` display name -- left behind, the former would
+    /// misclassify and the latter mislabel a later channel that happens to
+    /// reuse the name, see `channel_kind`/`channel_label`) -- called once the
     /// caller has actually torn down its gossip subscription and persisted
     /// state (see `InputAction::Leave`). Adjusts `active` to keep pointing
     /// at the same tab if it was after the removed one, or lands on the
@@ -1479,13 +1510,14 @@ impl AppState {
             self.channels.len() > 1,
             "must not remove leyline's only channel"
         );
-        // Resolved before the association is dropped below: once it's
-        // gone the channel would fall back to showing its raw name, and
-        // the notice should say what the channel was actually called on
-        // screen.
+        // Resolved before the association and rename are dropped below:
+        // once they're gone the channel would fall back to showing its
+        // raw name, and the notice should say what the channel was
+        // actually called on screen.
         let heading = self.channel_heading(channel);
         self.dm_channels.retain(|_, name| name != channel);
         self.direct_channels.retain(|_, name| name != channel);
+        self.renames.remove(channel);
         self.channels.remove(index);
         if self.active > index {
             self.active -= 1;
@@ -1734,6 +1766,7 @@ impl AppState {
             "alias" => self.run_alias(arg.trim()),
             "nick" => self.run_nick(arg.trim()),
             "leave" => self.run_leave(arg.trim()),
+            "rename" => self.run_rename(arg.trim()),
             "who" => self.run_who(),
             "send" => self.run_send(arg.trim()),
             "save" => self.run_save(arg.trim()),
@@ -1776,7 +1809,7 @@ impl AppState {
         self.push_system(
             "commands: /join <name|ticket>, /invite, /pair [ticket], /forget-device <hex-prefix>, \
              /msg <alias|hex-prefix> [text], /dm <alias|hex-prefix|endpoint-id> [text], \
-             /leave [channel], /who, /send <path>, \
+             /leave [channel], /rename [name], /who, /send <path>, \
              /save <hash-prefix>, /paste, /alias <hex-prefix> <name>, /nick <name>, \
              /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
@@ -1993,6 +2026,75 @@ impl AppState {
                 "'{typed}' matches more than one channel -- switch to the one you mean and run /leave with no argument"
             )),
         }
+    }
+
+    /// Handles `/rename [name]`: `arg` is everything after `/rename `
+    /// (already trimmed). Gives the active *group* channel a local display
+    /// name -- shown wherever the channel is named (`channel_label`), kept
+    /// in `renames`, and never sent to peers -- and returns an
+    /// `InputAction::Rename` for the caller to persist (see
+    /// `crate::channel_renames`). With no name it restores the stored one
+    /// instead, the way a bare `/search` clears a search, or shows usage
+    /// when there's nothing to restore.
+    ///
+    /// Refuses a DM or point-to-point chat, whose label already follows the
+    /// peer's `/alias` -- a second, independent override for the same
+    /// conversation would only be confusing -- and a name that could be
+    /// mistaken for another channel (`clashes_with_another_channel`).
+    fn run_rename(&mut self, arg: &str) -> Option<InputAction> {
+        let channel = self.active().name.clone();
+        if self.channel_kind(&channel) != ChannelKind::Group {
+            self.push_system(
+                "a conversation takes its name from the peer -- use /alias <hex-prefix> <name> to rename them",
+            );
+            return None;
+        }
+        if arg.is_empty() {
+            if self.renames.remove(&channel).is_none() {
+                self.push_system(
+                    "usage: /rename <name> (a bare /rename restores the original name)",
+                );
+                return None;
+            }
+            self.push_system(format!("name restored to #{channel}"));
+            return Some(InputAction::Rename {
+                channel,
+                name: None,
+            });
+        }
+        if self.clashes_with_another_channel(&channel, arg) {
+            self.push_system(format!(
+                "another channel already goes by #{arg} -- pick a different name"
+            ));
+            return None;
+        }
+        self.renames.insert(channel.clone(), arg.to_string());
+        self.push_system(format!(
+            "renamed #{channel} to #{arg} (local only -- peers still see #{channel})"
+        ));
+        Some(InputAction::Rename {
+            channel,
+            name: Some(arg.to_string()),
+        })
+    }
+
+    /// Whether `name` could be mistaken for a channel other than `channel`:
+    /// it's another channel's stored name -- which `/leave` matches before
+    /// anything displayed (`resolve_channel_arg`), so a stored name hidden
+    /// behind a rename would otherwise shadow the one on screen -- or it's
+    /// what another group channel already shows, which would leave two
+    /// identical `#name` rows no one could tell apart. A conversation can
+    /// share a name with a group channel: its `@` or bolt heading sets the
+    /// two apart.
+    fn clashes_with_another_channel(&self, channel: &str, name: &str) -> bool {
+        self.channels
+            .iter()
+            .filter(|other| other.name != channel)
+            .any(|other| {
+                other.name == name
+                    || (self.channel_kind(&other.name) == ChannelKind::Group
+                        && self.channel_label(&other.name) == name)
+            })
     }
 
     /// Handles `/who`: lists the active channel's current peers, one per
@@ -6616,5 +6718,261 @@ mod tests {
         app.pending_redeem = Some("ticket".to_string());
         ctrl_p(&mut app);
         assert!(app.switching.is_none());
+    }
+
+    // The `/rename` tests below reuse the switcher fixture
+    // (`app_for_the_switcher`): `general` (active), a `/msg` DM shown as
+    // `Alice`, `project-x`, and a `/dm` chat shown as `Bob` -- channel
+    // indices 0 to 3.
+
+    #[test]
+    fn rename_gives_the_active_group_channel_a_local_name() {
+        let mut app = app_for_the_switcher();
+        app.active = 2; // project-x
+
+        let action = submit(&mut app, "/rename proj");
+
+        match action.expect("a successful /rename returns an action") {
+            InputAction::Rename { channel, name } => {
+                assert_eq!(channel, "project-x");
+                assert_eq!(name, Some("proj".to_string()));
+            }
+            _ => panic!("expected InputAction::Rename"),
+        }
+        assert_eq!(app.channel_label("project-x"), "proj");
+        assert_eq!(app.channel_heading("project-x"), "#proj");
+        assert_eq!(
+            app.channels[2].name, "project-x",
+            "the stored name is the channel's identity and never changes"
+        );
+        assert_eq!(
+            app.channel_label("general"),
+            "general",
+            "other channels are untouched"
+        );
+    }
+
+    #[test]
+    fn a_renamed_channel_is_called_by_its_local_name_in_notices() {
+        let mut app = app_for_the_switcher();
+        app.active = 2;
+        submit(&mut app, "/rename proj");
+
+        submit(&mut app, "/who");
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "no peers currently in #proj");
+
+        app.remove_channel("project-x");
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "left #proj");
+    }
+
+    #[test]
+    fn renaming_again_replaces_the_previous_name() {
+        let mut app = app_for_the_switcher();
+        app.active = 2;
+
+        submit(&mut app, "/rename proj");
+        submit(&mut app, "/rename px");
+
+        assert_eq!(app.channel_label("project-x"), "px");
+    }
+
+    #[test]
+    fn a_local_name_may_have_spaces() {
+        let mut app = app_for_the_switcher();
+        app.active = 2;
+
+        submit(&mut app, "/rename  my project ");
+
+        assert_eq!(app.channel_label("project-x"), "my project");
+    }
+
+    #[test]
+    fn a_bare_rename_restores_the_stored_name() {
+        let mut app = app_for_the_switcher();
+        app.active = 2;
+        submit(&mut app, "/rename proj");
+
+        let action = submit(&mut app, "/rename");
+
+        match action.expect("restoring a name returns an action to persist that") {
+            InputAction::Rename { channel, name } => {
+                assert_eq!(channel, "project-x");
+                assert_eq!(name, None);
+            }
+            _ => panic!("expected InputAction::Rename"),
+        }
+        assert_eq!(app.channel_label("project-x"), "project-x");
+    }
+
+    #[test]
+    fn a_bare_rename_with_nothing_to_restore_shows_usage() {
+        let mut app = app_for_the_switcher();
+        app.active = 2;
+
+        let action = submit(&mut app, "/rename");
+
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.starts_with("usage:"), "got: {last}");
+    }
+
+    #[test]
+    fn rename_is_refused_on_a_dm_with_a_pointer_to_alias() {
+        let mut app = app_for_the_switcher();
+        app.active = 1; // the /msg DM
+
+        let action = submit(&mut app, "/rename buddy");
+
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("/alias"), "got: {last}");
+        assert_eq!(app.channel_label("dm-Alice"), "Alice", "label untouched");
+        // Restoring is refused the same way: there is nothing here to restore.
+        assert!(submit(&mut app, "/rename").is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("/alias"), "got: {last}");
+    }
+
+    #[test]
+    fn rename_is_refused_on_a_point_to_point_chat_too() {
+        let mut app = app_for_the_switcher();
+        app.active = 3; // the /dm chat
+
+        let action = submit(&mut app, "/rename buddy");
+
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("/alias"), "got: {last}");
+        assert_eq!(app.channel_label("p2p-08080808"), "Bob", "label untouched");
+    }
+
+    #[test]
+    fn rename_refuses_a_name_another_group_channel_already_shows() {
+        let mut app = app_for_the_switcher();
+        app.active = 2;
+        submit(&mut app, "/rename work"); // project-x is now shown as `work`
+        app.active = 0; // general
+
+        let action = submit(&mut app, "/rename work");
+
+        assert!(action.is_none());
+        assert_eq!(app.channel_label("general"), "general");
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("another channel"), "got: {last}");
+    }
+
+    #[test]
+    fn rename_refuses_another_channels_stored_name_even_when_it_is_hidden() {
+        // `/leave project-x` still matches that stored name first, so naming
+        // another channel that would leave the two impossible to tell apart.
+        let mut app = app_for_the_switcher();
+        app.active = 2;
+        submit(&mut app, "/rename work"); // `project-x` no longer on screen
+        app.active = 0; // general
+
+        let action = submit(&mut app, "/rename project-x");
+
+        assert!(action.is_none());
+        assert_eq!(app.channel_label("general"), "general");
+    }
+
+    #[test]
+    fn a_channel_may_be_renamed_to_its_own_stored_name() {
+        let mut app = app_for_the_switcher();
+        app.active = 2;
+        submit(&mut app, "/rename proj");
+
+        let action = submit(&mut app, "/rename project-x");
+
+        assert!(action.is_some());
+        assert_eq!(app.channel_label("project-x"), "project-x");
+    }
+
+    #[test]
+    fn a_group_channel_may_share_a_name_with_a_conversation() {
+        let mut app = app_for_the_switcher(); // `Alice` is the DM's label
+
+        let action = submit(&mut app, "/rename Alice"); // general is active
+
+        assert!(action.is_some());
+        assert_eq!(app.channel_heading("general"), "#Alice");
+        assert_eq!(
+            app.channel_heading("dm-Alice"),
+            "@Alice",
+            "the glyph tells the two apart"
+        );
+    }
+
+    #[test]
+    fn leaving_a_renamed_channel_forgets_its_name_so_a_rejoin_starts_clean() {
+        let mut app = app_for_the_switcher();
+        app.active = 2;
+        submit(&mut app, "/rename proj");
+
+        app.remove_channel("project-x");
+        // Rejoined later under the very same stored name.
+        app.handle_net_event(NetEvent::Joined("project-x".to_string()));
+
+        assert_eq!(app.active().name, "project-x");
+        assert_eq!(app.channel_label("project-x"), "project-x");
+    }
+
+    #[test]
+    fn load_renames_seeds_local_names() {
+        let mut app = app_for_the_switcher();
+
+        app.load_renames(HashMap::from([(
+            "project-x".to_string(),
+            "proj".to_string(),
+        )]));
+
+        assert_eq!(app.channel_label("project-x"), "proj");
+        assert_eq!(app.channel_label("general"), "general");
+    }
+
+    #[test]
+    fn a_stored_rename_never_applies_to_a_conversation() {
+        let mut app = app_for_the_switcher();
+
+        app.load_renames(HashMap::from([
+            ("dm-Alice".to_string(), "nope".to_string()),
+            ("p2p-08080808".to_string(), "nope".to_string()),
+        ]));
+
+        assert_eq!(app.channel_label("dm-Alice"), "Alice");
+        assert_eq!(app.channel_label("p2p-08080808"), "Bob");
+    }
+
+    #[test]
+    fn leave_and_the_switcher_find_a_renamed_channel_by_its_new_name() {
+        let mut app = app_for_the_switcher();
+        app.active = 2;
+        submit(&mut app, "/rename proj");
+        app.active = 0;
+
+        // `/leave` takes the new name, its heading, and still the stored name.
+        for typed in ["proj", "#proj", "project-x"] {
+            match submit(&mut app, &format!("/leave {typed}")) {
+                Some(InputAction::Leave(channel)) => {
+                    assert_eq!(channel, "project-x", "{typed}");
+                }
+                _ => panic!("expected InputAction::Leave for {typed}"),
+            }
+        }
+
+        // The switcher matches what is shown, not the stored name.
+        ctrl_p(&mut app);
+        type_text(&mut app, "proj");
+        assert_eq!(app.switcher_matches(), vec![2]);
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        type_text(&mut app, "-x");
+        assert!(
+            app.switcher_matches().is_empty(),
+            "the stored name is not searched"
+        );
     }
 }
