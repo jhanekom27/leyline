@@ -1,6 +1,8 @@
 //! Pure rendering: reads `AppState`, writes widgets to the frame. No
 //! mutation, no I/O -- see concept.md's "one owner of UI state" principle.
 
+use std::time::SystemTime;
+
 use chrono::{DateTime, Local};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
@@ -18,6 +20,7 @@ use crate::files::{StagedAttachment, human_size};
 use crate::hyperlink;
 use crate::markdown;
 use crate::message::ChatMessage;
+use crate::picker::{Entry, FilePicker, Kind};
 use crate::search::SearchResults;
 use crate::thread::ThreadView;
 
@@ -60,6 +63,17 @@ const SWITCHER_WIDTH: u16 = 44;
 /// Most matches the jump-to overlay shows at once before it scrolls.
 const SWITCHER_MAX_ROWS: usize = 10;
 
+/// Width of the file picker overlay (`render_picker`), borders included.
+const PICKER_WIDTH: u16 = 78;
+/// Rows of entries the file picker lists at once before it scrolls.
+const PICKER_ROWS: usize = 14;
+/// Cells at the left of a picker row, where a marked file's check mark goes.
+const PICKER_GUTTER: usize = 3;
+/// Width of a picker row's size column: room for `1023.9 KB`.
+const PICKER_SIZE_WIDTH: usize = 9;
+/// Width of a picker row's modified column: `12 Oct 14:03`, `03 Mar  2025`.
+const PICKER_TIME_WIDTH: usize = 12;
+
 /// Short usage reminders for every slash command, shown in the sidebar's
 /// commands panel (`render_hints`) when `AppState::show_hints` is on.
 /// Kept in sync with the Commands table in README.md and `run_help`'s
@@ -71,7 +85,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/leave [channel]",
     "/rename <name>",
     "/who",
-    "/send <path>",
+    "/send [path]",
     "/save <hash>",
     "/paste (or Ctrl+V)",
     "/alias <hex> <name>",
@@ -112,8 +126,10 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     render_staged(frame, staged, app);
     render_input(frame, input, app);
     // Last, so the overlay sits over everything else -- and so its cursor
-    // wins over the input box's.
+    // wins over the input box's. At most one is ever open: each owns every
+    // key while it is.
     render_switcher(frame, app);
+    render_picker(frame, app);
 }
 
 /// Height (in terminal rows, including the 2 border rows) the input box
@@ -323,23 +339,7 @@ fn render_switcher(frame: &mut Frame, app: &AppState) {
     let [query_area, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
 
-    // The query row: a prompt and the tail of what's been typed -- the end
-    // is what's being edited -- with the terminal cursor just after it.
-    let prompt = "› ";
-    let room = (query_area.width as usize).saturating_sub(Span::raw(prompt).width() + 1);
-    let cut = switcher.query.chars().count().saturating_sub(room);
-    let typed: String = switcher.query.chars().skip(cut).collect();
-    let query_line = Line::from(vec![
-        Span::styled(
-            prompt,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(typed),
-    ]);
-    frame.set_cursor_position((query_area.x + query_line.width() as u16, query_area.y));
-    frame.render_widget(Paragraph::new(query_line), query_area);
+    render_filter_row(frame, query_area, &switcher.query);
 
     if matches.is_empty() {
         let placeholder = Span::styled(
@@ -384,18 +384,243 @@ fn render_switcher(frame: &mut Frame, app: &AppState) {
 }
 
 /// Where the switcher box goes on a `screen`-sized frame when `matches`
-/// channels are listed: `SWITCHER_WIDTH` wide and centered, tall enough for
-/// the borders, the query row and up to `SWITCHER_MAX_ROWS` matches (one
-/// row even with none, for the placeholder), and anchored near the top so
-/// the box doesn't jump around as typing shrinks it. Never larger than the
-/// screen.
+/// channels are listed: `SWITCHER_WIDTH` wide, tall enough for up to
+/// `SWITCHER_MAX_ROWS` matches (one row even with none, for the
+/// placeholder), and shrinking as typing narrows the list -- see
+/// `overlay_area`.
 fn switcher_area(screen: Rect, matches: usize) -> Rect {
-    let width = SWITCHER_WIDTH.min(screen.width);
-    let list_rows = matches.clamp(1, SWITCHER_MAX_ROWS) as u16;
-    let height = (list_rows + 3).min(screen.height);
+    overlay_area(screen, SWITCHER_WIDTH, matches.clamp(1, SWITCHER_MAX_ROWS))
+}
+
+/// Where an overlay `width` wide, with room for `list_rows` rows under its
+/// borders and its filter row, goes on a `screen`-sized frame: centered, and
+/// anchored near the top so the box doesn't jump around as typing changes
+/// how many rows it needs. Never larger than the screen. Shared by the
+/// switcher and the file picker, which are laid out the same way.
+fn overlay_area(screen: Rect, width: u16, list_rows: usize) -> Rect {
+    let width = width.min(screen.width);
+    let height = (list_rows as u16 + 3).min(screen.height);
     let x = screen.x + (screen.width - width) / 2;
     let y = (screen.y + 2).min(screen.bottom() - height);
     Rect::new(x, y, width, height)
+}
+
+/// An overlay's filter row: a prompt and the tail of what's been typed --
+/// the end is what's being edited -- with the terminal cursor just after
+/// it.
+fn render_filter_row(frame: &mut Frame, area: Rect, query: &str) {
+    let prompt = "› ";
+    let room = (area.width as usize).saturating_sub(Span::raw(prompt).width() + 1);
+    let cut = query.chars().count().saturating_sub(room);
+    let typed: String = query.chars().skip(cut).collect();
+    let line = Line::from(vec![
+        Span::styled(
+            prompt,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(typed),
+    ]);
+    frame.set_cursor_position((area.x + line.width() as u16, area.y));
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// The file picker opened by a bare `/send` (`AppState::picking_file`),
+/// drawn over everything else like the switcher: a cleared, bordered box
+/// titled with the folder being browsed, holding the typed filter and, under
+/// it, the folder's entries -- folders first, then files newest first --
+/// with the highlighted row in the switcher's style. Its size is fixed, so
+/// the box doesn't jump around as typing narrows the folder; it scrolls to
+/// keep the highlight in view (`nav_scroll_offset`).
+fn render_picker(frame: &mut Frame, app: &AppState) {
+    let Some(picker) = &app.picking_file else {
+        return;
+    };
+    let area = picker_area(frame.area());
+    let block = Block::bordered()
+        .title(picker_title(picker, area.width as usize))
+        .title_bottom(picker_footer(picker, area.width as usize))
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+    // Cleared first, so nothing from the panes underneath shows through
+    // the blank cells of the box.
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let [query_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    render_filter_row(frame, query_area, picker.query());
+
+    let total = picker.visible().len();
+    if total == 0 {
+        let text = match (picker.is_empty(), picker.is_reading()) {
+            (true, true) => " reading...",
+            (true, false) => " empty folder",
+            (false, _) => " no matches",
+        };
+        let placeholder = Span::styled(
+            text,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        );
+        frame.render_widget(Paragraph::new(Line::from(placeholder)), list_area);
+        return;
+    }
+    let visible_rows = (list_area.height as usize).max(1);
+    let start = nav_scroll_offset(total, visible_rows, picker.selected());
+    let now = Local::now();
+    let items: Vec<ListItem> = picker
+        .visible()
+        .enumerate()
+        .skip(start)
+        .take(visible_rows)
+        .map(|(row, entry)| {
+            picker_row(
+                entry,
+                picker.is_marked(entry),
+                row == picker.selected(),
+                list_area.width as usize,
+                now,
+            )
+        })
+        .collect();
+    frame.render_widget(List::new(items), list_area);
+    // As for the switcher, a track a row taller than the list at each end.
+    let track = Rect::new(
+        area.x,
+        list_area.y.saturating_sub(1),
+        area.width,
+        list_area.height + 2,
+    );
+    render_scroll_indicator(frame, track, start, total, visible_rows);
+}
+
+/// Where the file picker box goes on a `screen`-sized frame: `PICKER_WIDTH`
+/// wide, with room for `PICKER_ROWS` entries whatever the folder holds --
+/// see `overlay_area`.
+fn picker_area(screen: Rect) -> Rect {
+    overlay_area(screen, PICKER_WIDTH, PICKER_ROWS)
+}
+
+/// The picker's title: the folder being browsed -- its tail, if it won't all
+/// fit -- then how many files are marked and whether a folder is still being
+/// read. `width` is the box's, borders included.
+fn picker_title(picker: &FilePicker, width: usize) -> String {
+    let mut extras = String::new();
+    if picker.marked_count() > 0 {
+        extras.push_str(&format!(" · {} marked", picker.marked_count()));
+    }
+    if picker.is_reading() {
+        extras.push_str(" · reading...");
+    }
+    // Two cells of border, and a blank either side of the title.
+    let room = width.saturating_sub(2 + 2 + extras.chars().count());
+    format!(
+        " {}{extras} ",
+        truncate_start(&picker.dir().to_string_lossy(), room)
+    )
+}
+
+/// What the picker's bottom border says: its notice -- an unreadable
+/// folder, say -- if it has one, else the keys. A notice too long for the
+/// row loses its start, not its end: the reason comes last. `width` is the
+/// box's, borders included.
+fn picker_footer(picker: &FilePicker, width: usize) -> Line<'static> {
+    match picker.notice() {
+        Some(notice) => Line::styled(
+            format!(" {} ", truncate_start(notice, width.saturating_sub(4))),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        None => {
+            Line::from(" ↑/↓ move · Enter open or choose · Space mark · Backspace up · Esc cancel ")
+        }
+    }
+}
+
+/// One row of the file picker, `width` cells wide: a gutter holding a check
+/// mark if the file is `marked`, the name -- a folder's ends in `/`, and a
+/// name that would run into the columns on the right is cut short with an
+/// ellipsis -- and, for a file, its size and when it was last modified
+/// (`modified_label`, against `now`). A `highlighted` row is shown black on
+/// cyan across its whole width, like the switcher's, so it carries no
+/// colors of its own.
+fn picker_row(
+    entry: &Entry,
+    marked: bool,
+    highlighted: bool,
+    width: usize,
+    now: DateTime<Local>,
+) -> ListItem<'static> {
+    // The size and modified columns, two blanks between them, and a blank
+    // at the right edge.
+    let columns_width = PICKER_SIZE_WIDTH + 2 + PICKER_TIME_WIDTH + 1;
+    let name_width = width.saturating_sub(PICKER_GUTTER + columns_width).max(1);
+    let styled = |text: String, style: Style| {
+        if highlighted {
+            Span::raw(text)
+        } else {
+            Span::styled(text, style)
+        }
+    };
+
+    let gutter = if marked { " ✓ " } else { "   " };
+    let label = match entry.kind {
+        Kind::Folder => format!("{}/", entry.name),
+        Kind::File { .. } => entry.name.clone(),
+    };
+    let name_style = match entry.kind {
+        Kind::Folder => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        Kind::File { .. } => Style::default(),
+    };
+    let mut spans = vec![
+        styled(
+            gutter.to_string(),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        styled(
+            format!("{:<name_width$}", truncate_chars(&label, name_width)),
+            name_style,
+        ),
+    ];
+    if let Kind::File { size, modified } = entry.kind {
+        spans.push(styled(
+            format!(
+                "{:>PICKER_SIZE_WIDTH$}  {}",
+                human_size(size),
+                modified_label(modified, now)
+            ),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let item = ListItem::new(Line::from(spans));
+    if highlighted {
+        return item.style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    item
+}
+
+/// When a file was last modified, in `PICKER_TIME_WIDTH` cells: the day and
+/// time for the last half year (`12 Oct 14:03`), the day and year before
+/// that (`03 Mar  2025`) -- as `ls -l` does, since a time says little about
+/// a file from long ago.
+fn modified_label(modified: SystemTime, now: DateTime<Local>) -> String {
+    let modified = DateTime::<Local>::from(modified);
+    let recent = now.signed_duration_since(modified) < chrono::Duration::days(180);
+    modified
+        .format(if recent { "%d %b %H:%M" } else { "%d %b  %Y" })
+        .to_string()
 }
 
 /// Splits the RHS column into the peers list and, when `show_hints` is
@@ -996,6 +1221,21 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     }
     let truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
     format!("{truncated}…")
+}
+
+/// Truncates `text` to at most `max_chars` characters by dropping its
+/// start, prefixing `…` if it was longer -- for a path, whose end is the
+/// part that tells you where you are.
+fn truncate_start(text: &str, max_chars: usize) -> String {
+    let len = text.chars().count();
+    if len <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let tail: String = text.chars().skip(len - (max_chars - 1)).collect();
+    format!("…{tail}")
 }
 
 /// Adds a reversed-video modifier to `span`, preserving its existing
@@ -2492,6 +2732,431 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -- the file picker ------------------------------------------------------
+
+    use std::path::PathBuf;
+
+    use chrono::TimeZone;
+
+    use crate::app::InputAction;
+    use crate::picker::FolderListing;
+
+    fn picked_file(name: &str, size: u64) -> Entry {
+        Entry::new(
+            name.to_string(),
+            Kind::File {
+                size,
+                modified: SystemTime::UNIX_EPOCH,
+            },
+        )
+    }
+
+    fn picked_folder(name: &str) -> Entry {
+        Entry::new(name.to_string(), Kind::Folder)
+    }
+
+    /// Opens the picker on `app` with a bare `/send`, in `dir`, and returns
+    /// the id of the read it asked for -- unanswered, so it is still reading.
+    fn open_picker_unanswered(app: &mut AppState, dir: &str) -> u64 {
+        app.load_browse_dir(PathBuf::from(dir));
+        type_text(app, "/send");
+        match app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            Some(InputAction::ReadFolder { request, .. }) => request,
+            _ => panic!("a bare /send opens the picker"),
+        }
+    }
+
+    /// Opens the picker on `app` in `dir` and answers its read with
+    /// `entries`.
+    fn open_picker_in(app: &mut AppState, dir: &str, entries: Vec<Entry>) {
+        let request = open_picker_unanswered(app, dir);
+        app.apply_folder_listing(FolderListing {
+            request,
+            result: Ok(entries),
+        });
+    }
+
+    fn open_picker(app: &mut AppState, entries: Vec<Entry>) {
+        open_picker_in(app, "/pics", entries);
+    }
+
+    /// The picker's box, one string per row, borders included.
+    fn picker_box(app: &AppState) -> Vec<String> {
+        box_rows(&render_to_buffer(app, 100, 20), picker_area(screen()))
+    }
+
+    #[test]
+    fn the_picker_is_not_drawn_until_it_is_opened() {
+        let mut app = app_with_every_kind();
+        let closed = render_to_rows(&app);
+        assert!(!closed.iter().any(|row| row.contains("/pics")));
+
+        open_picker(&mut app, vec![picked_file("a.txt", 1)]);
+
+        let open = render_to_rows(&app);
+        assert!(open.iter().any(|row| row.contains("/pics")), "{open:#?}");
+    }
+
+    #[test]
+    fn the_picker_lists_folders_before_files_and_titles_itself_with_the_folder() {
+        let mut app = app_with_every_kind();
+        open_picker(
+            &mut app,
+            vec![
+                picked_folder("docs"),
+                picked_file("a.txt", 1),
+                picked_file("b.txt", 1),
+            ],
+        );
+
+        let rows = picker_box(&app);
+
+        let row_of = |needle: &str| {
+            rows.iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("no row has {needle:?}:\n{}", rows.join("\n")))
+        };
+        assert!(row_of("docs/") < row_of("a.txt") && row_of("a.txt") < row_of("b.txt"));
+        assert!(rows[0].contains("/pics"), "got: {}", rows[0]);
+    }
+
+    #[test]
+    fn a_file_row_shows_its_size_and_a_folder_row_shows_nothing_after_its_name() {
+        let mut app = app_with_every_kind();
+        open_picker(
+            &mut app,
+            vec![picked_folder("docs"), picked_file("report.pdf", 2_150_000)],
+        );
+
+        let rows = picker_box(&app);
+
+        let file = rows.iter().find(|row| row.contains("report.pdf")).unwrap();
+        assert!(file.contains("2.1 MB"), "got: {file}");
+        let folder = rows.iter().find(|row| row.contains("docs/")).unwrap();
+        assert_eq!(folder.trim_matches(|c| c == '│' || c == ' '), "docs/");
+    }
+
+    #[test]
+    fn marked_files_carry_a_check_mark_and_the_title_counts_them() {
+        let mut app = app_with_every_kind();
+        open_picker(
+            &mut app,
+            vec![picked_file("a.txt", 1), picked_file("b.txt", 1)],
+        );
+        press(&mut app, KeyCode::Char(' ')); // marks a.txt
+
+        let rows = picker_box(&app);
+
+        let marked = rows.iter().find(|row| row.contains("a.txt")).unwrap();
+        let unmarked = rows.iter().find(|row| row.contains("b.txt")).unwrap();
+        assert!(marked.contains('✓'), "got: {marked}");
+        assert!(!unmarked.contains('✓'), "got: {unmarked}");
+        assert!(rows[0].contains("1 marked"), "got: {}", rows[0]);
+    }
+
+    #[test]
+    fn the_highlight_follows_down_and_is_styled_like_the_switchers() {
+        let mut app = app_with_every_kind();
+        open_picker(
+            &mut app,
+            vec![
+                picked_file("a.txt", 1),
+                picked_file("b.txt", 1),
+                picked_file("c.txt", 1),
+            ],
+        );
+        let area = picker_area(screen());
+        let first_entry = area.y + 2; // past the top border and the filter row
+        let highlighted = |app: &AppState| -> Vec<bool> {
+            let buffer = render_to_buffer(app, 100, 20);
+            (0..2)
+                .map(|i| row_is_highlighted(&buffer, area, first_entry + i))
+                .collect()
+        };
+
+        assert_eq!(highlighted(&app), [true, false]);
+
+        press(&mut app, KeyCode::Down);
+
+        assert_eq!(highlighted(&app), [false, true]);
+    }
+
+    #[test]
+    fn a_marked_row_that_is_highlighted_keeps_the_highlight_colors() {
+        let mut app = app_with_every_kind();
+        open_picker(&mut app, vec![picked_file("a.txt", 1)]);
+        press(&mut app, KeyCode::Char(' '));
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        let area = picker_area(screen());
+        let row = area.y + 2;
+        // The check mark sits in the gutter's middle cell.
+        let mark = &buffer[(area.x + 1 + 1, row)];
+        assert_eq!(mark.symbol(), "✓");
+        assert_eq!((mark.fg, mark.bg), (Color::Black, Color::Cyan));
+    }
+
+    #[test]
+    fn typing_narrows_the_list_and_the_cursor_sits_after_the_filter() {
+        let mut app = app_with_every_kind();
+        open_picker(
+            &mut app,
+            vec![
+                picked_folder("docs"),
+                picked_file("notes.txt", 1),
+                picked_file("a.txt", 1),
+            ],
+        );
+        type_text(&mut app, "A.T");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+            .expect("a test backend never fails");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("drawing to a test backend never fails");
+
+        let text = box_rows(terminal.backend().buffer(), picker_area(screen())).join("\n");
+        let cursor = terminal
+            .get_cursor_position()
+            .expect("a test backend never fails");
+
+        assert!(text.contains("a.txt"), "got:\n{text}");
+        assert!(
+            !text.contains("notes.txt") && !text.contains("docs/"),
+            "got:\n{text}"
+        );
+        // Past the border, the 2-cell prompt and the 3 typed characters, on
+        // the row under the top border -- not down in the input box.
+        let area = picker_area(screen());
+        assert_eq!((cursor.x, cursor.y), (area.x + 1 + 2 + 3, area.y + 1));
+    }
+
+    #[test]
+    fn the_picker_scrolls_to_keep_the_highlight_in_view() {
+        let mut app = app_with_every_kind();
+        let files = (0..40)
+            .map(|i| picked_file(&format!("file-{i:02}.txt"), 1))
+            .collect();
+        open_picker(&mut app, files);
+        for _ in 0..30 {
+            press(&mut app, KeyCode::Down);
+        }
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        let area = picker_area(screen());
+        let rows = box_rows(&buffer, area);
+        let row = (area.y..area.bottom())
+            .find(|&y| rows[(y - area.y) as usize].contains("file-30.txt"))
+            .expect("the highlighted file is in view");
+        assert!(row_is_highlighted(&buffer, area, row));
+        assert!(!rows.join("\n").contains("file-00.txt"));
+        assert!(
+            (area.y..area.bottom()).any(|y| buffer[(area.right() - 1, y)].symbol() == "▐"),
+            "a scroll thumb on the box's right border"
+        );
+    }
+
+    #[test]
+    fn a_folder_still_being_read_says_so() {
+        let mut app = app_with_every_kind();
+        open_picker_unanswered(&mut app, "/pics");
+
+        let rows = picker_box(&app);
+
+        assert!(rows[2].contains("reading..."), "got:\n{}", rows.join("\n"));
+    }
+
+    #[test]
+    fn an_empty_folder_says_so() {
+        let mut app = app_with_every_kind();
+        open_picker(&mut app, Vec::new());
+
+        let rows = picker_box(&app);
+
+        assert!(
+            rows[2].contains("empty folder"),
+            "got:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_says_so() {
+        let mut app = app_with_every_kind();
+        open_picker(&mut app, vec![picked_file("a.txt", 1)]);
+        type_text(&mut app, "zzz");
+
+        let rows = picker_box(&app);
+
+        assert!(rows[2].contains("no matches"), "got:\n{}", rows.join("\n"));
+    }
+
+    #[test]
+    fn a_notice_takes_the_place_of_the_key_hints() {
+        let mut app = app_with_every_kind();
+        open_picker(&mut app, vec![picked_folder("docs")]);
+        let hints = picker_box(&app);
+        assert!(hints.last().unwrap().contains("Esc cancel"), "{hints:#?}");
+
+        let Some(InputAction::ReadFolder { request, .. }) =
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter on a folder reads it");
+        };
+        app.apply_folder_listing(FolderListing {
+            request,
+            result: Err("can't open /pics/docs: Permission denied".to_string()),
+        });
+
+        let rows = picker_box(&app);
+        let bottom = rows.last().unwrap();
+        assert!(bottom.contains("can't open /pics/docs"), "got: {bottom}");
+        assert!(!bottom.contains("Esc cancel"), "got: {bottom}");
+        assert!(
+            rows.iter().any(|row| row.contains("docs/")),
+            "the old listing is still there:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_notice_too_long_for_the_row_loses_its_start_and_keeps_the_reason() {
+        let mut app = app_with_every_kind();
+        open_picker(&mut app, vec![picked_folder("docs")]);
+        let Some(InputAction::ReadFolder { request, .. }) =
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter on a folder reads it");
+        };
+        app.apply_folder_listing(FolderListing {
+            request,
+            result: Err(format!(
+                "can't open {}: Permission denied (os error 13)",
+                "x".repeat(120)
+            )),
+        });
+
+        let rows = picker_box(&app);
+
+        let bottom = rows.last().unwrap();
+        assert!(bottom.contains('…'), "got: {bottom}");
+        assert!(
+            bottom.contains("Permission denied (os error 13)"),
+            "the reason must survive: {bottom}"
+        );
+    }
+
+    #[test]
+    fn a_long_name_is_cut_short_of_the_size_column() {
+        let mut app = app_with_every_kind();
+        let long =
+            "a-file-name-that-is-far-too-long-to-fit-in-the-picker-next-to-its-size-and-date.txt";
+        open_picker(&mut app, vec![picked_file(long, 480)]);
+
+        let rows = picker_box(&app);
+
+        let row = rows.iter().find(|row| row.contains("a-file-name")).unwrap();
+        assert!(row.contains('…'), "got: {row}");
+        assert!(!row.contains("date.txt"), "got: {row}");
+        assert!(row.contains("480 B"), "the size always stays: {row}");
+    }
+
+    #[test]
+    fn a_long_folder_path_keeps_its_tail_in_the_title() {
+        let mut app = app_with_every_kind();
+        let deep = format!("/{}/pictures", "very-deep/".repeat(12));
+        open_picker_in(&mut app, &deep, vec![picked_file("a.txt", 1)]);
+
+        let rows = picker_box(&app);
+
+        assert!(rows[0].contains('…'), "got: {}", rows[0]);
+        assert!(rows[0].contains("/pictures"), "got: {}", rows[0]);
+    }
+
+    #[test]
+    fn the_picker_covers_what_is_underneath() {
+        let mut app = app_with_every_kind();
+        // Long enough to run right through the box's columns.
+        app.load_history("general", vec![text_message(1, [1; 32], &"X".repeat(60))]);
+        open_picker(&mut app, vec![picked_file("a.txt", 1)]);
+
+        let text = picker_box(&app).join("\n");
+
+        assert!(
+            !text.contains('X'),
+            "the message pane showed through:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_picker_survives_a_tiny_terminal() {
+        let mut app = app_with_every_kind();
+        let files = (0..40)
+            .map(|i| picked_file(&format!("file-{i:02}.txt"), 1))
+            .collect();
+        open_picker(&mut app, files);
+        press(&mut app, KeyCode::Char(' '));
+        type_text(&mut app, "file");
+
+        for width in 1..=30 {
+            for height in 1..=8 {
+                render_to_buffer(&app, width, height);
+            }
+        }
+    }
+
+    #[test]
+    fn the_picker_box_is_centered_top_anchored_and_never_outgrows_the_screen() {
+        let screen = Rect::new(0, 0, 120, 40);
+        let area = picker_area(screen);
+        assert_eq!(area.width, PICKER_WIDTH);
+        assert_eq!(area.height, PICKER_ROWS as u16 + 3);
+        assert_eq!(area.x * 2 + area.width, screen.width, "centered");
+        assert_eq!(area.y, 2, "anchored, so it never jumps while typing");
+
+        for width in 1..=120 {
+            for height in 1..=40 {
+                let screen = Rect::new(0, 0, width, height);
+                let area = picker_area(screen);
+                assert!(
+                    area.right() <= screen.right() && area.bottom() <= screen.bottom(),
+                    "{area:?} overflows {screen:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_recent_file_shows_its_day_and_time_and_an_old_one_its_day_and_year() {
+        let now = Local.with_ymd_and_hms(2026, 10, 12, 15, 0, 0).unwrap();
+        let at = |year, month, day, hour, minute| {
+            SystemTime::from(
+                Local
+                    .with_ymd_and_hms(year, month, day, hour, minute, 0)
+                    .unwrap(),
+            )
+        };
+
+        let today = modified_label(at(2026, 10, 12, 14, 3), now);
+        let months_ago = modified_label(at(2026, 5, 20, 9, 30), now);
+        let last_year = modified_label(at(2025, 3, 3, 11, 20), now);
+
+        assert_eq!(today, "12 Oct 14:03");
+        assert_eq!(months_ago, "20 May 09:30");
+        assert_eq!(last_year, "03 Mar  2025");
+        for label in [today, months_ago, last_year] {
+            assert_eq!(label.chars().count(), PICKER_TIME_WIDTH, "{label}");
+        }
+    }
+
+    #[test]
+    fn truncate_start_keeps_the_end_of_a_long_path() {
+        assert_eq!(truncate_start("/short", 10), "/short");
+        assert_eq!(truncate_start("/Users/jurgen/Downloads", 10), "…Downloads");
+        assert_eq!(truncate_start("/anything", 0), "");
     }
 
     #[test]

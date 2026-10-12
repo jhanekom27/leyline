@@ -7,7 +7,7 @@
 //! caller should do, rather than reaching for I/O itself.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use iroh_blobs::Hash;
@@ -16,6 +16,7 @@ use iroh_tickets::Ticket;
 use crate::files::StagedAttachment;
 use crate::message::{ChatMessage, now_unix_ms};
 use crate::net::{DEVICE_SYNC_CHANNEL, NetEvent};
+use crate::picker::{FilePicker, FolderListing, Step};
 use crate::search::{self, SearchOutcome, SearchResults};
 use crate::thread::{self, ThreadView};
 use crate::ticket::PairingTicket;
@@ -521,6 +522,21 @@ pub enum InputAction {
     /// immediately to `bell_enabled` for instant feedback; the caller only
     /// needs to persist it to disk.
     Bell(bool),
+    /// Read `dir` for the file picker (`picker::read_folder`, off the event
+    /// loop) and report it back as a `picker::FolderListing` for `request`,
+    /// which `AppState::apply_folder_listing` matches to the read it was
+    /// waiting for. app.rs never touches the filesystem, so the read is the
+    /// caller's.
+    ReadFolder { request: u64, dir: PathBuf },
+    /// Stage `paths`, chosen in the file picker, on `channel` -- each
+    /// checked like a `/send`ed file (`files::stage_file`) -- and remember
+    /// `folder` as where the picker opens next time
+    /// (`picker::remember_folder`).
+    StageFiles {
+        channel: String,
+        paths: Vec<PathBuf>,
+        folder: PathBuf,
+    },
 }
 
 /// All state needed to render the TUI and respond to input.
@@ -630,6 +646,20 @@ pub struct AppState {
     /// checks this alongside `picking_reply`/`picking_thread`, before
     /// normal typing/editing, to dispatch into `handle_switcher_key`.
     pub switching: Option<Switcher>,
+    /// The open file picker (a bare `/send`, see `run_send`), if any. A modal
+    /// mode like `switching`: `handle_key` hands it every key, a paste
+    /// filters it, and `is_composing` is false while it's open.
+    pub picking_file: Option<FilePicker>,
+    /// The folder the file picker opens in: where files were last chosen
+    /// from -- seeded at startup from what was remembered across restarts
+    /// (`load_browse_dir`) and updated whenever files are chosen. The
+    /// filesystem root until seeded, so there is always somewhere to open.
+    browse_dir: PathBuf,
+    /// Counts the folder reads the picker has asked for (`ReadFolder`), so
+    /// every one has an id of its own -- across pickers too, which is what
+    /// keeps a slow answer to a closed picker's read from landing in the
+    /// next one.
+    browse_requests: u64,
     /// The armed reply target for the next sent message (confirmed via
     /// `Enter` while picking, or `/reply`), by message id. Attached to the
     /// next `Send`-ed `ChatMessage` and cleared on send (`send_text`), on
@@ -697,6 +727,9 @@ impl AppState {
             replying_to: None,
             pending_redeem: None,
             restart_with_ticket: None,
+            picking_file: None,
+            browse_dir: PathBuf::from(std::path::MAIN_SEPARATOR_STR),
+            browse_requests: 0,
         }
     }
 
@@ -755,6 +788,14 @@ impl AppState {
     /// `load_contacts`.
     pub fn load_renames(&mut self, renames: HashMap<String, String>) {
         self.renames = renames;
+    }
+
+    /// Seeds the folder the file picker opens in (see
+    /// `picker::start_folder`, which resolves what was remembered across
+    /// restarts). Intended to be called once, right after `AppState::new`,
+    /// before the event loop starts -- mirrors `load_contacts`.
+    pub fn load_browse_dir(&mut self, dir: PathBuf) {
+        self.browse_dir = dir;
     }
 
     /// Merges a batch of possibly-historical messages fetched via backfill
@@ -845,6 +886,16 @@ impl AppState {
             .messages
             .sort_by_key(|message| (message.ts_unix_ms, message.id));
         search.pending = false;
+    }
+
+    /// Hands a finished folder read (`picker::read_folder`, kicked off via
+    /// `InputAction::ReadFolder`) to the open file picker. A no-op if the
+    /// picker has since closed; whether the answer is the one it was
+    /// waiting for is the picker's call (`FilePicker::apply`).
+    pub fn apply_folder_listing(&mut self, listing: FolderListing) {
+        if let Some(picker) = &mut self.picking_file {
+            picker.apply(listing);
+        }
     }
 
     pub fn active(&self) -> &Channel {
@@ -1081,6 +1132,9 @@ impl AppState {
         if self.switching.is_some() {
             self.handle_switcher_key(key);
             return None;
+        }
+        if self.picking_file.is_some() {
+            return self.handle_picker_key(key);
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -1343,6 +1397,57 @@ impl AppState {
         if index != self.active {
             self.active = index;
             self.finish_activating_channel();
+        }
+    }
+
+    /// Opens the file picker -- a bare `/send` -- for the channel that is
+    /// active now, in the folder files were last chosen from, and asks the
+    /// caller to read it. The picker shows "reading" until the listing
+    /// arrives (`apply_folder_listing`), so input is never held up on it.
+    fn open_picker(&mut self) -> InputAction {
+        let dir = self.browse_dir.clone();
+        let request = next_request(&mut self.browse_requests);
+        self.picking_file = Some(FilePicker::new(
+            self.active().name.clone(),
+            dir.clone(),
+            request,
+        ));
+        InputAction::ReadFolder { request, dir }
+    }
+
+    /// Handles a keypress while the file picker is open: what the keys
+    /// mean is `FilePicker::handle_key`'s business, and this turns what it
+    /// asks for into state changes and an `InputAction`. `Ctrl+C` still
+    /// force-quits, since `Esc` only closes the picker.
+    fn handle_picker_key(&mut self, key: KeyEvent) -> Option<InputAction> {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
+            return None;
+        }
+        let picker = self
+            .picking_file
+            .as_mut()
+            .expect("handle_key only calls this while the picker is open");
+        match picker.handle_key(key) {
+            Step::Stay => None,
+            Step::Cancel => {
+                self.picking_file = None;
+                None
+            }
+            Step::Open(dir) => {
+                let request = next_request(&mut self.browse_requests);
+                picker.read(request, dir.clone());
+                Some(InputAction::ReadFolder { request, dir })
+            }
+            Step::Choose(paths) => {
+                let picker = self.picking_file.take()?;
+                self.browse_dir = picker.dir().to_path_buf();
+                Some(InputAction::StageFiles {
+                    channel: picker.channel,
+                    paths,
+                    folder: self.browse_dir.clone(),
+                })
+            }
         }
     }
 
@@ -1903,7 +2008,7 @@ impl AppState {
         self.push_system(
             "commands: /join <name|ticket>, /invite, /pair [ticket], /forget-device <hex-prefix>, \
              /msg <alias|hex-prefix> [text], /dm <alias|hex-prefix|endpoint-id> [text], \
-             /leave [channel], /rename [name], /who, /send <path>, \
+             /leave [channel], /rename [name], /who, /send [path], \
              /save <hash-prefix>, /paste, /alias <hex-prefix> <name>, /nick <name>, \
              /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
@@ -1912,6 +2017,8 @@ impl AppState {
              /dm connects directly to a peer's endpoint id with no ticket or gossip channel, \
              unlike /msg -- keys: Tab/Shift+Tab switch channels, \
              Ctrl+P jump to a channel (type to filter, \u{2191}/\u{2193} pick, Enter confirm), \
+             a bare /send opens a file picker (type to filter, \u{2191}/\u{2193} pick, Space mark, \
+             Enter open a folder or stage the marked files, Backspace up a level, Esc cancel), \
              Alt+Enter/Ctrl+J newline, Ctrl+V share the clipboard (a file or image is staged \
              first: Enter sends it, Backspace on an empty input unstages, Esc clears), \
              Ctrl+R reply (\u{2191}/\u{2193} pick, \
@@ -2519,19 +2626,19 @@ impl AppState {
         }
     }
 
-    /// Handles `/send <path>`: `arg` is everything after `/send ` (already
-    /// trimmed), naming a local file to share with the active channel.
-    /// Strips one layer of surrounding quotes (see `strip_quotes`) and
-    /// otherwise only checks that a path was given -- app.rs never
-    /// touches the filesystem (see this module's doc comment), so the
-    /// path itself (existence, `~`-expansion, etc.) is validated and
-    /// resolved by the caller (`net::Net::send_file`) once this returns.
-    /// Pushes an immediate breadcrumb since importing and broadcasting a
-    /// file happens in the background and may take a moment.
+    /// Handles `/send [path]`: `arg` is everything after `/send ` (already
+    /// trimmed). With no path, opens the file picker (`open_picker`) to
+    /// choose files in. With one, it names a local file to share with the
+    /// active channel right away: strips one layer of surrounding quotes
+    /// (see `strip_quotes`) and otherwise only checks that a path was given
+    /// -- app.rs never touches the filesystem (see this module's doc
+    /// comment), so the path itself (existence, `~`-expansion, etc.) is
+    /// validated and resolved by the caller (`net::Net::send_file`) once
+    /// this returns. Pushes an immediate breadcrumb since importing and
+    /// broadcasting a file happens in the background and may take a moment.
     fn run_send(&mut self, arg: &str) -> Option<InputAction> {
         if arg.is_empty() {
-            self.push_system("usage: /send <path>");
-            return None;
+            return Some(self.open_picker());
         }
         let path = strip_quotes(arg);
         let name = Path::new(path)
@@ -2848,16 +2955,18 @@ impl AppState {
 
     /// Whether keys -- and pastes -- currently go to the message box. False
     /// while a live pairing redeem is awaiting confirmation, a reply or
-    /// thread pick is in progress, or the `Ctrl+P` switcher is open: each
-    /// takes over input ahead of normal typing (see `handle_key`). main.rs
-    /// only treats a pasted file path as a dropped file while this is true,
-    /// since staging files while the user is in the middle of something
-    /// else would put them somewhere they are not looking.
+    /// thread pick is in progress, or the `Ctrl+P` switcher or the file
+    /// picker is open: each takes over input ahead of normal typing (see
+    /// `handle_key`). main.rs only treats a pasted file path as a dropped
+    /// file while this is true, since staging files while the user is in
+    /// the middle of something else would put them somewhere they are not
+    /// looking.
     pub fn is_composing(&self) -> bool {
         self.pending_redeem.is_none()
             && self.picking_reply.is_none()
             && self.picking_thread.is_none()
             && self.switching.is_none()
+            && self.picking_file.is_none()
     }
 
     /// Inserts a terminal bracketed-paste's full text at the cursor as one
@@ -2876,6 +2985,13 @@ impl AppState {
         // so line breaks and other control characters are dropped.
         if self.switching.is_some() {
             self.edit_switcher_query(|query| {
+                query.extend(text.chars().filter(|c| !c.is_control()));
+            });
+            return;
+        }
+        // So does an open file picker, whose filter is one line too.
+        if let Some(picker) = &mut self.picking_file {
+            picker.edit_query(|query| {
                 query.extend(text.chars().filter(|c| !c.is_control()));
             });
             return;
@@ -2949,6 +3065,13 @@ fn strip_quotes(arg: &str) -> &str {
         && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
             || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''));
     if quoted { &arg[1..arg.len() - 1] } else { arg }
+}
+
+/// The next id of `counter`, which counts the folder reads the file picker
+/// has asked for (`AppState::browse_requests`).
+fn next_request(counter: &mut u64) -> u64 {
+    *counter += 1;
+    *counter
 }
 
 fn compose_message(sender: [u8; 32], text: &str, reply_to: Option<u64>) -> ChatMessage {
@@ -4495,6 +4618,290 @@ mod tests {
         assert!(!redeeming.is_composing());
     }
 
+    // -- the file picker, opened by a bare /send -----------------------------
+
+    use crate::picker::{Entry, Kind};
+
+    fn picked_file(name: &str) -> Entry {
+        Entry::new(
+            name.to_string(),
+            Kind::File {
+                size: 1,
+                modified: std::time::SystemTime::UNIX_EPOCH,
+            },
+        )
+    }
+
+    fn picked_folder(name: &str) -> Entry {
+        Entry::new(name.to_string(), Kind::Folder)
+    }
+
+    fn listing(request: u64, entries: Vec<Entry>) -> FolderListing {
+        FolderListing {
+            request,
+            result: Ok(entries),
+        }
+    }
+
+    /// The request id of the folder read `action` asks for.
+    fn read_request(action: Option<InputAction>) -> u64 {
+        match action {
+            Some(InputAction::ReadFolder { request, .. }) => request,
+            _ => panic!("expected InputAction::ReadFolder"),
+        }
+    }
+
+    /// Opens the picker with a bare `/send` on `app`, whose picker folder is
+    /// `/pics`, and answers its read with a folder and two files.
+    fn open_picker(app: &mut AppState) {
+        app.load_browse_dir(PathBuf::from("/pics"));
+        let request = read_request(submit(app, "/send"));
+        app.apply_folder_listing(listing(
+            request,
+            vec![
+                picked_folder("docs"),
+                picked_file("a.txt"),
+                picked_file("b.txt"),
+            ],
+        ));
+    }
+
+    #[test]
+    fn a_bare_send_opens_the_picker_and_asks_for_the_remembered_folder_to_be_read() {
+        let mut app = app();
+        app.load_browse_dir(PathBuf::from("/pics"));
+
+        let action = submit(&mut app, "/send");
+
+        match action {
+            Some(InputAction::ReadFolder { request, dir }) => {
+                assert_eq!(request, 1);
+                assert_eq!(dir, PathBuf::from("/pics"));
+            }
+            _ => panic!("expected InputAction::ReadFolder"),
+        }
+        let picker = app.picking_file.as_ref().expect("the picker is open");
+        assert_eq!(picker.dir(), Path::new("/pics"));
+        assert!(picker.is_reading());
+        assert_eq!(app.active().input, "", "the command was consumed");
+        assert!(app.active().messages.is_empty(), "no usage notice any more");
+    }
+
+    #[test]
+    fn the_picker_opens_at_the_root_until_a_folder_is_seeded() {
+        let mut app = app();
+
+        match submit(&mut app, "/send") {
+            Some(InputAction::ReadFolder { dir, .. }) => {
+                assert_eq!(dir, PathBuf::from(std::path::MAIN_SEPARATOR_STR));
+            }
+            _ => panic!("expected InputAction::ReadFolder"),
+        }
+    }
+
+    #[test]
+    fn send_with_a_path_still_sends_it_and_leaves_the_picker_closed() {
+        let mut app = app();
+
+        let action = submit(&mut app, "/send ~/Downloads/a.png");
+
+        assert!(matches!(action, Some(InputAction::SendFile { .. })));
+        assert!(app.picking_file.is_none());
+    }
+
+    #[test]
+    fn the_picker_owns_keys_and_pastes_while_open() {
+        let mut app = app();
+        open_picker(&mut app);
+        assert!(!app.is_composing());
+
+        app.handle_key(key(KeyCode::Char('a')));
+        app.paste_text("txt\n");
+
+        assert_eq!(app.active().input, "", "nothing lands in the draft");
+        let picker = app.picking_file.as_ref().expect("still open");
+        assert_eq!(
+            picker.query(),
+            "atxt",
+            "a paste filters, minus its line break"
+        );
+    }
+
+    #[test]
+    fn the_picker_answers_keys_before_its_folder_has_arrived() {
+        let mut app = app();
+        app.load_browse_dir(PathBuf::from("/pics"));
+        submit(&mut app, "/send"); // never answered: a huge or slow folder
+
+        assert!(app.handle_key(key(KeyCode::Down)).is_none());
+        assert!(app.handle_key(key(KeyCode::Char('x'))).is_none());
+        assert!(app.handle_key(key(KeyCode::Enter)).is_none());
+        assert!(app.picking_file.is_some(), "still open, and still waiting");
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.picking_file.is_none(), "and Esc still closes it");
+    }
+
+    #[test]
+    fn escape_closes_the_picker_without_staging_or_quitting() {
+        let mut app = app();
+        open_picker(&mut app);
+
+        let action = app.handle_key(key(KeyCode::Esc));
+
+        assert!(action.is_none());
+        assert!(app.picking_file.is_none());
+        assert!(!app.should_quit);
+        assert!(app.is_composing());
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_from_the_picker() {
+        let mut app = app();
+        open_picker(&mut app);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn choosing_a_file_stages_it_on_the_channel_the_picker_was_opened_on() {
+        let mut app = multi_channel_app(); // "random" is active
+        open_picker(&mut app);
+        app.handle_key(key(KeyCode::Down)); // a.txt
+        app.active = 0; // a join switched channels meanwhile
+
+        let action = app.handle_key(key(KeyCode::Enter));
+
+        match action {
+            Some(InputAction::StageFiles {
+                channel,
+                paths,
+                folder,
+            }) => {
+                assert_eq!(channel, "random");
+                assert_eq!(paths, [PathBuf::from("/pics/a.txt")]);
+                assert_eq!(folder, PathBuf::from("/pics"));
+            }
+            _ => panic!("expected InputAction::StageFiles"),
+        }
+        assert!(app.picking_file.is_none(), "choosing closes the picker");
+    }
+
+    #[test]
+    fn marked_files_are_all_staged_together() {
+        let mut app = app();
+        open_picker(&mut app);
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Char(' '))); // a.txt
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Char(' '))); // b.txt
+
+        match app.handle_key(key(KeyCode::Enter)) {
+            Some(InputAction::StageFiles { paths, .. }) => assert_eq!(
+                paths,
+                [PathBuf::from("/pics/a.txt"), PathBuf::from("/pics/b.txt")]
+            ),
+            _ => panic!("expected InputAction::StageFiles"),
+        }
+    }
+
+    #[test]
+    fn the_folder_files_were_chosen_from_is_where_the_picker_opens_next() {
+        let mut app = app();
+        open_picker(&mut app);
+        // Into docs, then choose a file there.
+        let request = read_request(app.handle_key(key(KeyCode::Enter)));
+        app.apply_folder_listing(listing(request, vec![picked_file("deep.txt")]));
+        app.handle_key(key(KeyCode::Enter));
+
+        match submit(&mut app, "/send") {
+            Some(InputAction::ReadFolder { dir, .. }) => {
+                assert_eq!(dir, PathBuf::from("/pics/docs"));
+            }
+            _ => panic!("expected InputAction::ReadFolder"),
+        }
+    }
+
+    #[test]
+    fn cancelling_does_not_change_where_the_picker_opens_next() {
+        let mut app = app();
+        open_picker(&mut app);
+        let request = read_request(app.handle_key(key(KeyCode::Enter))); // into docs
+        app.apply_folder_listing(listing(request, vec![picked_file("deep.txt")]));
+        app.handle_key(key(KeyCode::Esc));
+
+        match submit(&mut app, "/send") {
+            Some(InputAction::ReadFolder { dir, .. }) => {
+                assert_eq!(dir, PathBuf::from("/pics"));
+            }
+            _ => panic!("expected InputAction::ReadFolder"),
+        }
+    }
+
+    #[test]
+    fn opening_a_folder_asks_for_it_under_a_fresh_request_id() {
+        let mut app = app();
+        open_picker(&mut app); // request 1
+
+        match app.handle_key(key(KeyCode::Enter)) {
+            Some(InputAction::ReadFolder { request, dir }) => {
+                assert_eq!(request, 2);
+                assert_eq!(dir, PathBuf::from("/pics/docs"));
+            }
+            _ => panic!("expected InputAction::ReadFolder"),
+        }
+    }
+
+    #[test]
+    fn going_up_asks_for_the_parent_folder() {
+        let mut app = app();
+        open_picker(&mut app);
+        let request = read_request(app.handle_key(key(KeyCode::Enter))); // into docs
+        app.apply_folder_listing(listing(request, vec![picked_file("deep.txt")]));
+
+        match app.handle_key(key(KeyCode::Backspace)) {
+            Some(InputAction::ReadFolder { dir, .. }) => {
+                assert_eq!(dir, PathBuf::from("/pics"));
+            }
+            _ => panic!("expected InputAction::ReadFolder"),
+        }
+    }
+
+    #[test]
+    fn an_answer_only_reaches_the_picker_waiting_for_it() {
+        let mut app = app();
+        app.load_browse_dir(PathBuf::from("/pics"));
+        let first = read_request(submit(&mut app, "/send"));
+        app.handle_key(key(KeyCode::Esc));
+        let second = read_request(submit(&mut app, "/send"));
+        assert_ne!(first, second, "every read has an id of its own");
+
+        // The first picker's slow answer turns up after the second opened.
+        app.apply_folder_listing(listing(first, vec![picked_file("stale.txt")]));
+        let picker = app.picking_file.as_ref().expect("open");
+        assert!(picker.is_reading(), "still waiting for its own");
+        assert_eq!(picker.visible().len(), 0);
+
+        app.apply_folder_listing(listing(second, vec![picked_file("fresh.txt")]));
+        let picker = app.picking_file.as_ref().expect("open");
+        assert!(!picker.is_reading());
+        assert_eq!(picker.visible().len(), 1);
+    }
+
+    #[test]
+    fn an_answer_after_the_picker_closed_is_ignored() {
+        let mut app = app();
+        app.load_browse_dir(PathBuf::from("/pics"));
+        let request = read_request(submit(&mut app, "/send"));
+        app.handle_key(key(KeyCode::Esc));
+
+        app.apply_folder_listing(listing(request, vec![picked_file("late.txt")]));
+
+        assert!(app.picking_file.is_none());
+    }
+
     #[test]
     fn slash_leave_with_no_arg_leaves_the_active_channel() {
         let mut app = multi_channel_app();
@@ -5148,15 +5555,6 @@ mod tests {
         }
         let last = as_system(app.active().messages.back().unwrap());
         assert_eq!(last, "sending report.pdf...");
-    }
-
-    #[test]
-    fn slash_send_without_arg_shows_usage_and_returns_none() {
-        let mut app = app();
-        let action = submit(&mut app, "/send");
-        assert!(action.is_none());
-        let last = as_system(app.active().messages.back().unwrap());
-        assert!(last.starts_with("usage:"), "got: {last}");
     }
 
     #[test]

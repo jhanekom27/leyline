@@ -14,6 +14,7 @@ mod markdown;
 mod message;
 mod net;
 mod pairing;
+mod picker;
 mod search;
 mod settings;
 mod storage;
@@ -51,6 +52,7 @@ use files::{downloads_dir, dropped_files, resolve_destination, stage_file, stage
 use forgotten_devices::ForgottenDevices;
 use message::ChatMessage;
 use net::{DEVICE_SYNC_CHANNEL, Net, NetEvent};
+use picker::{FolderListing, read_folder, remember_folder, start_folder};
 use search::{SearchOutcome, run_on_disk_scan};
 use settings::Settings;
 use storage::MessageStore;
@@ -528,6 +530,7 @@ async fn run(
     app.load_settings(settings.bell_enabled());
     app.load_dm_registry(dm_registry.all());
     app.load_forgotten_devices(forgotten_devices.all());
+    app.load_browse_dir(start_folder(&data_dir));
     for name in &joined_channels {
         // Ensures a brand-new channel ("general" on a first run, or a
         // `--join` ticket's channel) lands in the registry, so it's
@@ -608,6 +611,9 @@ async fn run(
     // since this isn't network activity, following the same "async work
     // reports into the select loop" shape.
     let (search_tx, mut search_rx) = mpsc::channel::<SearchOutcome>(8);
+    // Likewise for the file picker's folder reads (see `InputAction::
+    // ReadFolder`), which are filesystem work, not network activity.
+    let (browse_tx, mut browse_rx) = mpsc::channel::<FolderListing>(8);
     let mut dirty = true;
 
     while !app.should_quit {
@@ -778,6 +784,27 @@ async fn run(
                             Some(InputAction::Bell(enabled)) => {
                                 if let Err(err) = settings.set_bell_enabled(enabled) {
                                     warn!("failed to persist bell setting: {err}");
+                                }
+                            }
+                            // The file picker wants a folder listed. A huge or
+                            // slow one -- a network mount -- can't be assumed
+                            // cheap, so it's read on tokio's blocking pool and
+                            // answers through `browse_rx` below: input stays
+                            // live while it's pending.
+                            Some(InputAction::ReadFolder { request, dir }) => {
+                                let browse_tx = browse_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let result = read_folder(&dir);
+                                    let _ = browse_tx.blocking_send(FolderListing { request, result });
+                                });
+                            }
+                            // Files chosen in the picker: staged for review
+                            // exactly like a drop, and the folder they came
+                            // from remembered for the next time it opens.
+                            Some(InputAction::StageFiles { channel, paths, folder }) => {
+                                stage_files(&mut app, &channel, &paths);
+                                if let Err(err) = remember_folder(&data_dir, &folder) {
+                                    warn!("failed to remember the picker's folder: {err}");
                                 }
                             }
                             None => {}
@@ -1049,6 +1076,10 @@ async fn run(
             }
             Some(outcome) = search_rx.recv() => {
                 app.apply_search_outcome(outcome);
+                dirty = true;
+            }
+            Some(listing) = browse_rx.recv() => {
+                app.apply_folder_listing(listing);
                 dirty = true;
             }
             _ = tick.tick() => {

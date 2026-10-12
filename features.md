@@ -175,6 +175,30 @@ mechanisms, not one, since they trade off differently:
   as the one `Event::Paste` a bracketing terminal would have sent. Typing a
   path by hand never qualifies: one key arrives at a time, and the files
   must exist besides.
+- [x] **File picker** -- a bare `/send` opens a keyboard-driven picker in
+  place of the exact path `/send <path>` wants, drawn over everything like
+  the `Ctrl+P` switcher. It lives inside the TUI rather than being a GUI
+  dialog, so it works over SSH and on Linux. `picker::FilePicker` is pure
+  state, like `ThreadView`/`SearchResults`, owned by
+  `AppState::picking_file`; `picker::read_folder` is the one piece of I/O
+  and runs on tokio's blocking pool, answering through its own channel the
+  way `/search`'s scan does, so a huge or slow folder never holds up a key:
+  the picker says "reading...", still answers `Esc`, and ignores an answer
+  that is not the one it is waiting for (a slower earlier read, or one for
+  a picker since closed) by request id. It lists folders first, by name,
+  then files newest first, leaving out dot-files. `Up`/`Down` move; `Enter`
+  opens a folder or, on a file, stages the marked files (the highlighted
+  one if none are marked); `Space` marks, so the filter -- typing narrows
+  the folder by name, ignoring case -- can't hold a space; `Backspace`
+  edits the filter and, once it is empty, goes up a level; `Esc` cancels.
+  What is chosen is staged like anything else (`files::stage_file`), on the
+  channel the picker was opened on. It opens where files were last chosen
+  from, kept across restarts in a one-line `browse_dir` file in the data
+  directory -- not a new field of the postcard `settings` file, which
+  would fail to decode an existing one and silently reset the saved
+  nickname and bell setting -- falling back to Downloads, then home. An
+  unreadable folder shows the reason in the bottom border and leaves the
+  picker where it was.
 
 ## Networking & sharing
 

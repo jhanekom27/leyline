@@ -282,6 +282,13 @@ together and spell nothing but existing files are handed out as the one
 `Event::Paste` a bracketing terminal would have sent -- which `handle_paste`
 then stages like any other drop. Everything else passes through untouched.
 
+Slow filesystem work stays off the loop the same way slow network work does:
+`/search`'s on-disk scan and the file picker's folder reads
+(`picker::read_folder`) run on tokio's blocking pool and report back through
+their own channels into the same `select!`, so a huge folder never blocks a
+keypress. Each read carries an id (`AppState::browse_requests`), and the
+picker applies only the answer it is waiting for.
+
 Each joined channel's gossip receive loop runs on its own `tokio::spawn`
 (`net::forward_events`), forwarding parsed `NetEvent`s into one bounded
 `mpsc` channel that the select loop above owns. The channel has a modest,
@@ -397,5 +404,6 @@ src/
   backfill.rs         // iroh-blobs history manifests for offline backfill
   files.rs            // /save destination resolution, filename safety, sizes, outgoing-file checks + staged attachments, drag-and-drop paste detection
   term_events.rs      // crossterm EventStream wrapper: a drop a terminal types out (Warp) becomes one paste
+  picker.rs           // in-TUI file picker behind a bare /send: pure state, folder reads, remembered start folder
   version.rs          // build version/git-hash constants, newer-than-ours comparison
 ```
