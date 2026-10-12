@@ -113,10 +113,24 @@ comes down to in a TUI.
   (group, `/msg` DM, or `/dm` point-to-point chat, plus the peer for the
   latter two), a reverse lookup over `dm_channels`/`direct_channels` --
   never from the shape of the name, so a group channel someone happened to
-  call `#dm-alice` stays a group channel. A `dm-`/`p2p-` text prefix
-  keeps the two 1:1 kinds distinguishable for now. `/leave <name>` accepts
-  a channel's raw name or the label shown for it, and refuses a label
+  call `#dm-alice` stays a group channel. The kind is shown as a glyph
+  (`ChannelKind::glyph`: `#` group, `@` `/msg` DM, `⚡` point-to-point) --
+  beside every entry in the navigation panel, and in front of the label as
+  the channel's *heading* (`AppState::channel_heading`) in pane titles and
+  system notices -- so a `/msg` DM and a `/dm` chat with the same person,
+  which share a label, still read differently. `/leave <name>` accepts a
+  channel's raw name, its label, or its heading, and refuses a reference
   shared by several channels rather than guessing.
+- The left-hand navigation panel (`ui::render_nav`) lists every joined
+  channel in two sections -- CHANNELS for group channels, PEOPLE for DMs
+  and point-to-point chats -- each in join order (`AppState::nav_sections`).
+  `Tab`/`Shift+Tab` walk the channels in that same drawn order
+  (`switch_channel`) rather than strict join order, so the highlight moves
+  down the panel instead of hopping between sections when the two kinds
+  were joined interleaved. Like the rest of `ui.rs` the panel is a pure
+  function of `AppState`: when it outgrows the terminal, its scroll offset
+  is derived from which row is active (`nav_scroll_offset`) instead of
+  being stored anywhere.
 - Each device also loads a second, longer-lived **user key**
   (`identity.rs`, same load-or-generate-once treatment as the device
   identity) and self-signs a `DeviceCert` binding its own `EndpointId` to

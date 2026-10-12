@@ -22,9 +22,9 @@ and whoever's behind automatically fetches the messages they're missing
 directly from whoever announced them, no manual command needed -- not
 just from whichever peer you happened to connect through. Combined with
 local persistence, multi-channel support (one gossip task per joined
-topic, a tab bar to switch between them, and a presence sidebar scoped to
-whichever channel is active), a couple of things are still deliberately
-minimal:
+topic, a left-hand panel to switch between them, and a presence sidebar
+scoped to whichever channel is active), a couple of things are still
+deliberately minimal:
 
 - **Identity persists across runs** -- your keypair is generated once and
   saved to disk, so your endpoint id stays the same every time you start
@@ -92,8 +92,15 @@ Once running, join or create additional channels from the message box with
 `/join <channel-name-or-ticket>`: a bare name (e.g. `/join project-x`)
 creates a brand-new, private channel under that name locally -- share its
 ticket with others via `/invite` -- while pasting someone else's ticket
-joins their swarm directly. Switch between joined channels with `Tab` /
-`Shift+Tab`.
+joins their swarm directly.
+
+Every joined channel is listed in the panel down the left, in two
+sections: **CHANNELS** for group channels (`#`) and **PEOPLE** for your 1:1
+conversations (`@` for a `/msg` DM, `⚡` for a `/dm` point-to-point chat),
+each in the order you joined them. The active one is highlighted, and a `*`
+marks another with unread messages; the panel scrolls once the list is
+taller than the terminal. Switch between channels with `Tab` / `Shift+Tab`,
+which step down / up the panel and wrap around.
 
 Your identity now persists in your OS config directory, keyed by your `$HOME`.
 Chat history persists the same way in your OS data directory -- one log
@@ -140,7 +147,7 @@ HOME=/tmp/leyline-b CARGO_HOME="$REAL_CARGO_HOME" cargo run
 | `Ctrl+R` | Pick a message to reply to -- `Up`/`Down` move the highlight, `Enter` confirms, `Esc` cancels |
 | `Ctrl+T` | Pick a message to view its reply chain in isolation -- `Up`/`Down` move the highlight, `Enter` confirms, `Esc` cancels |
 | `Up` / `Down` | Scroll the message history (or move the highlight while picking a reply or thread target, see `Ctrl+R`/`Ctrl+T`) |
-| `Tab` / `Shift+Tab` | Switch to the next / previous joined channel |
+| `Tab` / `Shift+Tab` | Switch to the next / previous channel in the left-hand panel (group channels first, then conversations), wrapping around |
 | `Esc` / `Ctrl+C` | Cancel an in-progress reply or thread pick, or an armed reply, first, if any; otherwise leave an open thread view if one is active; otherwise quit |
 
 ## Commands
@@ -152,10 +159,10 @@ Typed into the message box and submitted with `Enter`:
 | `/join <channel-name>` | Join or create a channel by name, then switch to it |
 | `/join <ticket>` | Join the channel named in a pasted invite ticket |
 | `/invite` | Show the active channel's invite ticket in the transcript (and copy it to your clipboard, if one is available) to share with others |
-| `/msg <alias-or-hex-prefix> [text]` | Message a specific peer 1:1: switches to (or auto-creates) a private channel just for the two of you, shown as `dm-<name>` where `<name>` is the peer's current alias, nickname, or hex prefix (it updates as soon as you `/alias` them); share its invite ticket the same way as any new channel so they can join it too. With `[text]`, sends it immediately once the channel is ready |
-| `/dm <alias-or-hex-prefix-or-endpoint-id> [text]` | Message a peer directly over a point-to-point QUIC connection -- no gossip channel, room secret, or invite ticket, unlike `/msg`. Switches to (or auto-creates) a `p2p-<name>` tab, named the same way as a `/msg` DM so it follows `/alias` too; accepts a full endpoint id for a peer you've never shared a channel with, as long as you already know their id. Reconnects automatically on disconnect, and the conversation's tab, history, and connection attempt all come back after a restart. With `[text]`, sends it immediately once connected |
+| `/msg <alias-or-hex-prefix> [text]` | Message a specific peer 1:1: switches to (or auto-creates) a private channel just for the two of you, listed under PEOPLE as `@<name>` where `<name>` is the peer's current alias, nickname, or hex prefix (it updates as soon as you `/alias` them); share its invite ticket the same way as any new channel so they can join it too. With `[text]`, sends it immediately once the channel is ready |
+| `/dm <alias-or-hex-prefix-or-endpoint-id> [text]` | Message a peer directly over a point-to-point QUIC connection -- no gossip channel, room secret, or invite ticket, unlike `/msg`. Switches to (or auto-creates) a conversation listed under PEOPLE as `⚡<name>`, named the same way as a `/msg` DM so it follows `/alias` too; accepts a full endpoint id for a peer you've never shared a channel with, as long as you already know their id. Reconnects automatically on disconnect, and the conversation, its history, and its connection attempt all come back after a restart. With `[text]`, sends it immediately once connected |
 | `/leave` | Leave the active channel |
-| `/leave <channel-name>` | Leave a specific joined channel without switching to it, by the name shown in its tab (a DM's or point-to-point chat's tab shows the peer's current name) |
+| `/leave <channel-name>` | Leave a specific joined channel without switching to it, by the name shown for it in the left-hand panel (a DM or point-to-point chat shows the peer's current name). Add its badge -- `#general`, `@Alice`, `⚡Alice` -- to pick between a `/msg` DM and a `/dm` chat with the same person, which share a name |
 | `/who` | List the active channel's peers, showing each one's full endpoint id, broadcast nickname (if any), and local alias (if any) |
 | `/send <path>` | Share a local file with the active channel; peers see its name and size and can fetch it with `/save`, never automatically |
 | `/save <hash-prefix>` | Download a file previously shared in any joined channel to your Downloads folder (in a `leyline` subfolder) |

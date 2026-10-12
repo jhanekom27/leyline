@@ -51,6 +51,33 @@ pub enum ChannelKind {
     Direct { peer: [u8; 32] },
 }
 
+impl ChannelKind {
+    /// The one-symbol badge that tells this kind apart at a glance -- shown
+    /// beside every channel in the navigation panel and in front of its
+    /// name in titles and notices (`AppState::channel_heading`). The
+    /// point-to-point badge is double-width in a terminal, which is why
+    /// `ui::render_nav` pads every badge to a fixed column instead of
+    /// assuming one cell.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            ChannelKind::Group => "#",
+            ChannelKind::GossipDm { .. } => "@",
+            ChannelKind::Direct { .. } => "⚡",
+        }
+    }
+}
+
+/// Which channels the navigation panel lists under each of its two
+/// sections, as indices into `AppState::channels` -- see
+/// `AppState::nav_sections`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavSections {
+    /// Group channels, in join order.
+    pub channels: Vec<usize>,
+    /// `/msg` DMs and `/dm` point-to-point chats, in join order.
+    pub people: Vec<usize>,
+}
+
 /// One joined channel's transcript, presence, per-channel scroll state,
 /// and in-progress input draft.
 pub struct Channel {
@@ -58,8 +85,8 @@ pub struct Channel {
     pub messages: VecDeque<TranscriptLine>,
     pub peers: Vec<[u8; 32]>,
     pub scroll: usize,
-    /// Whether this channel has unseen activity, shown in the tab bar --
-    /// cleared when it becomes the active channel.
+    /// Whether this channel has unseen activity, shown in the navigation
+    /// panel -- cleared when it becomes the active channel.
     pub has_unread: bool,
     /// Every message id seen so far in this channel (live gossip or
     /// backfill), for dedupe. Deliberately unbounded -- capping this by
@@ -843,28 +870,72 @@ impl AppState {
         }
     }
 
-    /// The name to *show* a user for `channel` -- its tab and pane title --
-    /// as opposed to its `name`, which is its identity (storage file,
-    /// registry key, gossip map entry) and must never change. A group
-    /// channel shows its stored name. A DM or point-to-point chat shows
-    /// whoever it's with, resolved through `display_name` on every call, so
-    /// it follows `/alias` and `/nick` immediately instead of staying
-    /// frozen at whatever was known when the channel was created. That
-    /// frozen name was worse than stale for the *recipient* of a `/msg`
-    /// invite: the initiator picks it (`unique_dm_channel_name`) from their
-    /// label for the recipient, so on the recipient's side it described
-    /// themselves rather than the person they were talking to.
+    /// The name to *show* a user for `channel`, as opposed to its `name`,
+    /// which is its identity (storage file, registry key, gossip map
+    /// entry) and must never change. A group channel shows its stored
+    /// name. A DM or point-to-point chat shows whoever it's with, resolved
+    /// through `display_name` on every call, so it follows `/alias` and
+    /// `/nick` immediately instead of staying frozen at whatever was known
+    /// when the channel was created. That frozen name was worse than stale
+    /// for the *recipient* of a `/msg` invite: the initiator picks it
+    /// (`unique_dm_channel_name`) from their label for the recipient, so on
+    /// the recipient's side it described themselves rather than the person
+    /// they were talking to.
     ///
-    /// The `dm-`/`p2p-` prefix is an interim kind marker, kept so a `/msg`
-    /// DM and a `/dm` chat with the same person don't render identically;
-    /// the kind is expected to move to a glyph once the navigation panel
-    /// can show one (LEY-24.2).
+    /// Just the name, with no kind marker -- a `/msg` DM and a `/dm` chat
+    /// with the same person share one. See `channel_heading` for the form
+    /// that says which kind it is.
     pub fn channel_label(&self, channel: &str) -> String {
         match self.channel_kind(channel) {
             ChannelKind::Group => channel.to_string(),
-            ChannelKind::GossipDm { peer } => format!("dm-{}", self.display_name(&peer)),
-            ChannelKind::Direct { peer } => format!("p2p-{}", self.display_name(&peer)),
+            ChannelKind::GossipDm { peer } | ChannelKind::Direct { peer } => {
+                self.display_name(&peer)
+            }
         }
+    }
+
+    /// `channel_label` behind its kind's glyph (`#general`, `@Alice`, a
+    /// bolt before `Bob`) -- how a channel is named in pane titles and
+    /// system notices, so its kind reads the same everywhere as it does in
+    /// the navigation panel, and so two channels that share a label stay
+    /// distinguishable.
+    pub fn channel_heading(&self, channel: &str) -> String {
+        format!(
+            "{}{}",
+            self.channel_kind(channel).glyph(),
+            self.channel_label(channel)
+        )
+    }
+
+    /// How the navigation panel groups the joined channels: group channels
+    /// under one section, DMs and point-to-point chats under the other,
+    /// each kept in join order. Every channel lands in exactly one.
+    pub fn nav_sections(&self) -> NavSections {
+        let mut sections = NavSections {
+            channels: Vec::new(),
+            people: Vec::new(),
+        };
+        for (index, channel) in self.channels.iter().enumerate() {
+            match self.channel_kind(&channel.name) {
+                ChannelKind::Group => sections.channels.push(index),
+                ChannelKind::GossipDm { .. } | ChannelKind::Direct { .. } => {
+                    sections.people.push(index);
+                }
+            }
+        }
+        sections
+    }
+
+    /// Every channel index in the order the navigation panel draws them,
+    /// top to bottom -- the order `Tab`/`Shift+Tab` step through
+    /// (`switch_channel`).
+    fn nav_order(&self) -> Vec<usize> {
+        let NavSections {
+            mut channels,
+            people,
+        } = self.nav_sections();
+        channels.extend(people);
+        channels
     }
 
     /// The peer a point-to-point channel belongs to, if `channel` is one
@@ -1276,8 +1347,9 @@ impl AppState {
         );
         // Resolved before the association is dropped below: once it's
         // gone the channel would fall back to showing its raw name, and
-        // the notice should say what the tab was actually called on screen.
-        let label = self.channel_label(channel);
+        // the notice should say what the channel was actually called on
+        // screen.
+        let heading = self.channel_heading(channel);
         self.dm_channels.retain(|_, name| name != channel);
         self.direct_channels.retain(|_, name| name != channel);
         self.channels.remove(index);
@@ -1293,7 +1365,7 @@ impl AppState {
             self.picking_thread = None;
             self.replying_to = None;
         }
-        self.push_system(format!("left #{label}"));
+        self.push_system(format!("left {heading}"));
     }
 
     /// Places a locally-authored message (currently only a finished
@@ -1423,16 +1495,25 @@ impl AppState {
     }
 
     /// Moves `active` forward (`step = 1`) or backward (`step = -1`)
-    /// through `channels`, wrapping, and clears the new active channel's
-    /// unread flag. Also clears any in-progress reply pick or armed reply
-    /// -- both are only meaningful against the channel they were made in.
+    /// through the channels in the order the navigation panel draws them
+    /// (`nav_order`), wrapping, and clears the new active channel's unread
+    /// flag. Stepping in drawn order rather than join order keeps the
+    /// panel's highlight moving top to bottom instead of hopping between
+    /// its sections when group channels and conversations were joined
+    /// interleaved; with only group channels the two orders are the same.
+    /// Also clears any in-progress reply pick or armed reply -- both are
+    /// only meaningful against the channel they were made in.
     fn switch_channel(&mut self, step: isize) {
-        if self.channels.len() <= 1 {
+        let order = self.nav_order();
+        if order.len() <= 1 {
             return;
         }
-        let len = self.channels.len() as isize;
-        let next = (self.active as isize + step).rem_euclid(len) as usize;
-        self.active = next;
+        let position = order
+            .iter()
+            .position(|&index| index == self.active)
+            .expect("the active channel is always in the navigation order");
+        let next = (position as isize + step).rem_euclid(order.len() as isize) as usize;
+        self.active = order[next];
         self.finish_activating_channel();
     }
 
@@ -1753,10 +1834,13 @@ impl AppState {
 
     /// Resolves a channel typed by the user (e.g. after `/leave`) to a
     /// joined channel's own `name`. Tries an exact match on `name` first,
-    /// then on the label shown for it (`channel_label`): the two differ for
-    /// a DM or point-to-point chat, and what's on screen is what a user
-    /// will type. Errors on a label shared by several channels (two peers
-    /// given the same alias, say) rather than guessing which was meant.
+    /// then on what's shown for it: its label (`Alice`) or its heading
+    /// (`@Alice`, `#general`). The label differs from `name` for a DM or
+    /// point-to-point chat, and the heading is how a channel is named in
+    /// titles and notices. Errors on a reference shared by several
+    /// channels -- a `/msg` DM and a `/dm` chat with the same person share
+    /// a label, as do two peers given the same alias -- rather than
+    /// guessing which was meant.
     fn resolve_channel_arg(&self, typed: &str) -> Result<String, String> {
         if self.channels.iter().any(|c| c.name == typed) {
             return Ok(typed.to_string());
@@ -1765,7 +1849,7 @@ impl AppState {
             .channels
             .iter()
             .map(|c| c.name.as_str())
-            .filter(|name| self.channel_label(name) == typed)
+            .filter(|name| self.channel_label(name) == typed || self.channel_heading(name) == typed)
             .collect();
         match matches.as_slice() {
             [name] => Ok((*name).to_string()),
@@ -1787,13 +1871,13 @@ impl AppState {
     /// local, like `/hints`/`/help`: no `InputAction` needed.
     fn run_who(&mut self) -> Option<InputAction> {
         let channel = self.active();
-        let name = self.channel_label(&channel.name);
+        let name = self.channel_heading(&channel.name);
         let peers = channel.peers.clone();
         if peers.is_empty() {
-            self.push_system(format!("no peers currently in #{name}"));
+            self.push_system(format!("no peers currently in {name}"));
             return None;
         }
-        self.push_system(format!("peers in #{name} ({}):", peers.len()));
+        self.push_system(format!("peers in {name} ({}):", peers.len()));
         for line in self.grouped_who_lines(&peers) {
             self.push_system(line);
         }
@@ -5682,14 +5766,26 @@ mod tests {
     }
 
     #[test]
-    fn the_left_notice_names_a_dm_by_its_label() {
+    fn the_left_notice_names_a_dm_by_its_heading() {
         let mut app = app_with_dm("dm-07070707", PEER_ID);
         app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
 
         app.remove_channel("dm-07070707");
 
         let last = as_system(app.active().messages.back().unwrap());
-        assert_eq!(last, "left #dm-Alice");
+        assert_eq!(last, "left @Alice");
+    }
+
+    #[test]
+    fn the_left_notice_names_a_point_to_point_chat_by_its_heading() {
+        let mut app = app();
+        app.background_direct_channel("p2p-07070707".to_string(), PEER_ID);
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+
+        app.remove_channel("p2p-07070707");
+
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "left ⚡Alice");
     }
 
     #[test]
@@ -5750,6 +5846,7 @@ mod tests {
 
         assert_eq!(app.channel_kind("dm-Alice"), ChannelKind::Group);
         assert_eq!(app.channel_label("dm-Alice"), "dm-Alice");
+        assert_eq!(app.channel_heading("dm-Alice"), "#dm-Alice");
     }
 
     #[test]
@@ -5766,7 +5863,7 @@ mod tests {
     #[test]
     fn a_dm_label_follows_a_later_alias() {
         let mut app = app_with_dm("dm-07070707", PEER_ID);
-        assert_eq!(app.channel_label("dm-07070707"), "dm-07070707");
+        assert_eq!(app.channel_label("dm-07070707"), "07070707");
 
         app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
         submit(
@@ -5774,7 +5871,7 @@ mod tests {
             &format!("/alias {} Alice", &hex_id(&PEER_ID)[..8]),
         );
 
-        assert_eq!(app.channel_label("dm-07070707"), "dm-Alice");
+        assert_eq!(app.channel_label("dm-07070707"), "Alice");
     }
 
     #[test]
@@ -5782,7 +5879,7 @@ mod tests {
         let raw = crate::direct::channel_name(&PEER_ID);
         let mut app = app();
         app.background_direct_channel(raw.clone(), PEER_ID);
-        assert_eq!(app.channel_label(&raw), "p2p-07070707");
+        assert_eq!(app.channel_label(&raw), "07070707");
 
         app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
         submit(
@@ -5790,7 +5887,7 @@ mod tests {
             &format!("/alias {} Alice", &hex_id(&PEER_ID)[..8]),
         );
 
-        assert_eq!(app.channel_label(&raw), "p2p-Alice");
+        assert_eq!(app.channel_label(&raw), "Alice");
     }
 
     #[test]
@@ -5804,7 +5901,7 @@ mod tests {
             },
         ));
 
-        assert_eq!(app.channel_label("dm-whoever"), "dm-alice (07070707)");
+        assert_eq!(app.channel_label("dm-whoever"), "alice (07070707)");
     }
 
     #[test]
@@ -5822,18 +5919,20 @@ mod tests {
         });
 
         assert_eq!(app.active().name, "dm-Bob");
-        assert_eq!(app.channel_label("dm-Bob"), "dm-Alice");
+        assert_eq!(app.channel_label("dm-Bob"), "Alice");
     }
 
     #[test]
-    fn a_msg_dm_and_a_dm_chat_with_the_same_peer_get_distinct_labels() {
+    fn a_msg_dm_and_a_dm_chat_with_the_same_peer_share_a_label_but_not_a_heading() {
         let raw = crate::direct::channel_name(&PEER_ID);
         let mut app = app_with_dm("dm-Alice", PEER_ID);
         app.background_direct_channel(raw.clone(), PEER_ID);
         app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
 
-        assert_eq!(app.channel_label("dm-Alice"), "dm-Alice");
-        assert_eq!(app.channel_label(&raw), "p2p-Alice");
+        assert_eq!(app.channel_label("dm-Alice"), "Alice");
+        assert_eq!(app.channel_label(&raw), "Alice");
+        assert_eq!(app.channel_heading("dm-Alice"), "@Alice");
+        assert_eq!(app.channel_heading(&raw), "⚡Alice");
     }
 
     #[test]
@@ -5841,7 +5940,7 @@ mod tests {
         let mut app = app_with_dm("dm-07070707", PEER_ID);
         app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
 
-        let action = submit(&mut app, "/leave dm-Alice");
+        let action = submit(&mut app, "/leave Alice");
 
         match action.expect("a label that resolves should leave") {
             InputAction::Leave(channel) => assert_eq!(channel, "dm-07070707"),
@@ -5864,12 +5963,12 @@ mod tests {
 
     #[test]
     fn leave_prefers_an_exact_channel_name_over_a_matching_label() {
-        // "dm-Alice" is both a group channel's own name and the DM's label.
+        // "Alice" is both a group channel's own name and the DM's label.
         let mut app = AppState::new(
             SELF_ID,
             vec![
                 "general".to_string(),
-                "dm-Alice".to_string(),
+                "Alice".to_string(),
                 "dm-07070707".to_string(),
             ],
             "general",
@@ -5877,10 +5976,10 @@ mod tests {
         app.record_dm_channel(PEER_ID, "dm-07070707".to_string());
         app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
 
-        let action = submit(&mut app, "/leave dm-Alice");
+        let action = submit(&mut app, "/leave Alice");
 
         match action.expect("an exact name should win") {
-            InputAction::Leave(channel) => assert_eq!(channel, "dm-Alice"),
+            InputAction::Leave(channel) => assert_eq!(channel, "Alice"),
             _ => panic!("expected InputAction::Leave"),
         }
     }
@@ -5903,7 +6002,7 @@ mod tests {
             (PEER_ID_2, "Alice".to_string()),
         ]));
 
-        let action = submit(&mut app, "/leave dm-Alice");
+        let action = submit(&mut app, "/leave Alice");
 
         assert!(action.is_none());
         let last = as_system(app.active().messages.back().unwrap());
@@ -5911,7 +6010,7 @@ mod tests {
     }
 
     #[test]
-    fn who_names_a_dm_by_its_label() {
+    fn who_names_a_dm_by_its_heading() {
         let mut app = app_with_dm("dm-07070707", PEER_ID);
         app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
         app.active = 1; // the DM tab
@@ -5920,6 +6019,146 @@ mod tests {
 
         assert!(action.is_none());
         let last = as_system(app.active().messages.back().unwrap());
-        assert_eq!(last, "no peers currently in #dm-Alice");
+        assert_eq!(last, "no peers currently in @Alice");
+    }
+
+    /// `general`, a `/msg` DM (`dm-Alice`), `project-x`, and a `/dm` chat
+    /// (`p2p-08080808`) -- joined in that order, so the two kinds are
+    /// interleaved -- with `general` active. The shape the navigation tests
+    /// below all start from.
+    fn app_with_interleaved_kinds() -> AppState {
+        let mut app = AppState::new(
+            SELF_ID,
+            vec![
+                "general".to_string(),
+                "dm-Alice".to_string(),
+                "project-x".to_string(),
+            ],
+            "general",
+        );
+        app.record_dm_channel(PEER_ID, "dm-Alice".to_string());
+        app.background_direct_channel(crate::direct::channel_name(&PEER_ID_2), PEER_ID_2);
+        app
+    }
+
+    #[test]
+    fn each_channel_kind_has_its_own_glyph() {
+        let glyphs = [
+            ChannelKind::Group.glyph(),
+            ChannelKind::GossipDm { peer: PEER_ID }.glyph(),
+            ChannelKind::Direct { peer: PEER_ID }.glyph(),
+        ];
+
+        assert_eq!(glyphs, ["#", "@", "⚡"]);
+    }
+
+    #[test]
+    fn a_channels_heading_is_its_label_behind_its_kind_glyph() {
+        let mut app = app_with_interleaved_kinds();
+        app.load_contacts(HashMap::from([
+            (PEER_ID, "Alice".to_string()),
+            (PEER_ID_2, "Bob".to_string()),
+        ]));
+
+        assert_eq!(app.channel_heading("general"), "#general");
+        assert_eq!(app.channel_heading("dm-Alice"), "@Alice");
+        assert_eq!(app.channel_heading("p2p-08080808"), "⚡Bob");
+    }
+
+    #[test]
+    fn nav_sections_split_group_channels_from_conversations_in_join_order() {
+        let app = app_with_interleaved_kinds();
+
+        let sections = app.nav_sections();
+
+        assert_eq!(sections.channels, vec![0, 2], "general and project-x");
+        assert_eq!(sections.people, vec![1, 3], "the DM and the /dm chat");
+    }
+
+    #[test]
+    fn nav_sections_of_only_group_channels_has_no_people() {
+        let sections = multi_channel_app().nav_sections();
+
+        assert_eq!(sections.channels, vec![0, 1]);
+        assert!(sections.people.is_empty());
+    }
+
+    #[test]
+    fn tab_walks_the_panel_top_to_bottom_and_wraps() {
+        let mut app = app_with_interleaved_kinds();
+        let mut visited = Vec::new();
+
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Tab));
+            visited.push(app.active().name.clone());
+        }
+
+        // Group channels first (general -> project-x), then conversations
+        // (dm-Alice -> the /dm chat): the order the panel draws them in,
+        // not the order they were joined in. Then back to the top.
+        assert_eq!(
+            visited,
+            ["project-x", "dm-Alice", "p2p-08080808", "general"]
+        );
+    }
+
+    #[test]
+    fn backtab_walks_the_panel_bottom_to_top_and_wraps() {
+        let mut app = app_with_interleaved_kinds();
+        let mut visited = Vec::new();
+
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::BackTab));
+            visited.push(app.active().name.clone());
+        }
+
+        assert_eq!(
+            visited,
+            ["p2p-08080808", "dm-Alice", "project-x", "general"]
+        );
+    }
+
+    #[test]
+    fn leave_accepts_a_channel_by_its_heading() {
+        let mut app = app_with_interleaved_kinds();
+        app.load_contacts(HashMap::from([
+            (PEER_ID, "Alice".to_string()),
+            (PEER_ID_2, "Bob".to_string()),
+        ]));
+
+        for (typed, expected) in [
+            ("#project-x", "project-x"),
+            ("@Alice", "dm-Alice"),
+            ("⚡Bob", "p2p-08080808"),
+        ] {
+            match submit(&mut app, &format!("/leave {typed}")) {
+                Some(InputAction::Leave(channel)) => assert_eq!(channel, expected, "{typed}"),
+                _ => panic!("expected InputAction::Leave for {typed}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_heading_tells_apart_a_dm_and_a_dm_chat_with_the_same_person() {
+        let raw = crate::direct::channel_name(&PEER_ID);
+        let mut app = app_with_dm("dm-Alice", PEER_ID);
+        app.background_direct_channel(raw.clone(), PEER_ID);
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+
+        // The bare label is shared, so on its own it can't say which one
+        // is meant...
+        assert!(submit(&mut app, "/leave Alice").is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("more than one channel"), "got: {last}");
+
+        // ...but each one's heading can.
+        match submit(&mut app, "/leave @Alice") {
+            Some(InputAction::Leave(channel)) => assert_eq!(channel, "dm-Alice"),
+            _ => panic!("expected InputAction::Leave for the DM"),
+        }
+        match submit(&mut app, "/leave ⚡Alice") {
+            Some(InputAction::Leave(channel)) => assert_eq!(channel, raw),
+            _ => panic!("expected InputAction::Leave for the /dm chat"),
+        }
     }
 }

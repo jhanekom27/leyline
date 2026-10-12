@@ -34,6 +34,20 @@ const SEPARATOR: &str = " │ ";
 /// message from growing the input box to swallow the whole terminal.
 const MAX_INPUT_VISIBLE_LINES: usize = 6;
 
+/// Width of the navigation panel on the left (`render_nav`), borders
+/// included.
+const NAV_WIDTH: u16 = 24;
+/// Terminal cells every channel's kind glyph is padded to, so all labels
+/// start in one column whichever kind they follow: the widest glyph (the
+/// point-to-point bolt, see `ChannelKind::glyph`) takes two.
+const NAV_GLYPH_WIDTH: usize = 2;
+/// Where a label starts within a navigation row: a leading space, the
+/// glyph column, and a separating space.
+const NAV_LABEL_OFFSET: usize = 1 + NAV_GLYPH_WIDTH + 1;
+/// Cells held back at a row's right edge for the unread marker (the `*`
+/// itself plus a blank before it), so a long label never runs into it.
+const NAV_MARKER_WIDTH: usize = 2;
+
 /// Short usage reminders for every slash command, shown in the sidebar's
 /// commands panel (`render_hints`) when `AppState::show_hints` is on.
 /// Kept in sync with the Commands table in README.md and `run_help`'s
@@ -73,7 +87,7 @@ const USER_PALETTE: [Color; 8] = [
 
 pub fn render(frame: &mut Frame, app: &AppState) {
     let [header, body, input] = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(input_box_height(&app.active().input)),
     ])
@@ -94,37 +108,11 @@ fn input_box_height(input: &str) -> u16 {
     lines.min(MAX_INPUT_VISIBLE_LINES) as u16 + 2
 }
 
+/// The one-row strip above the body: who you are (your full endpoint id,
+/// which a peer can paste into `/dm` to reach you directly) and, once a
+/// peer has been seen running a newer build, a standing update notice. The
+/// channel list lives in the navigation panel (`render_nav`).
 fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
-    let [tabs, identity] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
-
-    let mut spans = vec![Span::styled(
-        " leyline ",
-        Style::default().add_modifier(Modifier::BOLD),
-    )];
-    for (index, channel) in app.channels.iter().enumerate() {
-        let unread_marker = if channel.has_unread && index != app.active {
-            "*"
-        } else {
-            ""
-        };
-        let style = if index == app.active {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        spans.push(Span::styled(
-            format!(" #{}{unread_marker} ", app.channel_label(&channel.name)),
-            style,
-        ));
-    }
-
-    let tabs_line = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
-    frame.render_widget(tabs_line, tabs);
-
     let mut identity_spans = vec![
         Span::raw(" you: "),
         Span::styled(
@@ -146,15 +134,129 @@ fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
         ));
     }
     let identity_line = Paragraph::new(Line::from(identity_spans));
-    frame.render_widget(identity_line, identity);
+    frame.render_widget(identity_line, area);
 }
 
 fn render_body(frame: &mut Frame, area: Rect, app: &AppState) {
-    let [messages, sidebar] =
-        Layout::horizontal([Constraint::Min(20), Constraint::Length(22)]).areas(area);
+    let [nav, messages, sidebar] = Layout::horizontal([
+        Constraint::Length(NAV_WIDTH),
+        Constraint::Min(20),
+        Constraint::Length(22),
+    ])
+    .areas(area);
 
+    render_nav(frame, nav, app);
     render_messages(frame, messages, app);
     render_sidebar(frame, sidebar, app);
+}
+
+/// The left-hand navigation panel: every joined channel on its own row in
+/// one of two sections -- CHANNELS for group channels, PEOPLE for `/msg`
+/// DMs and `/dm` point-to-point chats (`AppState::nav_sections`) -- led by
+/// its kind's glyph (`ChannelKind::glyph`) and named by its current label
+/// (`AppState::channel_label`). The active channel's row is highlighted
+/// across the panel's width, and any other channel with unseen activity
+/// ends in a `*`. Both section headers are always drawn, even over an
+/// empty section, so the panel's shape doesn't jump as conversations come
+/// and go.
+///
+/// When the rows outnumber the panel's height it scrolls to keep the
+/// active row in view (`nav_scroll_offset`), with a thumb on its right
+/// border (`render_scroll_indicator`).
+fn render_nav(frame: &mut Frame, area: Rect, app: &AppState) {
+    let block = Block::bordered()
+        .title("leyline")
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+    let visible_rows = (inner.height as usize).max(1);
+
+    let sections = app.nav_sections();
+    let mut rows = Vec::new();
+    let mut active_row = 0;
+    for (title, members) in [
+        ("CHANNELS", &sections.channels),
+        ("PEOPLE", &sections.people),
+    ] {
+        rows.push(nav_section_header(title));
+        for &index in members {
+            if index == app.active {
+                active_row = rows.len();
+            }
+            rows.push(nav_entry(app, index, inner.width as usize));
+        }
+    }
+
+    let total = rows.len();
+    let start = nav_scroll_offset(total, visible_rows, active_row);
+    let items: Vec<ListItem> = rows.into_iter().skip(start).take(visible_rows).collect();
+    frame.render_widget(List::new(items).block(block), area);
+    render_scroll_indicator(frame, area, start, total, visible_rows);
+}
+
+/// A section title row (CHANNELS / PEOPLE), muted so the entries beneath
+/// it stand out.
+fn nav_section_header(title: &str) -> ListItem<'static> {
+    ListItem::new(Line::from(Span::styled(
+        format!(" {title}"),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )))
+}
+
+/// One channel's row, `width` cells wide: a space, the kind glyph padded
+/// to `NAV_GLYPH_WIDTH` cells (measured rather than assumed, since the
+/// point-to-point bolt is double-width), the label truncated to leave
+/// `NAV_MARKER_WIDTH` cells free, and -- right-aligned -- a `*` when the
+/// channel has unseen activity. The active channel is highlighted
+/// (black on cyan) across the whole row, and never gets a `*`: being on a
+/// channel is what clears its flag.
+fn nav_entry(app: &AppState, index: usize, width: usize) -> ListItem<'static> {
+    let channel = &app.channels[index];
+
+    let glyph = Span::raw(app.channel_kind(&channel.name).glyph());
+    let padding = " ".repeat(NAV_GLYPH_WIDTH.saturating_sub(glyph.width()) + 1);
+    let label = truncate_chars(
+        &app.channel_label(&channel.name),
+        width.saturating_sub(NAV_LABEL_OFFSET + NAV_MARKER_WIDTH),
+    );
+    let mut line = Line::from(vec![
+        Span::raw(" "),
+        glyph,
+        Span::raw(padding),
+        Span::raw(label),
+    ]);
+
+    if index == app.active {
+        return ListItem::new(line).style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    if channel.has_unread {
+        let gap = width.saturating_sub(line.width() + 1);
+        line.push_span(Span::raw(" ".repeat(gap)));
+        line.push_span(Span::styled(
+            "*",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    ListItem::new(line)
+}
+
+/// Index of the first of `total` navigation rows to draw in a window of
+/// `visible` rows, chosen so `active_row` stays in view: centered where
+/// there's room, held against the top or bottom otherwise. Everything
+/// starts at row 0 while it all fits.
+fn nav_scroll_offset(total: usize, visible: usize, active_row: usize) -> usize {
+    if total <= visible {
+        return 0;
+    }
+    active_row.saturating_sub(visible / 2).min(total - visible)
 }
 
 /// Splits the RHS column into the peers list and, when `show_hints` is
@@ -177,7 +279,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &AppState) {
 
 fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
     let channel = app.active();
-    let label = app.channel_label(&channel.name);
+    let heading = app.channel_heading(&channel.name);
     let visible_rows = area.height.saturating_sub(2).max(1) as usize; // minus borders
     let inner_width = (area.width as usize).saturating_sub(2).max(1); // minus borders
 
@@ -221,8 +323,8 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
         "pick a message to view its thread: ↑/↓ move · Enter confirm · Esc cancel".to_string()
     } else if let Some(thread) = &channel.thread {
         format!(
-            "#{} · thread from {}: {} ({}) · /thread or Esc to leave",
-            label,
+            "{} · thread from {}: {} ({}) · /thread or Esc to leave",
+            heading,
             app.display_name(&thread.origin.sender),
             reply_snippet(&thread.origin),
             thread.messages.len()
@@ -236,13 +338,13 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
                     ""
                 };
                 format!(
-                    "#{} · search '{}' ({}{status}) · /s to clear",
-                    label,
+                    "{} · search '{}' ({}{status}) · /s to clear",
+                    heading,
                     search.term,
                     search.messages.len()
                 )
             }
-            None => format!("#{} · {} peer(s)", label, channel.peers.len()),
+            None => format!("{} · {} peer(s)", heading, channel.peers.len()),
         }
     };
     let block = Block::bordered()
@@ -255,12 +357,13 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
     hyperlink::linkify(frame.buffer_mut(), inner);
 }
 
-/// Overlays a scroll-position thumb on the messages block's right border,
-/// so it's clear at a glance how far back you've scrolled and how much
-/// history is above. `start` is the same top-of-viewport row index used
-/// to slice the visible window above. Only drawn once the transcript
-/// actually overflows one screen (`total > visible_rows`) -- a
-/// full-height thumb on a short conversation would just be noise.
+/// Overlays a scroll-position thumb on a bordered block's right border --
+/// the messages pane's (how far back you've scrolled and how much history
+/// is above) and the navigation panel's (how much of the channel list is
+/// out of view). `start` is the same top-of-viewport row index the caller
+/// used to slice the visible window. Only drawn once the content actually
+/// overflows one screen (`total > visible_rows`) -- a full-height thumb on
+/// a short list would just be noise.
 fn render_scroll_indicator(
     frame: &mut Frame,
     area: Rect,
@@ -1371,33 +1474,104 @@ mod tests {
 
     use std::collections::HashMap;
 
-    /// Renders `app` into an off-screen terminal and returns the text of
-    /// every screen row, so a test can assert on what a user would
-    /// actually see rather than on the state that drives it.
-    fn render_to_rows(app: &AppState) -> Vec<String> {
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
-            .expect("a test backend never fails");
+    use ratatui::buffer::Buffer;
+
+    /// Renders `app` into an off-screen terminal of `width` x `height`
+    /// cells and returns what was drawn, so a test can assert on what a
+    /// user would actually see rather than on the state that drives it.
+    fn render_to_buffer(app: &AppState, width: u16, height: u16) -> Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("a test backend never fails");
         terminal
             .draw(|frame| render(frame, app))
             .expect("drawing to a test backend never fails");
-        let buffer = terminal.backend().buffer();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The symbols of `buffer`'s row `y` from column `x` for `width`
+    /// cells, one per cell -- so a test can check *which column* something
+    /// landed in.
+    fn cells(buffer: &Buffer, y: u16, x: u16, width: u16) -> String {
+        (x..x + width).map(|x| buffer[(x, y)].symbol()).collect()
+    }
+
+    /// The first `width` columns of `buffer`'s row `y` as a user reads
+    /// them: the blank cell a double-width glyph (the point-to-point bolt)
+    /// leaves behind it in the buffer isn't a column of its own on screen,
+    /// so it's left out.
+    fn visible_row(buffer: &Buffer, y: u16, width: u16) -> String {
+        let mut text = String::new();
+        let mut hidden = 0;
+        for x in 0..width {
+            if hidden > 0 {
+                hidden -= 1;
+                continue;
+            }
+            let symbol = buffer[(x, y)].symbol();
+            hidden = Span::raw(symbol).width().saturating_sub(1);
+            text.push_str(symbol);
+        }
+        text
+    }
+
+    /// The text of every screen row of a 100x20 render of `app`.
+    fn render_to_rows(app: &AppState) -> Vec<String> {
+        let buffer = render_to_buffer(app, 100, 20);
         (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
+            .map(|y| visible_row(&buffer, y, buffer.area.width))
             .collect()
     }
 
-    /// An app with `general` active plus a `/msg` DM tab and a `/dm`
-    /// point-to-point tab for the same peer, both stored under hex-prefix
-    /// names -- as they would have been named before the peer was.
-    fn app_with_both_dm_kinds() -> AppState {
+    /// Just the navigation panel's part of each row of `buffer` -- the
+    /// message pane's title right beside it repeats channel names.
+    fn nav_rows(buffer: &Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| visible_row(buffer, y, NAV_WIDTH))
+            .collect()
+    }
+
+    /// Where a navigation row's glyph sits: past the border and the
+    /// leading space.
+    const NAV_GLYPH_X: u16 = 2;
+    /// Where a navigation row's label starts, whichever glyph precedes it.
+    const NAV_LABEL_X: u16 = NAV_GLYPH_X + NAV_GLYPH_WIDTH as u16 + 1;
+    /// Where a navigation row's unread marker sits: the last cell before
+    /// the right border.
+    const NAV_MARKER_X: u16 = NAV_WIDTH - 2;
+
+    /// The screen row of the navigation entry with `glyph` in the glyph
+    /// column and `label` in the label column, panicking with the panel's
+    /// text if there's none.
+    fn nav_row(buffer: &Buffer, glyph: &str, label: &str) -> u16 {
+        let label_width = label.chars().count() as u16;
+        (0..buffer.area.height)
+            .find(|&y| {
+                cells(buffer, y, NAV_GLYPH_X, 1) == glyph
+                    && cells(buffer, y, NAV_LABEL_X, label_width) == label
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no entry {glyph}{label} in the panel:\n{}",
+                    nav_rows(buffer).join("\n")
+                )
+            })
+    }
+
+    /// An app with `general` active, then -- joined in this order, so the
+    /// two kinds are interleaved -- a `/msg` DM, `project-x`, and a `/dm`
+    /// point-to-point chat. The DM and the chat are with one peer and both
+    /// stored under hex-prefix names, as they'd have been named before the
+    /// peer was.
+    fn app_with_every_kind() -> AppState {
         let peer = [7; 32];
         let mut app = AppState::new(
             [9; 32],
-            vec!["general".to_string(), "dm-07070707".to_string()],
+            vec![
+                "general".to_string(),
+                "dm-07070707".to_string(),
+                "project-x".to_string(),
+            ],
             "general",
         );
         app.record_dm_channel(peer, "dm-07070707".to_string());
@@ -1405,49 +1579,300 @@ mod tests {
         app
     }
 
+    /// `count` group channels named `channel-00`, `channel-01`, ... with
+    /// the one at `active` selected -- more than a short terminal's panel
+    /// has room for.
+    fn app_with_many_channels(count: usize, active: usize) -> AppState {
+        let names: Vec<String> = (0..count).map(|i| format!("channel-{i:02}")).collect();
+        let active_name = names[active].clone();
+        AppState::new([9; 32], names, &active_name)
+    }
+
     #[test]
-    fn the_tab_bar_shows_a_peers_current_alias_not_the_stored_channel_name() {
-        let mut app = app_with_both_dm_kinds();
-        app.load_contacts(HashMap::from([([7; 32], "Alice".to_string())]));
+    fn the_top_row_is_the_identity_line_not_a_tab_bar() {
+        let app = app_with_every_kind();
 
-        let tabs = &render_to_rows(&app)[0];
+        let rows = render_to_rows(&app);
 
-        assert!(tabs.contains("#dm-Alice"), "got: {tabs}");
-        assert!(tabs.contains("#p2p-Alice"), "got: {tabs}");
-        assert!(!tabs.contains("07070707"), "stored name leaked: {tabs}");
+        let identity = format!("you: {}", hex_id(&[9; 32]));
+        assert!(rows[0].contains(&identity), "got: {}", rows[0]);
         assert!(
-            tabs.contains("#general"),
-            "a group channel keeps its stored name: {tabs}"
+            !rows[0].contains("general"),
+            "channel names belong in the panel, got: {}",
+            rows[0]
+        );
+        assert!(
+            rows[1].starts_with("╭leyline"),
+            "the panel starts right under the identity line, got: {}",
+            rows[1]
         );
     }
 
     #[test]
-    fn the_tab_bar_shows_the_hex_prefix_until_a_peer_is_named() {
-        let app = app_with_both_dm_kinds();
-
-        let tabs = &render_to_rows(&app)[0];
-
-        assert!(tabs.contains("#dm-07070707"), "got: {tabs}");
-        assert!(tabs.contains("#p2p-07070707"), "got: {tabs}");
-    }
-
-    #[test]
-    fn the_pane_title_shows_a_peers_current_alias() {
-        let mut app = app_with_both_dm_kinds();
+    fn the_nav_panel_lists_channels_then_people_under_their_own_headers() {
+        let mut app = app_with_every_kind();
         app.load_contacts(HashMap::from([([7; 32], "Alice".to_string())]));
-        app.active = 1; // the /msg DM tab
 
-        let rows = render_to_rows(&app);
+        let rows = nav_rows(&render_to_buffer(&app, 100, 20));
 
+        let row_with = |needle: &str| {
+            rows.iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("no row contains {needle:?}: {rows:#?}"))
+        };
+        // Group channels first, then the conversations, each in join order
+        // -- though the DM was joined before `project-x`.
+        let order = [
+            row_with("CHANNELS"),
+            row_with("general"),
+            row_with("project-x"),
+            row_with("PEOPLE"),
+            row_with("@"),
+            row_with("⚡"),
+        ];
         assert!(
-            rows.iter().any(|row| row.contains("#dm-Alice · 0 peer(s)")),
+            order.windows(2).all(|pair| pair[0] < pair[1]),
             "got: {rows:#?}"
         );
     }
 
     #[test]
+    fn both_sections_are_drawn_even_when_there_are_no_conversations() {
+        let app = AppState::new([9; 32], vec!["general".to_string()], "general");
+
+        let panel = nav_rows(&render_to_buffer(&app, 100, 20)).join("\n");
+
+        assert!(
+            panel.contains("CHANNELS") && panel.contains("PEOPLE"),
+            "got:\n{panel}"
+        );
+    }
+
+    #[test]
+    fn each_entry_leads_with_its_kinds_glyph_and_labels_line_up() {
+        let mut app = app_with_every_kind();
+        app.load_contacts(HashMap::from([([7; 32], "Alice".to_string())]));
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        // `nav_row` wants the glyph in its column and the label in its own,
+        // which is the same column for the double-width bolt as for the
+        // single-width glyphs.
+        nav_row(&buffer, "#", "general");
+        nav_row(&buffer, "#", "project-x");
+        nav_row(&buffer, "@", "Alice");
+        nav_row(&buffer, "⚡", "Alice");
+    }
+
+    #[test]
+    fn the_nav_panel_shows_a_peers_current_alias_not_the_stored_channel_name() {
+        let mut app = app_with_every_kind();
+        app.load_contacts(HashMap::from([([7; 32], "Alice".to_string())]));
+
+        let panel = nav_rows(&render_to_buffer(&app, 100, 20)).join("\n");
+
+        assert!(!panel.contains("07070707"), "stored name leaked:\n{panel}");
+    }
+
+    #[test]
+    fn the_nav_panel_shows_the_hex_prefix_until_a_peer_is_named() {
+        let app = app_with_every_kind();
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        nav_row(&buffer, "@", "07070707");
+        nav_row(&buffer, "⚡", "07070707");
+    }
+
+    #[test]
+    fn the_active_channel_is_highlighted_across_its_whole_row() {
+        let mut app = app_with_every_kind();
+        app.active = 2; // project-x
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        let active = nav_row(&buffer, "#", "project-x");
+        let other = nav_row(&buffer, "#", "general");
+        for x in 1..NAV_WIDTH - 1 {
+            assert_eq!(
+                buffer[(x, active)].bg,
+                Color::Cyan,
+                "column {x} of the active row"
+            );
+            assert_ne!(
+                buffer[(x, other)].bg,
+                Color::Cyan,
+                "column {x} of another row"
+            );
+        }
+        assert_eq!(buffer[(NAV_LABEL_X, active)].fg, Color::Black);
+        assert!(
+            buffer[(NAV_LABEL_X, active)]
+                .modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn a_highlighted_conversation_row_is_highlighted_to_its_edges_too() {
+        let mut app = app_with_every_kind();
+        app.active = 3; // the /dm chat, behind the double-width bolt
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        // The blank cell the bolt leaves behind it carries no style of its
+        // own -- the terminal paints the bolt's background across both
+        // columns -- so check the cells either side of it.
+        let row = nav_row(&buffer, "⚡", "07070707");
+        assert_eq!(buffer[(1, row)].bg, Color::Cyan);
+        assert_eq!(buffer[(NAV_LABEL_X, row)].bg, Color::Cyan);
+        assert_eq!(buffer[(NAV_MARKER_X, row)].bg, Color::Cyan);
+    }
+
+    #[test]
+    fn an_unread_channel_ends_in_a_marker_but_the_active_one_never_does() {
+        let mut app = app_with_every_kind();
+        app.channels[2].has_unread = true; // project-x, inactive
+        app.channels[0].has_unread = true; // general, active: the flag is moot
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        let unread = nav_row(&buffer, "#", "project-x");
+        let active = nav_row(&buffer, "#", "general");
+        let read = nav_row(&buffer, "@", "07070707");
+        assert_eq!(buffer[(NAV_MARKER_X, unread)].symbol(), "*");
+        assert_eq!(buffer[(NAV_MARKER_X, active)].symbol(), " ");
+        assert_eq!(buffer[(NAV_MARKER_X, read)].symbol(), " ");
+    }
+
+    #[test]
+    fn a_long_label_is_cut_short_of_the_unread_marker() {
+        let long = "a-channel-name-far-too-long-for-the-panel";
+        let mut app = AppState::new(
+            [9; 32],
+            vec!["general".to_string(), long.to_string()],
+            "general",
+        );
+        app.channels[1].has_unread = true;
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        // 15 characters and an ellipsis, a blank, then the marker.
+        let row = nav_row(&buffer, "#", "a-channel-name-…");
+        assert_eq!(buffer[(NAV_MARKER_X - 1, row)].symbol(), " ");
+        assert_eq!(buffer[(NAV_MARKER_X, row)].symbol(), "*");
+    }
+
+    #[test]
+    fn the_nav_panel_scrolls_down_to_keep_the_last_channel_in_view() {
+        // A 12-row terminal leaves the panel 6 rows of room (a header row,
+        // 3 input-box rows and 2 borders go to everything else), against
+        // 14 rows of content: 12 channels and 2 section headers.
+        let app = app_with_many_channels(12, 11);
+
+        let panel = nav_rows(&render_to_buffer(&app, 100, 12)).join("\n");
+
+        assert!(panel.contains("channel-11"), "got:\n{panel}");
+        assert!(!panel.contains("channel-00"), "got:\n{panel}");
+    }
+
+    #[test]
+    fn the_nav_panel_scrolls_back_up_to_keep_the_first_channel_in_view() {
+        let app = app_with_many_channels(12, 0);
+
+        let panel = nav_rows(&render_to_buffer(&app, 100, 12)).join("\n");
+
+        assert!(panel.contains("channel-00"), "got:\n{panel}");
+        assert!(!panel.contains("channel-11"), "got:\n{panel}");
+    }
+
+    #[test]
+    fn the_nav_panel_keeps_a_middle_channel_in_view_with_neighbours_either_side() {
+        let app = app_with_many_channels(12, 6);
+
+        let panel = nav_rows(&render_to_buffer(&app, 100, 12)).join("\n");
+
+        for channel in ["channel-05", "channel-06", "channel-07"] {
+            assert!(panel.contains(channel), "{channel} missing:\n{panel}");
+        }
+        assert!(!panel.contains("channel-00"), "got:\n{panel}");
+        assert!(!panel.contains("channel-11"), "got:\n{panel}");
+    }
+
+    #[test]
+    fn the_nav_panel_draws_a_scroll_thumb_only_when_it_overflows() {
+        let has_thumb = |app: &AppState, height: u16| {
+            let buffer = render_to_buffer(app, 100, height);
+            (0..height).any(|y| buffer[(NAV_WIDTH - 1, y)].symbol() == "▐")
+        };
+
+        assert!(has_thumb(&app_with_many_channels(12, 0), 12));
+        assert!(!has_thumb(&app_with_many_channels(2, 0), 20));
+    }
+
+    #[test]
+    fn nav_scroll_offset_is_zero_while_everything_fits() {
+        assert_eq!(nav_scroll_offset(5, 10, 4), 0);
+        assert_eq!(nav_scroll_offset(10, 10, 9), 0);
+    }
+
+    #[test]
+    fn nav_scroll_offset_centers_the_active_row_where_there_is_room() {
+        // Rows 8..13, with the active row 10 in the middle.
+        assert_eq!(nav_scroll_offset(20, 5, 10), 8);
+    }
+
+    #[test]
+    fn nav_scroll_offset_holds_the_window_against_either_end() {
+        assert_eq!(nav_scroll_offset(20, 5, 1), 0);
+        assert_eq!(nav_scroll_offset(20, 5, 19), 15);
+    }
+
+    #[test]
+    fn nav_scroll_offset_always_keeps_the_active_row_inside_the_rows() {
+        for total in 1..=30 {
+            for visible in 1..=10 {
+                for active_row in 0..total {
+                    let start = nav_scroll_offset(total, visible, active_row);
+                    let context = format!(
+                        "total {total}, visible {visible}, active {active_row}: window starts at {start}"
+                    );
+                    assert!(
+                        start <= active_row && active_row < start + visible,
+                        "active row out of view: {context}"
+                    );
+                    assert!(
+                        start + visible <= total.max(visible),
+                        "window runs past the last row: {context}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_pane_title_names_a_peer_by_its_current_alias_behind_the_kinds_glyph() {
+        let mut app = app_with_every_kind();
+        app.load_contacts(HashMap::from([([7; 32], "Alice".to_string())]));
+
+        app.active = 1; // the /msg DM
+        let dm = render_to_rows(&app);
+        app.active = 3; // the /dm chat
+        let direct = render_to_rows(&app);
+
+        assert!(
+            dm.iter().any(|row| row.contains("@Alice · 0 peer(s)")),
+            "got: {dm:#?}"
+        );
+        assert!(
+            direct.iter().any(|row| row.contains("⚡Alice · 0 peer(s)")),
+            "got: {direct:#?}"
+        );
+    }
+
+    #[test]
     fn the_pane_title_shows_a_group_channel_by_its_stored_name() {
-        let mut app = app_with_both_dm_kinds();
+        let mut app = app_with_every_kind();
         app.load_contacts(HashMap::from([([7; 32], "Alice".to_string())]));
 
         let rows = render_to_rows(&app); // `general` is active
