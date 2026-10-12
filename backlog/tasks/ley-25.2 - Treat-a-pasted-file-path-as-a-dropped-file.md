@@ -1,11 +1,11 @@
 ---
 id: LEY-25.2
 title: Treat a pasted file path as a dropped file
-status: In Progress
+status: Done
 assignee:
   - '@Jurgen'
 created_date: '2026-10-12 08:28'
-updated_date: '2026-10-12 14:54'
+updated_date: '2026-10-12 15:04'
 labels:
   - files
   - ux
@@ -27,7 +27,7 @@ Dragging a file onto the terminal makes the terminal paste its path, and leyline
 - [x] #1 A bracketed paste made up only of existing file paths (backslash-escaped, quoted, or `file://` URIs; separated by spaces or newlines) stages those files instead of inserting text
 - [x] #2 A paste that is not entirely existing paths, including ordinary text that merely mentions a path, is inserted into the message box unchanged
 - [x] #3 Several dropped files are staged together; any path that is missing or unreadable is reported and skipped
-- [ ] #4 Dropping a file onto leyline works in Warp and in at least one other terminal on macOS or Linux (verified manually)
+- [x] #4 Dropping a file onto leyline works in Warp and in at least one other terminal on macOS or Linux (verified manually)
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -61,4 +61,12 @@ First real drag, in Warp: the path landed in the message box as text and nothing
 Validation of the Warp fix: cargo test 637 passed (7 new, in term_events.rs), cargo clippy --all-targets and cargo fmt --check clean. PTY run of the real binary under an isolated HOME, screen read with pyte (`uv run --with pyte`), Warp's exact bytes in one write: 14 of 14 scenarios pass on the fixed build. A Warp-style drop stages the file and leaves the box empty; a drop then a typed caption becomes one message; two files stage together; a drop with text already in the box stages and keeps that text; a bracketed paste still stages. Left as text: a burst of ordinary text, a sentence naming a real file, a missing path, a real path typed by hand one key at a time, and a drop while the Ctrl+P switcher is open. Characters followed by Enter in one write keep their order. A single key echoes in about 7 ms (max 10), including right after a burst, so the stream never misses a wake-up. 60 of 60 repeated drops staged (and logged), and single-write drops of 14, 40 and 100 files (1.8, 5.3 and 13.2 KB) each arrived whole and staged. The same Warp-style scenario fails against the pre-fix build.
 
 Limits: this leans on a drop arriving in one piece (it did at every size tried on macOS; a terminal that trickled one out would get typed text, as before), and a path pasted as text into a terminal that does not bracket pastes now stages too, the same call a bracketed paste of it already got. AC 4 stays unchecked: it needs a real drag in Warp (now expected to stage) and in one more terminal, a GUI action I cannot perform, and the Warp source above was read from master rather than the installed version.
+
+AC 4 verified manually by Jurgen on macOS after the term_events fix: dragging a file onto leyline stages it in Warp and in Ghostty. cargo test (637 passed) re-run on the committed tree with a clean working tree.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Dragging a file onto leyline now stages it for review and a caption instead of typing its path into the message box. files::dropped_files recognizes a paste made up of nothing but existing files (backslash-escaped, quoted, file:// URIs, newline-joined or raw), all or nothing, and main.rs's handle_paste stages them on the active channel like a Ctrl+V of a copied file; AppState::is_composing keeps a drop plain text while the switcher, a pick or a pairing confirmation owns input. Warp types a drop out as plain keys instead of pasting it, so term_events::TermEvents turns keys that arrive together and spell nothing but existing files into the one paste a bracketing terminal would have sent. Verified with 637 passing tests and clean clippy, the real binary driven through a PTY with Warp's exact bytes (14 scenarios, including repeated drops, ordinary text staying text and no input lag), and by hand: a real drag stages the file in Warp and in Ghostty.
+<!-- SECTION:FINAL_SUMMARY:END -->
