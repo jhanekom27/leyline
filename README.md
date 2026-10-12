@@ -100,7 +100,8 @@ conversations (`@` for a `/msg` DM, `⚡` for a `/dm` point-to-point chat),
 each in the order you joined them. The active one is highlighted, and a `*`
 marks another with unread messages; the panel scrolls once the list is
 taller than the terminal. Switch between channels with `Tab` / `Shift+Tab`,
-which step down / up the panel and wrap around.
+which step down / up the panel and wrap around, or press `Ctrl+P` to jump
+straight to one by typing part of its name.
 
 Your identity now persists in your OS config directory, keyed by your `$HOME`.
 Chat history persists the same way in your OS data directory -- one log
@@ -148,7 +149,8 @@ HOME=/tmp/leyline-b CARGO_HOME="$REAL_CARGO_HOME" cargo run
 | `Ctrl+T` | Pick a message to view its reply chain in isolation -- `Up`/`Down` move the highlight, `Enter` confirms, `Esc` cancels |
 | `Up` / `Down` | Scroll the message history (or move the highlight while picking a reply or thread target, see `Ctrl+R`/`Ctrl+T`) |
 | `Tab` / `Shift+Tab` | Switch to the next / previous channel in the left-hand panel (group channels first, then conversations), wrapping around |
-| `Esc` / `Ctrl+C` | Cancel an in-progress reply or thread pick, or an armed reply, first, if any; otherwise leave an open thread view if one is active; otherwise quit |
+| `Ctrl+P` | Jump to a channel or conversation by name -- type to narrow the list to names containing what you typed (case-insensitive), `Up`/`Down` move the highlight, `Enter` switches to it, `Esc` cancels and leaves you where you were |
+| `Esc` / `Ctrl+C` | Close the `Ctrl+P` jump-to list, or cancel an in-progress reply or thread pick, or an armed reply, first, if any; otherwise leave an open thread view if one is active; otherwise quit |
 
 ## Commands
 

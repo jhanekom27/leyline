@@ -78,6 +78,23 @@ pub struct NavSections {
     pub people: Vec<usize>,
 }
 
+/// The jump-to-conversation overlay opened with `Ctrl+P` -- see
+/// `AppState::switching`. Only the query and the highlight are state:
+/// which channels match is always derived from the live channel list
+/// (`AppState::switcher_matches`), so the list itself can never go stale.
+#[derive(Debug, Default)]
+pub struct Switcher {
+    /// What's been typed so far, matched case-insensitively against each
+    /// channel's label.
+    pub query: String,
+    /// Position of the highlighted entry among the current matches. Reset
+    /// to the first match whenever the query changes
+    /// (`AppState::edit_switcher_query`) and clamped on every read
+    /// (`AppState::switcher_highlight`), since the matches can change under
+    /// an open overlay -- a peer gets renamed, a channel joins.
+    selected: usize,
+}
+
 /// One joined channel's transcript, presence, per-channel scroll state,
 /// and in-progress input draft.
 pub struct Channel {
@@ -570,6 +587,11 @@ pub struct AppState {
     /// alongside `picking_reply`, before normal typing/editing, to
     /// dispatch into `handle_thread_picking_key`.
     pub picking_thread: Option<u64>,
+    /// The open jump-to-conversation overlay (`Ctrl+P`, see
+    /// `start_switcher`), if any. `None` when closed -- `handle_key`
+    /// checks this alongside `picking_reply`/`picking_thread`, before
+    /// normal typing/editing, to dispatch into `handle_switcher_key`.
+    pub switching: Option<Switcher>,
     /// The armed reply target for the next sent message (confirmed via
     /// `Enter` while picking, or `/reply`), by message id. Attached to the
     /// next `Send`-ed `ChatMessage` and cleared on send (`send_text`), on
@@ -632,6 +654,7 @@ impl AppState {
             direct_channels: HashMap::new(),
             picking_reply: None,
             picking_thread: None,
+            switching: None,
             replying_to: None,
             pending_redeem: None,
             restart_with_ticket: None,
@@ -1003,6 +1026,10 @@ impl AppState {
             self.handle_thread_picking_key(key);
             return None;
         }
+        if self.switching.is_some() {
+            self.handle_switcher_key(key);
+            return None;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             // Backs out one level at a time: cancel an armed reply first
@@ -1020,6 +1047,7 @@ impl AppState {
             KeyCode::Char('c') if ctrl => self.should_quit = true,
             KeyCode::Char('r') if ctrl => self.start_reply_pick(),
             KeyCode::Char('t') if ctrl => self.start_thread_pick(),
+            KeyCode::Char('p') if ctrl => self.start_switcher(),
             KeyCode::Char('a') if ctrl => self.active_mut().move_home(),
             KeyCode::Char('e') if ctrl => self.active_mut().move_end(),
             KeyCode::Char('u') if ctrl => self.active_mut().delete_to_start(),
@@ -1145,6 +1173,112 @@ impl AppState {
             }
             KeyCode::Esc => self.picking_thread = None,
             _ => {}
+        }
+    }
+
+    /// Handles `Ctrl+P`: opens the jump-to-conversation overlay with an
+    /// empty query, listing every channel -- type to filter, move with
+    /// `Up`/`Down`, confirm with `Enter`, cancel with `Esc` (see
+    /// `handle_switcher_key`). `Ctrl+K`, the usual quick-switch key, is
+    /// already `delete_to_end`, so this deliberately takes `Ctrl+P`.
+    fn start_switcher(&mut self) {
+        self.switching = Some(Switcher::default());
+    }
+
+    /// Handles a keypress while the switcher is open: typing and
+    /// `Backspace` edit the query, `Up`/`Down` move the highlight, `Enter`
+    /// switches to it (`confirm_switcher`), `Esc` closes without
+    /// switching. `Ctrl+C` still force-quits, since `Esc` no longer does
+    /// while the overlay is open. Every other key is ignored -- like the
+    /// pick modes above this is a dedicated mode, so a stray keystroke
+    /// can't leak into the input box.
+    fn handle_switcher_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('c') if ctrl => self.should_quit = true,
+            KeyCode::Esc => self.switching = None,
+            KeyCode::Enter => self.confirm_switcher(),
+            KeyCode::Up => self.move_switcher(-1),
+            KeyCode::Down => self.move_switcher(1),
+            KeyCode::Backspace => self.edit_switcher_query(|query| {
+                query.pop();
+            }),
+            KeyCode::Char(c) if !ctrl => self.edit_switcher_query(|query| query.push(c)),
+            _ => {}
+        }
+    }
+
+    /// Applies `edit` to the open switcher's query and puts the highlight
+    /// back on the first match. The one place the query changes, so a typed
+    /// character, a `Backspace` and a paste can't disagree about where the
+    /// highlight lands. A no-op if the switcher isn't open.
+    fn edit_switcher_query(&mut self, edit: impl FnOnce(&mut String)) {
+        if let Some(switcher) = &mut self.switching {
+            edit(&mut switcher.query);
+            switcher.selected = 0;
+        }
+    }
+
+    /// The channels the open switcher lists, as indices into `channels`:
+    /// those whose label (`channel_label` -- what's on screen, never the
+    /// stored name) contains the typed text, ignoring case, in the order
+    /// the navigation panel draws them (`nav_order`), so the list reads
+    /// like the panel and steps like `Tab`. An empty query lists every
+    /// channel; nothing is listed while the switcher is closed.
+    pub fn switcher_matches(&self) -> Vec<usize> {
+        let Some(switcher) = &self.switching else {
+            return Vec::new();
+        };
+        let query = switcher.query.to_lowercase();
+        self.nav_order()
+            .into_iter()
+            .filter(|&index| {
+                self.channel_label(&self.channels[index].name)
+                    .to_lowercase()
+                    .contains(&query)
+            })
+            .collect()
+    }
+
+    /// The channel (an index into `channels`) `Enter` would switch to: the
+    /// highlighted match, or `None` while nothing matches or the switcher
+    /// is closed. The stored position is clamped here, and only here --
+    /// matches can change under an open overlay (a peer gets renamed, a
+    /// channel joins), and a position left over from before must never
+    /// point past the end.
+    pub fn switcher_highlight(&self) -> Option<usize> {
+        let switcher = self.switching.as_ref()?;
+        let matches = self.switcher_matches();
+        let last = matches.len().checked_sub(1)?;
+        Some(matches[switcher.selected.min(last)])
+    }
+
+    /// Moves the highlight by `delta` among the current matches, clamping
+    /// at both ends rather than wrapping, like `move_pick` does for
+    /// messages. A no-op while nothing matches.
+    fn move_switcher(&mut self, delta: isize) {
+        let Some(last) = self.switcher_matches().len().checked_sub(1) else {
+            return;
+        };
+        if let Some(switcher) = &mut self.switching {
+            let current = switcher.selected.min(last) as isize;
+            switcher.selected = (current + delta).clamp(0, last as isize) as usize;
+        }
+    }
+
+    /// Switches to the highlighted match and closes the switcher. Does
+    /// nothing while nothing matches, leaving the overlay open to edit.
+    /// Choosing the channel you're already on just closes it: a real switch
+    /// clears an armed reply (`finish_activating_channel`), and staying put
+    /// mustn't discard one for no reason.
+    fn confirm_switcher(&mut self) {
+        let Some(index) = self.switcher_highlight() else {
+            return;
+        };
+        self.switching = None;
+        if index != self.active {
+            self.active = index;
+            self.finish_activating_channel();
         }
     }
 
@@ -1650,6 +1784,7 @@ impl AppState {
              Enter/Esc confirmation -- this replaces this device's identity and data) -- \
              /dm connects directly to a peer's endpoint id with no ticket or gossip channel, \
              unlike /msg -- keys: Tab/Shift+Tab switch channels, \
+             Ctrl+P jump to a channel (type to filter, \u{2191}/\u{2193} pick, Enter confirm), \
              Alt+Enter/Ctrl+J newline, Ctrl+V paste, Ctrl+R reply (\u{2191}/\u{2193} pick, \
              Enter confirm), Ctrl+T thread (\u{2191}/\u{2193} pick, Enter confirm), \
              Up/Down scroll, Esc/Ctrl+C quit",
@@ -2522,6 +2657,15 @@ impl AppState {
     /// `/command`. `paste_text` never submits, so a pasted newline just
     /// becomes a real line break (`insert_newline`) instead.
     pub fn paste_text(&mut self, text: &str) {
+        // An open switcher owns input: a paste filters it rather than
+        // landing, unseen, in the draft underneath. Its query is one line,
+        // so line breaks and other control characters are dropped.
+        if self.switching.is_some() {
+            self.edit_switcher_query(|query| {
+                query.extend(text.chars().filter(|c| !c.is_control()));
+            });
+            return;
+        }
         let channel = self.active_mut();
         let mut chars = text.chars().peekable();
         while let Some(c) = chars.next() {
@@ -6160,5 +6304,317 @@ mod tests {
             Some(InputAction::Leave(channel)) => assert_eq!(channel, raw),
             _ => panic!("expected InputAction::Leave for the /dm chat"),
         }
+    }
+
+    /// `app_with_interleaved_kinds` with its two peers named, so the labels
+    /// are `general`, `Alice` (a `/msg` DM), `project-x` and `Bob` (a `/dm`
+    /// chat): channel indices 0 to 3, but 0, 2, 1, 3 in the order the panel
+    /// draws them.
+    fn app_for_the_switcher() -> AppState {
+        let mut app = app_with_interleaved_kinds();
+        app.load_contacts(HashMap::from([
+            (PEER_ID, "Alice".to_string()),
+            (PEER_ID_2, "Bob".to_string()),
+        ]));
+        app
+    }
+
+    fn ctrl_p(app: &mut AppState) {
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    }
+
+    /// Types `text` one key at a time without pressing `Enter` -- into
+    /// whatever has the keyboard, the switcher's query once it's open.
+    fn type_text(app: &mut AppState, text: &str) {
+        for c in text.chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    fn switcher_query(app: &AppState) -> &str {
+        &app.switching.as_ref().expect("the switcher is open").query
+    }
+
+    #[test]
+    fn ctrl_p_opens_the_switcher_listing_every_channel_in_panel_order() {
+        let mut app = app_for_the_switcher();
+        assert!(app.switching.is_none());
+        assert!(
+            app.switcher_matches().is_empty(),
+            "nothing is listed while it is closed"
+        );
+
+        ctrl_p(&mut app);
+
+        assert!(app.switching.is_some());
+        assert_eq!(app.switcher_matches(), vec![0, 2, 1, 3]);
+    }
+
+    #[test]
+    fn typing_narrows_the_switcher_to_labels_containing_the_text_ignoring_case() {
+        let mut app = app_for_the_switcher();
+        ctrl_p(&mut app);
+
+        type_text(&mut app, "ECT"); // from the middle of "project-x"
+        assert_eq!(app.switcher_matches(), vec![2]);
+
+        type_text(&mut app, "z");
+        assert!(app.switcher_matches().is_empty());
+    }
+
+    #[test]
+    fn the_switcher_matches_the_label_not_the_stored_channel_name() {
+        let mut app = app_for_the_switcher();
+        ctrl_p(&mut app);
+
+        // `dm-Alice` and `p2p-08080808` are the stored names; what is shown
+        // for them is `Alice` and `Bob`.
+        type_text(&mut app, "dm-");
+        assert!(app.switcher_matches().is_empty());
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        type_text(&mut app, "p2p");
+        assert!(app.switcher_matches().is_empty());
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        type_text(&mut app, "ali");
+        assert_eq!(app.switcher_matches(), vec![1]);
+    }
+
+    #[test]
+    fn backspace_widens_the_switcher_again() {
+        let mut app = app_for_the_switcher();
+        ctrl_p(&mut app);
+        type_text(&mut app, "zz");
+        assert!(app.switcher_matches().is_empty());
+
+        app.handle_key(key(KeyCode::Backspace));
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.switcher_matches(), vec![0, 2, 1, 3]);
+
+        app.handle_key(key(KeyCode::Backspace)); // nothing left to delete
+        assert_eq!(switcher_query(&app), "");
+    }
+
+    #[test]
+    fn up_and_down_move_the_switcher_highlight_and_clamp_at_both_ends() {
+        let mut app = app_for_the_switcher();
+        ctrl_p(&mut app);
+        assert_eq!(app.switcher_highlight(), Some(0));
+
+        // Down walks the panel order: 0, 2, 1, 3 -- and stops at the end.
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Down));
+            seen.push(app.switcher_highlight());
+        }
+        assert_eq!(seen, [Some(2), Some(1), Some(3), Some(3)]);
+
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Up));
+            seen.push(app.switcher_highlight());
+        }
+        assert_eq!(seen, [Some(1), Some(2), Some(0), Some(0)]);
+    }
+
+    #[test]
+    fn editing_the_query_puts_the_switcher_highlight_back_on_the_first_match() {
+        let mut app = app_for_the_switcher();
+        ctrl_p(&mut app);
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.switcher_highlight(), Some(1));
+
+        type_text(&mut app, "o"); // project-x and Bob
+        assert_eq!(app.switcher_matches(), vec![2, 3]);
+        assert_eq!(app.switcher_highlight(), Some(2));
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.switcher_highlight(), Some(3));
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.switcher_highlight(), Some(0));
+    }
+
+    #[test]
+    fn enter_in_the_switcher_switches_to_the_highlighted_channel_and_closes_it() {
+        let mut app = app_for_the_switcher();
+        ctrl_p(&mut app);
+        type_text(&mut app, "bob");
+
+        let action = app.handle_key(key(KeyCode::Enter));
+
+        assert!(action.is_none());
+        assert_eq!(app.active().name, "p2p-08080808");
+        assert!(app.switching.is_none());
+    }
+
+    #[test]
+    fn the_arrow_keys_pick_which_match_enter_switches_to() {
+        let mut app = app_for_the_switcher();
+        ctrl_p(&mut app);
+
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.active().name, "dm-Alice");
+    }
+
+    #[test]
+    fn switching_through_the_switcher_clears_unread_and_an_armed_reply() {
+        let mut app = app_for_the_switcher();
+        app.channels[3].has_unread = true;
+        app.replying_to = Some(7);
+        ctrl_p(&mut app);
+        type_text(&mut app, "bob");
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(!app.active().has_unread);
+        assert!(app.replying_to.is_none());
+    }
+
+    #[test]
+    fn choosing_the_channel_you_are_already_on_just_closes_the_switcher() {
+        let mut app = app_for_the_switcher();
+        app.replying_to = Some(7);
+        ctrl_p(&mut app);
+        type_text(&mut app, "general");
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.active, 0);
+        assert!(app.switching.is_none());
+        assert_eq!(
+            app.replying_to,
+            Some(7),
+            "staying put must not discard an armed reply"
+        );
+    }
+
+    #[test]
+    fn enter_with_nothing_matching_keeps_the_switcher_open() {
+        let mut app = app_for_the_switcher();
+        ctrl_p(&mut app);
+        type_text(&mut app, "zzz");
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.switching.is_some());
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn esc_closes_the_switcher_without_switching_or_quitting() {
+        let mut app = app_for_the_switcher();
+        app.replying_to = Some(7);
+        ctrl_p(&mut app);
+        app.handle_key(key(KeyCode::Down)); // highlight another channel
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.switching.is_none());
+        assert_eq!(app.active, 0, "cancelling leaves the active channel alone");
+        assert!(!app.should_quit);
+        assert_eq!(app.replying_to, Some(7));
+    }
+
+    #[test]
+    fn ctrl_c_in_the_switcher_still_quits() {
+        let mut app = app_for_the_switcher();
+        ctrl_p(&mut app);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn keys_typed_into_the_switcher_never_reach_the_input_draft() {
+        let mut app = app_for_the_switcher();
+        type_text(&mut app, "draft");
+        ctrl_p(&mut app);
+
+        type_text(&mut app, "bob");
+        app.handle_key(key(KeyCode::Backspace));
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Esc));
+
+        assert_eq!(app.active().input, "draft");
+        assert_eq!(app.active().cursor, 5);
+    }
+
+    #[test]
+    fn control_chords_do_not_type_into_the_switcher_query() {
+        let mut app = app_for_the_switcher();
+        ctrl_p(&mut app);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        ctrl_p(&mut app); // a second Ctrl+P is just another chord to ignore
+
+        assert_eq!(switcher_query(&app), "");
+        assert!(app.switching.is_some());
+    }
+
+    #[test]
+    fn a_paste_filters_the_switcher_instead_of_the_draft() {
+        let mut app = app_for_the_switcher();
+        ctrl_p(&mut app);
+
+        app.paste_text("bo\nb\r\n");
+
+        assert_eq!(switcher_query(&app), "bob");
+        assert_eq!(app.active().input, "");
+        assert_eq!(app.switcher_matches(), vec![3]);
+    }
+
+    #[test]
+    fn the_switcher_highlight_stays_in_range_when_the_matches_shrink_underneath() {
+        let mut app = app_for_the_switcher();
+        ctrl_p(&mut app);
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.switcher_highlight(), Some(3)); // Bob, the last match
+
+        app.remove_channel("p2p-08080808"); // gone while the overlay is open
+
+        assert_eq!(app.switcher_matches(), vec![0, 2, 1]);
+        assert_eq!(
+            app.switcher_highlight(),
+            Some(1),
+            "clamped to the new last match"
+        );
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.active().name, "dm-Alice");
+    }
+
+    #[test]
+    fn the_switcher_follows_labels_that_change_while_it_is_open() {
+        let mut app = app_with_interleaved_kinds(); // peers unnamed: hex labels
+        ctrl_p(&mut app);
+        type_text(&mut app, "ali");
+        assert!(app.switcher_matches().is_empty());
+
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+
+        assert_eq!(app.switcher_matches(), vec![1]);
+    }
+
+    #[test]
+    fn ctrl_p_is_ignored_while_another_mode_has_the_keyboard() {
+        let mut app = app_for_the_switcher();
+        app.picking_reply = Some(1);
+        ctrl_p(&mut app);
+        assert!(app.switching.is_none());
+        assert_eq!(app.picking_reply, Some(1));
+
+        app.picking_reply = None;
+        app.pending_redeem = Some("ticket".to_string());
+        ctrl_p(&mut app);
+        assert!(app.switching.is_none());
     }
 }

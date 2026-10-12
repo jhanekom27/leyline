@@ -131,6 +131,18 @@ comes down to in a TUI.
   function of `AppState`: when it outgrows the terminal, its scroll offset
   is derived from which row is active (`nav_scroll_offset`) instead of
   being stored anywhere.
+- `Ctrl+P` opens a jump-to overlay over that same list
+  (`AppState::switching`), a modal mode like the `Ctrl+R`/`Ctrl+T` picks:
+  while it's open it owns every key (and a paste), `Enter` switches and
+  `Esc` leaves the active channel alone. It lists the channels whose
+  *label* -- what's on screen, never the stored name -- contains the typed
+  text, case-insensitively, in panel order (`switcher_matches`). Only the
+  query and the highlight position are stored; the matches are re-derived
+  from the live channel list every time, and the position is clamped in
+  one place (`switcher_highlight`), so a peer being renamed or a channel
+  joining while it's open can't leave it pointing at something stale.
+  `Ctrl+K`, the usual quick-switch key, is already "delete to end of
+  line", hence `Ctrl+P`.
 - Each device also loads a second, longer-lived **user key**
   (`identity.rs`, same load-or-generate-once treatment as the device
   identity) and self-signs a `DeviceCert` binding its own `EndpointId` to

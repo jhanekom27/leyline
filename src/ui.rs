@@ -8,7 +8,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::scrollbar;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, BorderType, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
 };
 use textwrap::wrap;
 
@@ -47,6 +48,11 @@ const NAV_LABEL_OFFSET: usize = 1 + NAV_GLYPH_WIDTH + 1;
 /// Cells held back at a row's right edge for the unread marker (the `*`
 /// itself plus a blank before it), so a long label never runs into it.
 const NAV_MARKER_WIDTH: usize = 2;
+
+/// Width of the jump-to overlay (`render_switcher`), borders included.
+const SWITCHER_WIDTH: u16 = 44;
+/// Most matches the jump-to overlay shows at once before it scrolls.
+const SWITCHER_MAX_ROWS: usize = 10;
 
 /// Short usage reminders for every slash command, shown in the sidebar's
 /// commands panel (`render_hints`) when `AppState::show_hints` is on.
@@ -96,6 +102,9 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     render_header(frame, header, app);
     render_body(frame, body, app);
     render_input(frame, input, app);
+    // Last, so the overlay sits over everything else -- and so its cursor
+    // wins over the input box's.
+    render_switcher(frame, app);
 }
 
 /// Height (in terminal rows, including the 2 border rows) the input box
@@ -182,7 +191,12 @@ fn render_nav(frame: &mut Frame, area: Rect, app: &AppState) {
             if index == app.active {
                 active_row = rows.len();
             }
-            rows.push(nav_entry(app, index, inner.width as usize));
+            rows.push(nav_entry(
+                app,
+                index,
+                inner.width as usize,
+                index == app.active,
+            ));
         }
     }
 
@@ -208,10 +222,11 @@ fn nav_section_header(title: &str) -> ListItem<'static> {
 /// to `NAV_GLYPH_WIDTH` cells (measured rather than assumed, since the
 /// point-to-point bolt is double-width), the label truncated to leave
 /// `NAV_MARKER_WIDTH` cells free, and -- right-aligned -- a `*` when the
-/// channel has unseen activity. The active channel is highlighted
-/// (black on cyan) across the whole row, and never gets a `*`: being on a
-/// channel is what clears its flag.
-fn nav_entry(app: &AppState, index: usize, width: usize) -> ListItem<'static> {
+/// channel has unseen activity. A `highlighted` row -- the active channel
+/// in the navigation panel, the selected match in the switcher -- is shown
+/// black on cyan across the whole row and carries no `*`: it's the channel
+/// you're on, or about to be.
+fn nav_entry(app: &AppState, index: usize, width: usize, highlighted: bool) -> ListItem<'static> {
     let channel = &app.channels[index];
 
     let glyph = Span::raw(app.channel_kind(&channel.name).glyph());
@@ -227,7 +242,7 @@ fn nav_entry(app: &AppState, index: usize, width: usize) -> ListItem<'static> {
         Span::raw(label),
     ]);
 
-    if index == app.active {
+    if highlighted {
         return ListItem::new(line).style(
             Style::default()
                 .fg(Color::Black)
@@ -257,6 +272,108 @@ fn nav_scroll_offset(total: usize, visible: usize, active_row: usize) -> usize {
         return 0;
     }
     active_row.saturating_sub(visible / 2).min(total - visible)
+}
+
+/// The jump-to overlay opened with `Ctrl+P` (`AppState::switching`), drawn
+/// over everything else: a cleared, bordered box holding the typed filter
+/// and, under it, every channel that matches (`AppState::switcher_matches`)
+/// in the navigation panel's own row format (`nav_entry`), with the
+/// highlighted match in the active-channel style. Like the panel it scrolls
+/// to keep the highlight in view once there are more matches than rows
+/// (`nav_scroll_offset`).
+fn render_switcher(frame: &mut Frame, app: &AppState) {
+    let Some(switcher) = &app.switching else {
+        return;
+    };
+    let matches = app.switcher_matches();
+    let highlighted = app.switcher_highlight();
+
+    let area = switcher_area(frame.area(), matches.len());
+    let block = Block::bordered()
+        .title("jump to")
+        .title_bottom("↑/↓ move · Enter confirm · Esc cancel")
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+    // Cleared first, so nothing from the panes underneath shows through
+    // the blank cells of the box.
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let [query_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+
+    // The query row: a prompt and the tail of what's been typed -- the end
+    // is what's being edited -- with the terminal cursor just after it.
+    let prompt = "› ";
+    let room = (query_area.width as usize).saturating_sub(Span::raw(prompt).width() + 1);
+    let cut = switcher.query.chars().count().saturating_sub(room);
+    let typed: String = switcher.query.chars().skip(cut).collect();
+    let query_line = Line::from(vec![
+        Span::styled(
+            prompt,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(typed),
+    ]);
+    frame.set_cursor_position((query_area.x + query_line.width() as u16, query_area.y));
+    frame.render_widget(Paragraph::new(query_line), query_area);
+
+    if matches.is_empty() {
+        let placeholder = Span::styled(
+            " no matches",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        );
+        frame.render_widget(Paragraph::new(Line::from(placeholder)), list_area);
+        return;
+    }
+    let visible_rows = (list_area.height as usize).max(1);
+    let highlighted_row = matches
+        .iter()
+        .position(|&index| Some(index) == highlighted)
+        .unwrap_or(0);
+    let start = nav_scroll_offset(matches.len(), visible_rows, highlighted_row);
+    let items: Vec<ListItem> = matches
+        .iter()
+        .skip(start)
+        .take(visible_rows)
+        .map(|&index| {
+            nav_entry(
+                app,
+                index,
+                list_area.width as usize,
+                Some(index) == highlighted,
+            )
+        })
+        .collect();
+    frame.render_widget(List::new(items), list_area);
+    // The thumb belongs beside the list rows, not the query row above
+    // them, so hand the indicator a track one row taller than the list at
+    // each end -- it insets its own area by a row, as for a bordered block.
+    let track = Rect::new(
+        area.x,
+        list_area.y.saturating_sub(1),
+        area.width,
+        list_area.height + 2,
+    );
+    render_scroll_indicator(frame, track, start, matches.len(), visible_rows);
+}
+
+/// Where the switcher box goes on a `screen`-sized frame when `matches`
+/// channels are listed: `SWITCHER_WIDTH` wide and centered, tall enough for
+/// the borders, the query row and up to `SWITCHER_MAX_ROWS` matches (one
+/// row even with none, for the placeholder), and anchored near the top so
+/// the box doesn't jump around as typing shrinks it. Never larger than the
+/// screen.
+fn switcher_area(screen: Rect, matches: usize) -> Rect {
+    let width = SWITCHER_WIDTH.min(screen.width);
+    let list_rows = matches.clamp(1, SWITCHER_MAX_ROWS) as u16;
+    let height = (list_rows + 3).min(screen.height);
+    let x = screen.x + (screen.width - width) / 2;
+    let y = (screen.y + 2).min(screen.bottom() - height);
+    Rect::new(x, y, width, height)
 }
 
 /// Splits the RHS column into the peers list and, when `show_hints` is
@@ -1474,6 +1591,7 @@ mod tests {
 
     use std::collections::HashMap;
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::buffer::Buffer;
 
     /// Renders `app` into an off-screen terminal of `width` x `height`
@@ -1496,14 +1614,14 @@ mod tests {
         (x..x + width).map(|x| buffer[(x, y)].symbol()).collect()
     }
 
-    /// The first `width` columns of `buffer`'s row `y` as a user reads
-    /// them: the blank cell a double-width glyph (the point-to-point bolt)
-    /// leaves behind it in the buffer isn't a column of its own on screen,
-    /// so it's left out.
-    fn visible_row(buffer: &Buffer, y: u16, width: u16) -> String {
+    /// `width` columns of `buffer`'s row `y`, from column `x`, as a user
+    /// reads them: the blank cell a double-width glyph (the point-to-point
+    /// bolt) leaves behind it in the buffer isn't a column of its own on
+    /// screen, so it's left out.
+    fn visible_row(buffer: &Buffer, y: u16, x: u16, width: u16) -> String {
         let mut text = String::new();
         let mut hidden = 0;
-        for x in 0..width {
+        for x in x..x + width {
             if hidden > 0 {
                 hidden -= 1;
                 continue;
@@ -1515,19 +1633,23 @@ mod tests {
         text
     }
 
+    /// The text of every screen row of `buffer`.
+    fn screen_rows(buffer: &Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| visible_row(buffer, y, 0, buffer.area.width))
+            .collect()
+    }
+
     /// The text of every screen row of a 100x20 render of `app`.
     fn render_to_rows(app: &AppState) -> Vec<String> {
-        let buffer = render_to_buffer(app, 100, 20);
-        (0..buffer.area.height)
-            .map(|y| visible_row(&buffer, y, buffer.area.width))
-            .collect()
+        screen_rows(&render_to_buffer(app, 100, 20))
     }
 
     /// Just the navigation panel's part of each row of `buffer` -- the
     /// message pane's title right beside it repeats channel names.
     fn nav_rows(buffer: &Buffer) -> Vec<String> {
         (0..buffer.area.height)
-            .map(|y| visible_row(buffer, y, NAV_WIDTH))
+            .map(|y| visible_row(buffer, y, 0, NAV_WIDTH))
             .collect()
     }
 
@@ -1540,22 +1662,29 @@ mod tests {
     /// the right border.
     const NAV_MARKER_X: u16 = NAV_WIDTH - 2;
 
-    /// The screen row of the navigation entry with `glyph` in the glyph
-    /// column and `label` in the label column, panicking with the panel's
-    /// text if there's none.
-    fn nav_row(buffer: &Buffer, glyph: &str, label: &str) -> u16 {
+    /// The screen row of the entry with `glyph` in the glyph column and
+    /// `label` in the label column of the bordered box whose left edge is
+    /// at column `left` -- the navigation panel at 0, the switcher wherever
+    /// it's centered; both lay their entries out identically. Panics, with
+    /// the whole screen, if there's none.
+    fn entry_row(buffer: &Buffer, left: u16, glyph: &str, label: &str) -> u16 {
         let label_width = label.chars().count() as u16;
         (0..buffer.area.height)
             .find(|&y| {
-                cells(buffer, y, NAV_GLYPH_X, 1) == glyph
-                    && cells(buffer, y, NAV_LABEL_X, label_width) == label
+                cells(buffer, y, left + NAV_GLYPH_X, 1) == glyph
+                    && cells(buffer, y, left + NAV_LABEL_X, label_width) == label
             })
             .unwrap_or_else(|| {
                 panic!(
-                    "no entry {glyph}{label} in the panel:\n{}",
-                    nav_rows(buffer).join("\n")
+                    "no entry {glyph}{label} at column {left}:\n{}",
+                    screen_rows(buffer).join("\n")
                 )
             })
+    }
+
+    /// `entry_row` for the navigation panel.
+    fn nav_row(buffer: &Buffer, glyph: &str, label: &str) -> u16 {
+        entry_row(buffer, 0, glyph, label)
     }
 
     /// An app with `general` active, then -- joined in this order, so the
@@ -1881,5 +2010,254 @@ mod tests {
             rows.iter().any(|row| row.contains("#general · 0 peer(s)")),
             "got: {rows:#?}"
         );
+    }
+
+    /// The screen every switcher render test draws on.
+    fn screen() -> Rect {
+        Rect::new(0, 0, 100, 20)
+    }
+
+    fn open_switcher(app: &mut AppState) {
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    }
+
+    fn type_text(app: &mut AppState, text: &str) {
+        for c in text.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    fn press(app: &mut AppState, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// The text of the box at `area` on `buffer`, one string per row.
+    fn box_rows(buffer: &Buffer, area: Rect) -> Vec<String> {
+        (area.y..area.bottom())
+            .map(|y| visible_row(buffer, y, area.x, area.width))
+            .collect()
+    }
+
+    /// Whether row `y` of the box at `area` is highlighted right across
+    /// its inside.
+    fn row_is_highlighted(buffer: &Buffer, area: Rect, y: u16) -> bool {
+        (area.x + 1..area.right() - 1).all(|x| buffer[(x, y)].bg == Color::Cyan)
+    }
+
+    #[test]
+    fn the_switcher_is_not_drawn_until_it_is_opened() {
+        let mut app = app_with_every_kind();
+        let closed = render_to_rows(&app);
+        assert!(!closed.iter().any(|row| row.contains("jump to")));
+
+        open_switcher(&mut app);
+
+        let open = render_to_rows(&app);
+        assert!(open.iter().any(|row| row.contains("jump to")), "{open:#?}");
+    }
+
+    #[test]
+    fn the_switcher_lists_every_channel_in_panel_order_with_its_glyph() {
+        let mut app = app_with_every_kind();
+        app.load_contacts(HashMap::from([([7; 32], "Alice".to_string())]));
+        open_switcher(&mut app);
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        let area = switcher_area(screen(), 4);
+        let rows = [
+            entry_row(&buffer, area.x, "#", "general"),
+            entry_row(&buffer, area.x, "#", "project-x"),
+            entry_row(&buffer, area.x, "@", "Alice"),
+            entry_row(&buffer, area.x, "⚡", "Alice"),
+        ];
+        assert!(
+            rows.windows(2).all(|pair| pair[0] < pair[1]),
+            "got: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn an_unread_channel_keeps_its_marker_in_the_switcher() {
+        let mut app = app_with_every_kind();
+        app.channels[2].has_unread = true; // project-x
+        open_switcher(&mut app);
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        let area = switcher_area(screen(), 4);
+        let unread = entry_row(&buffer, area.x, "#", "project-x");
+        let read = entry_row(&buffer, area.x, "@", "07070707");
+        assert_eq!(buffer[(area.right() - 2, unread)].symbol(), "*");
+        assert_eq!(buffer[(area.right() - 2, read)].symbol(), " ");
+    }
+
+    #[test]
+    fn typing_narrows_the_switcher_and_shrinks_its_box() {
+        let mut app = app_with_every_kind();
+        app.load_contacts(HashMap::from([([7; 32], "Alice".to_string())]));
+        open_switcher(&mut app);
+        type_text(&mut app, "ALI");
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        // Both conversations with Alice match, ignoring case, and nothing
+        // else does: two rows, plus the query row and the borders.
+        let area = switcher_area(screen(), 2);
+        assert_eq!(area.height, 5);
+        entry_row(&buffer, area.x, "@", "Alice");
+        entry_row(&buffer, area.x, "⚡", "Alice");
+        let text = box_rows(&buffer, area).join("\n");
+        assert!(
+            !text.contains("general") && !text.contains("project-x"),
+            "got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_highlight_follows_down_and_is_styled_like_the_active_channel() {
+        let mut app = app_with_every_kind();
+        open_switcher(&mut app);
+        let area = switcher_area(screen(), 4);
+        let first_entry = area.y + 2; // past the top border and the query row
+        let highlighted = |app: &AppState| -> Vec<bool> {
+            let buffer = render_to_buffer(app, 100, 20);
+            (0..2)
+                .map(|i| row_is_highlighted(&buffer, area, first_entry + i))
+                .collect()
+        };
+
+        assert_eq!(highlighted(&app), [true, false]);
+
+        press(&mut app, KeyCode::Down);
+
+        assert_eq!(highlighted(&app), [false, true]);
+    }
+
+    #[test]
+    fn the_switcher_scrolls_to_keep_the_highlight_in_view() {
+        let mut app = app_with_many_channels(30, 0);
+        open_switcher(&mut app);
+        for _ in 0..20 {
+            press(&mut app, KeyCode::Down);
+        }
+
+        let buffer = render_to_buffer(&app, 100, 24);
+
+        let area = switcher_area(Rect::new(0, 0, 100, 24), 30);
+        assert_eq!(
+            area.height,
+            SWITCHER_MAX_ROWS as u16 + 3,
+            "capped, then it scrolls"
+        );
+        let row = entry_row(&buffer, area.x, "#", "channel-20");
+        assert!(row_is_highlighted(&buffer, area, row));
+        let text = box_rows(&buffer, area).join("\n");
+        assert!(!text.contains("channel-00"), "got:\n{text}");
+        assert!(
+            (area.y..area.bottom()).any(|y| buffer[(area.right() - 1, y)].symbol() == "▐"),
+            "a scroll thumb on the box's right border"
+        );
+    }
+
+    #[test]
+    fn a_switcher_with_no_matches_says_so() {
+        let mut app = app_with_every_kind();
+        open_switcher(&mut app);
+        type_text(&mut app, "zzz");
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        let text = box_rows(&buffer, switcher_area(screen(), 0)).join("\n");
+        assert!(text.contains("no matches"), "got:\n{text}");
+    }
+
+    #[test]
+    fn the_cursor_sits_just_after_the_typed_query() {
+        let mut app = app_with_every_kind();
+        open_switcher(&mut app);
+        type_text(&mut app, "ali");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+            .expect("a test backend never fails");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("drawing to a test backend never fails");
+
+        let cursor = terminal
+            .get_cursor_position()
+            .expect("a test backend never fails");
+
+        // Past the border, the 2-cell prompt and the 3 typed characters, on
+        // the row under the top border -- not down in the input box.
+        let area = switcher_area(screen(), 0);
+        assert_eq!((cursor.x, cursor.y), (area.x + 1 + 2 + 3, area.y + 1));
+    }
+
+    #[test]
+    fn the_switcher_covers_what_is_underneath() {
+        let mut app = app_with_every_kind();
+        // Long enough to run right through the box's columns.
+        app.load_history("general", vec![text_message(1, [1; 32], &"X".repeat(60))]);
+        open_switcher(&mut app);
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        let text = box_rows(&buffer, switcher_area(screen(), 4)).join("\n");
+        assert!(
+            !text.contains('X'),
+            "the message pane showed through:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_switcher_survives_a_tiny_terminal() {
+        let mut app = app_with_many_channels(30, 0);
+        open_switcher(&mut app);
+        type_text(&mut app, "channel");
+
+        for width in 1..=14 {
+            for height in 1..=8 {
+                render_to_buffer(&app, width, height);
+            }
+        }
+    }
+
+    #[test]
+    fn the_switcher_box_is_centered_top_anchored_and_sized_to_its_matches() {
+        let screen = Rect::new(0, 0, 100, 40);
+
+        assert_eq!(
+            switcher_area(screen, 0).height,
+            4,
+            "a row for the placeholder"
+        );
+        assert_eq!(switcher_area(screen, 3).height, 6);
+        assert_eq!(
+            switcher_area(screen, 50).height,
+            SWITCHER_MAX_ROWS as u16 + 3
+        );
+        let area = switcher_area(screen, 3);
+        assert_eq!(area.width, SWITCHER_WIDTH);
+        assert_eq!(area.x * 2 + area.width, screen.width, "centered");
+        assert_eq!(
+            area.y, 2,
+            "anchored, so it does not jump as typing shrinks it"
+        );
+    }
+
+    #[test]
+    fn the_switcher_box_never_outgrows_the_screen() {
+        for width in 1..=120 {
+            for height in 1..=40 {
+                for matches in [0, 1, 5, 10, 11, 30] {
+                    let screen = Rect::new(0, 0, width, height);
+                    let area = switcher_area(screen, matches);
+                    assert!(
+                        area.right() <= screen.right() && area.bottom() <= screen.bottom(),
+                        "{area:?} overflows {screen:?} for {matches} matches"
+                    );
+                }
+            }
+        }
     }
 }
