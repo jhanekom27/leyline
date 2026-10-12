@@ -4,7 +4,7 @@ title: Mouse support for the channel panel and scrolling
 status: To Do
 assignee: []
 created_date: '2026-10-08 02:12'
-updated_date: '2026-10-12 07:54'
+updated_date: '2026-10-12 13:29'
 labels:
   - ux
 dependencies: []
@@ -16,10 +16,6 @@ ordinal: 16000
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
 `crossterm` already supports mouse events, but leyline currently only supports keyboard navigation for switching channels (`Tab`/`Shift+Tab`, `Ctrl+P`) and scrolling the transcript.
-<!-- SECTION:DESCRIPTION:END -->
 
-## Acceptance Criteria
-<!-- AC:BEGIN -->
-- [ ] #1 Clicking a channel or conversation in the left-hand navigation panel switches to it
-- [ ] #2 The scroll wheel scrolls the active channel's transcript, equivalent to Up/Down
-<!-- AC:END -->
+Mouse input is split into two subtasks because the halves have very different costs. Wheel scrolling can use the terminal alternate scroll mode and needs no mouse capture. Clicking needs real mouse reporting, which takes over native text selection in the terminal, so it is an opt-in toggle.
+<!-- SECTION:DESCRIPTION:END -->
