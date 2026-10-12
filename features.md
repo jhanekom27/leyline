@@ -199,6 +199,22 @@ mechanisms, not one, since they trade off differently:
   nickname and bell setting -- falling back to Downloads, then home. An
   unreadable folder shows the reason in the bottom border and leaves the
   picker where it was.
+- [x] **Bare `/save`** -- `/save` with no hash prefix fetches the newest
+  file another peer shared in the active channel, the way a bare `/reply`
+  answers the most recent message, so the common case -- grabbing the file
+  that was just shared -- no longer means copying a hash prefix out of the
+  transcript. "Another peer" is anyone but this device, the test
+  `ui::attachment_line` already uses to give a file its `/save <hash> to
+  download` hint, so a bare `/save` takes exactly the newest file that
+  shows one; that includes a file from one of your own paired devices,
+  which is not on this one. It reads the channel's transcript rather than
+  what is in view (an open thread or search narrows what `/reply` can
+  target, but the file just shared belongs to the channel), and says so
+  when there is no such file. It then goes through the same
+  `InputAction::SaveFile` as `/save <hash-prefix>`, so the download, the
+  destination notice and the failures are the ones that path always had.
+  An older file stays with the hash prefix rather than a second picker
+  mode.
 
 ## Networking & sharing
 

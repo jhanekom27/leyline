@@ -86,7 +86,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/rename <name>",
     "/who",
     "/send [path]",
-    "/save <hash>",
+    "/save [hash]",
     "/paste (or Ctrl+V)",
     "/alias <hex> <name>",
     "/nick <name>",

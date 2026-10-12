@@ -502,10 +502,11 @@ pub enum InputAction {
         caption: String,
     },
     /// Fetch a previously shared file and save it locally -- `hash`,
-    /// `filename`, and `sender` already resolved from a typed hash-prefix
-    /// by `run_save` (see `resolve_attachment`). The caller
-    /// (`net::Net::save_file`) picks the destination and performs the
-    /// download; app.rs never touches the filesystem.
+    /// `filename`, and `sender` already resolved by `run_save`, from a
+    /// typed hash-prefix (see `resolve_attachment`) or, with none, as the
+    /// newest file in the active channel (see `newest_shared_file`). The
+    /// caller (`net::Net::save_file`) picks the destination and performs
+    /// the download; app.rs never touches the filesystem.
     SaveFile {
         hash: Hash,
         filename: String,
@@ -2009,7 +2010,7 @@ impl AppState {
             "commands: /join <name|ticket>, /invite, /pair [ticket], /forget-device <hex-prefix>, \
              /msg <alias|hex-prefix> [text], /dm <alias|hex-prefix|endpoint-id> [text], \
              /leave [channel], /rename [name], /who, /send [path], \
-             /save <hash-prefix>, /paste, /alias <hex-prefix> <name>, /nick <name>, \
+             /save [hash-prefix], /paste, /alias <hex-prefix> <name>, /nick <name>, \
              /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
              ticket for a new device to redeem, /pair <ticket> redeems one (after an \
@@ -2652,16 +2653,21 @@ impl AppState {
         })
     }
 
-    /// Handles `/save <hash-prefix>`: `arg` is everything after `/save `
-    /// (already trimmed), naming (a prefix of) a file previously shared in
-    /// any joined channel -- see `resolve_attachment`. Mirrors `/alias`'s
-    /// hex-prefix resolution for a consistent UX.
+    /// Handles `/save [hash-prefix]`: `arg` is everything after `/save `
+    /// (already trimmed). With a prefix, it names (a prefix of) a file
+    /// previously shared in any joined channel -- see `resolve_attachment`,
+    /// which mirrors `/alias`'s hex-prefix resolution for a consistent UX.
+    /// With none, it takes the newest file another peer shared in the
+    /// active channel (`newest_shared_file`), mirroring a bare `/reply`'s
+    /// "most recent message" default -- name an older file by its prefix.
+    /// Either way the file goes through the same `InputAction::SaveFile`.
     fn run_save(&mut self, arg: &str) -> Option<InputAction> {
-        if arg.is_empty() {
-            self.push_system("usage: /save <hash-prefix>");
-            return None;
-        }
-        match self.resolve_attachment(arg) {
+        let file = if arg.is_empty() {
+            self.newest_shared_file()
+        } else {
+            self.resolve_attachment(arg)
+        };
+        match file {
             Ok((hash, filename, sender)) => {
                 self.push_system(format!("saving {filename}..."));
                 Some(InputAction::SaveFile {
@@ -2951,6 +2957,33 @@ impl AppState {
             }
         }
         result
+    }
+
+    /// The newest file another peer shared in the active channel -- what a
+    /// bare `/save` fetches, as a bare `/reply` answers the newest message
+    /// -- as `resolve_attachment` returns one: its hash, filename, and the
+    /// sender to fetch it from. "Another peer" is anyone but this device
+    /// (`self_id`), the test `ui::attachment_line` uses to give a file its
+    /// `/save <hash>` hint, so this is always the newest file that shows
+    /// one -- including a file from one of our own other devices, which
+    /// isn't on this one. Looks through the channel's loaded transcript,
+    /// like `known_attachments`, not `Channel::visible_chat_ids`: an open
+    /// thread or search narrows what `/reply` can target, but the file just
+    /// shared belongs to the channel, not to the view. Errors with a
+    /// user-facing message if there is none.
+    fn newest_shared_file(&self) -> Result<(Hash, String, [u8; 32]), String> {
+        self.active()
+            .messages
+            .iter()
+            .rev()
+            .find_map(|line| match line {
+                TranscriptLine::Chat(message) if message.sender != self.self_id => {
+                    let file = message.attachment.as_ref()?;
+                    Some((file.hash, file.filename.clone(), message.sender))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| "no file from another peer to save in this channel".to_string())
     }
 
     /// Whether keys -- and pastes -- currently go to the message box. False
@@ -5621,15 +5654,6 @@ mod tests {
     }
 
     #[test]
-    fn slash_save_without_arg_shows_usage_and_returns_none() {
-        let mut app = app();
-        let action = submit(&mut app, "/save");
-        assert!(action.is_none());
-        let last = as_system(app.active().messages.back().unwrap());
-        assert!(last.starts_with("usage:"), "got: {last}");
-    }
-
-    #[test]
     fn slash_save_rejects_a_non_hex_prefix() {
         let mut app = app();
         let action = submit(&mut app, "/save not-hex");
@@ -5653,6 +5677,210 @@ mod tests {
         let resolved = app.resolve_attachment(&hash.to_hex()[..8]).unwrap();
 
         assert_eq!(resolved.0, hash);
+    }
+
+    /// Delivers `message` to `channel` as if a peer had just sent it.
+    fn receive(app: &mut AppState, channel: &str, message: ChatMessage) {
+        app.handle_net_event(NetEvent::Received(channel.to_string(), message));
+    }
+
+    /// What a `/save` asked to fetch -- the hash, filename, and sender of
+    /// its `InputAction::SaveFile` -- panicking on anything else.
+    fn saved_file(action: Option<InputAction>) -> (Hash, String, [u8; 32]) {
+        match action.expect("a /save with a file to save returns an action") {
+            InputAction::SaveFile {
+                hash,
+                filename,
+                sender,
+            } => (hash, filename, sender),
+            _ => panic!("expected InputAction::SaveFile"),
+        }
+    }
+
+    #[test]
+    fn bare_slash_save_saves_the_newest_file_from_another_peer() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "old.pdf", b"old contents"),
+        );
+        let newest = file_message(2, PEER_ID_2, "new.pdf", b"new contents");
+        let newest_hash = newest.attachment.as_ref().unwrap().hash;
+        receive(&mut app, "general", newest);
+
+        let saved = saved_file(submit(&mut app, "/save"));
+
+        assert_eq!(saved, (newest_hash, "new.pdf".to_string(), PEER_ID_2));
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "saving new.pdf...");
+    }
+
+    #[test]
+    fn bare_slash_save_skips_our_own_files_even_when_they_are_newer() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "theirs.pdf", b"theirs"),
+        );
+        app.record_sent_message("general", file_message(2, SELF_ID, "mine.pdf", b"mine"));
+
+        let (_, filename, sender) = saved_file(submit(&mut app, "/save"));
+
+        assert_eq!((filename.as_str(), sender), ("theirs.pdf", PEER_ID));
+    }
+
+    #[test]
+    fn bare_slash_save_looks_past_newer_lines_that_carry_no_file() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        receive(
+            &mut app,
+            "general",
+            compose_message(PEER_ID_2, "got it, thanks", None),
+        );
+        app.push_system("some notice");
+
+        let (_, filename, _) = saved_file(submit(&mut app, "/save"));
+
+        assert_eq!(filename, "report.pdf");
+    }
+
+    #[test]
+    fn bare_slash_save_is_not_narrowed_by_an_open_search() {
+        // A search narrows what `/reply` can target to what is in view; the
+        // file just shared belongs to the channel, not to the view.
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        receive(
+            &mut app,
+            "general",
+            compose_message(PEER_ID_2, "hello there", None),
+        );
+        submit(&mut app, "/search hello");
+        assert_eq!(
+            app.active().visible_chat_ids().len(),
+            1,
+            "the search leaves only the greeting in view"
+        );
+
+        let (_, filename, _) = saved_file(submit(&mut app, "/save"));
+
+        assert_eq!(filename, "report.pdf");
+    }
+
+    #[test]
+    fn bare_slash_save_only_reads_the_active_channel() {
+        let mut app = multi_channel_app(); // "random" is active
+        receive(
+            &mut app,
+            "random",
+            file_message(1, PEER_ID, "here.pdf", b"here"),
+        );
+        receive(
+            &mut app,
+            "general",
+            file_message(2, PEER_ID_2, "elsewhere.pdf", b"elsewhere"),
+        );
+
+        let (_, filename, sender) = saved_file(submit(&mut app, "/save"));
+
+        assert_eq!((filename.as_str(), sender), ("here.pdf", PEER_ID));
+    }
+
+    #[test]
+    fn bare_slash_save_saves_a_file_from_one_of_our_own_other_devices() {
+        // Like `ui::attachment_line`, a bare `/save` counts anyone but this
+        // device as another peer: a paired sibling's file is not on this one.
+        let mut app = app();
+        let user_key = SecretKey::generate();
+        app.load_self_user_id(*user_key.public().as_bytes());
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID),
+        ));
+        assert_eq!(app.display_name(&PEER_ID), "you", "PEER_ID is our sibling");
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "from-the-other-laptop.png", b"png"),
+        );
+
+        let (_, filename, sender) = saved_file(submit(&mut app, "/save"));
+
+        assert_eq!(
+            (filename.as_str(), sender),
+            ("from-the-other-laptop.png", PEER_ID)
+        );
+    }
+
+    #[test]
+    fn bare_slash_save_says_so_when_the_channel_has_no_file() {
+        let mut app = app();
+        receive(&mut app, "general", compose_message(PEER_ID, "hello", None));
+
+        let action = submit(&mut app, "/save");
+
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("no file from another peer"), "got: {last}");
+    }
+
+    #[test]
+    fn bare_slash_save_says_so_when_only_our_own_files_are_there() {
+        let mut app = app();
+        app.record_sent_message("general", file_message(1, SELF_ID, "mine.pdf", b"mine"));
+
+        let action = submit(&mut app, "/save");
+
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("no file from another peer"), "got: {last}");
+    }
+
+    #[test]
+    fn bare_slash_save_says_so_when_files_were_only_shared_in_other_channels() {
+        let mut app = multi_channel_app(); // "random" is active
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "elsewhere.pdf", b"elsewhere"),
+        );
+
+        let action = submit(&mut app, "/save");
+
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("no file from another peer"), "got: {last}");
+    }
+
+    #[test]
+    fn slash_save_with_a_prefix_still_reaches_an_older_file() {
+        let mut app = app();
+        let older = file_message(1, PEER_ID, "old.pdf", b"old contents");
+        let older_hash = older.attachment.as_ref().unwrap().hash;
+        receive(&mut app, "general", older);
+        receive(
+            &mut app,
+            "general",
+            file_message(2, PEER_ID_2, "new.pdf", b"new contents"),
+        );
+
+        let saved = saved_file(submit(
+            &mut app,
+            &format!("/save {}", &older_hash.to_hex()[..8]),
+        ));
+
+        assert_eq!(saved, (older_hash, "old.pdf".to_string(), PEER_ID));
     }
 
     #[test]
