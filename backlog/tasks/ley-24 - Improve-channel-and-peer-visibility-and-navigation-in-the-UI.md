@@ -4,7 +4,7 @@ title: Improve channel and peer visibility and navigation in the UI
 status: Done
 assignee: []
 created_date: '2026-10-12 05:45'
-updated_date: '2026-10-12 07:49'
+updated_date: '2026-10-12 07:54'
 labels:
   - ux
   - channels
@@ -27,6 +27,8 @@ Delivered as four subtasks, each with its own plan, notes and checked ACs: LEY-2
 Cross-cutting decisions made along the way: the dm-/p2p- text prefix from LEY-24.1 was dropped once the glyph carried the kind (channel_label is the bare name, channel_heading is glyph plus label and is what titles and notices use); Tab and Shift+Tab step through the panel in drawn order rather than join order; the switcher is on Ctrl+P because Ctrl+K already deletes to end of line; /rename is refused for conversations, which follow /alias instead.
 
 Follow-ups noted but not created as tasks (they need approval): auto-collapsing the right peers sidebar on narrow terminals (the 24-column panel leaves about 13 characters of message text at 80 columns); switcher extras (most-recently-used ordering, fuzzy matching, # and @ kind filters, an on-screen hint for Ctrl+P); /join of a brand-new channel whose stored name equals another channel rename gives two identical-looking rows; COMMAND_HINTS still lacks /dm; LEY-16 (mouse support for tabs) still says tab and should now mean a row in the left-hand panel.
+
+Follow-up resolved afterwards: LEY-16 (now titled Mouse support for the channel panel and scrolling) was reworded to refer to the left-hand navigation panel instead of tabs. Wording only, no change of scope.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
