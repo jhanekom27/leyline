@@ -14,6 +14,7 @@ mod identity;
 mod markdown;
 mod message;
 mod net;
+mod outbox;
 mod pairing;
 mod picker;
 mod runtime;
@@ -59,6 +60,7 @@ use files::{
 use forgotten_devices::ForgottenDevices;
 use message::ChatMessage;
 use net::{DEVICE_SYNC_CHANNEL, Net, NetEvent};
+use outbox::{Outbox, Watcher};
 use picker::{FolderListing, read_folder, remember_folder, start_folder};
 use runtime::*;
 use saved_files::SavedFiles;
@@ -94,6 +96,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize channel renames")?;
     let autosave = AutoSave::load(dirs.data_dir().join("autosave"))
         .context("failed to initialize auto-save settings")?;
+    let outbox = Outbox::load(dirs.data_dir().join("outbox"))
+        .context("failed to initialize outbox settings")?;
     let dm_registry = DmRegistry::load(dirs.data_dir().join("dms"))
         .context("failed to initialize DM registry")?;
     let direct_registry = DirectRegistry::load(dirs.data_dir().join("direct_peers"))
@@ -154,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
         contacts,
         channel_renames,
         autosave,
+        outbox,
         dm_registry,
         direct_registry,
         settings,
@@ -259,6 +264,7 @@ fn paths_to_wipe_for_pairing(data_dir: &Path, config_dir: &Path) -> Vec<PathBuf>
         data_dir.join("contacts"),
         data_dir.join("channel_renames"),
         data_dir.join("autosave"),
+        data_dir.join("outbox"),
         data_dir.join("dms"),
         data_dir.join("direct_peers"),
         data_dir.join("settings"),
@@ -395,6 +401,8 @@ struct Session {
     /// `AppState` (`load_autosave`) at startup; written when `/autosave`
     /// switches a channel and when one is left.
     autosave: AutoSave,
+    /// Enabled one-way outboxes and their durable de-duplication records.
+    outbox: Outbox,
     dm_registry: DmRegistry,
     direct_registry: DirectRegistry,
     settings: Settings,
@@ -466,12 +474,13 @@ async fn run(
         mut contacts,
         mut channel_renames,
         mut autosave,
+        mut outbox,
         mut dm_registry,
         mut direct_registry,
         mut settings,
         mut forgotten_devices,
         mut saved_files,
-        files_root,
+        mut files_root,
         size_limit,
         data_dir,
     } = session;
@@ -481,11 +490,12 @@ async fn run(
     app.load_contacts(contacts.all());
     app.load_renames(channel_renames.all());
     app.load_autosave(autosave.channels());
+    app.load_outbox(outbox.channels());
     app.load_settings(settings.bell_enabled());
     app.load_dm_registry(dm_registry.all());
     app.load_forgotten_devices(forgotten_devices.all());
     app.load_browse_dir(start_folder(&data_dir));
-    app.load_files_root(files_root);
+    app.load_files_root(files_root.clone());
     app.load_size_limit(size_limit);
     for name in &joined_channels {
         // Ensures a brand-new channel ("general" on a first run, or a
@@ -570,6 +580,14 @@ async fn run(
     // Likewise for the file picker's folder reads (see `InputAction::
     // ReadFolder`), which are filesystem work, not network activity.
     let (browse_tx, mut browse_rx) = mpsc::channel::<FolderListing>(8);
+    // Outbox directory reads stay off the event loop, exactly like the file
+    // picker. One scan at a time prevents a slow network volume from piling
+    // up blocking jobs.
+    let (outbox_tx, mut outbox_rx) =
+        mpsc::channel::<Vec<(String, Result<Vec<outbox::Candidate>, String>)>>(1);
+    let mut outbox_watcher = Watcher::default();
+    let mut outbox_scan_in_flight = false;
+    let mut outbox_tick = interval(Duration::from_secs(1));
     let mut dirty = true;
 
     while !app.should_quit {
@@ -612,6 +630,36 @@ async fn run(
                                         warn!(%channel, "failed to persist sent message: {err}");
                                     }
                                     app.record_sent_message(&channel, message);
+                                }
+                            }
+                            Some(InputAction::SetOutbox { channel, on }) => {
+                                let folder = files::outbox_dir(&files_root, &channel);
+                                let result = if on {
+                                    outbox.enable(&channel, &folder)
+                                } else {
+                                    outbox.disable(&channel)
+                                };
+                                match result {
+                                    Ok(()) => {
+                                        app.set_outbox(channel.clone(), on);
+                                        if on {
+                                            app.push_system(format!(
+                                                "outbox is on for {} -- new files in {} will be shared once they stop changing",
+                                                app.channel_heading(&channel),
+                                                folder.display()
+                                            ));
+                                        } else {
+                                            app.push_system(format!(
+                                                "outbox is off for {}",
+                                                app.channel_heading(&channel)
+                                            ));
+                                        }
+                                    }
+                                    Err(err) => app.push_system(format!(
+                                        "couldn't turn outbox {} for {}: {err}",
+                                        if on { "on" } else { "off" },
+                                        app.channel_heading(&channel)
+                                    )),
                                 }
                             }
                             Some(InputAction::Join(arg)) => {
@@ -680,6 +728,9 @@ async fn run(
                                 // could be given later.
                                 if let Err(err) = autosave.set(&channel, false) {
                                     warn!(%channel, "failed to forget the auto-save setting: {err}");
+                                }
+                                if let Err(err) = outbox.disable(&channel) {
+                                    warn!(%channel, "failed to forget the outbox setting: {err}");
                                 }
                                 match app.direct_peer_for(&channel) {
                                     Some(peer) => {
@@ -760,6 +811,7 @@ async fn run(
                                             "files will now be saved under {} (files saved before stay where they are)",
                                             root.display()
                                         ));
+                                        files_root = root.clone();
                                         app.load_files_root(root);
                                     }
                                     Err(message) => app.push_system(message),
@@ -840,6 +892,25 @@ async fn run(
                         dirty = true;
                     }
                     _ => {}
+                }
+            }
+            _ = outbox_tick.tick(), if !outbox_scan_in_flight => {
+                let channels = outbox.channels();
+                if !channels.is_empty() {
+                    let root = files_root.clone();
+                    let tx = outbox_tx.clone();
+                    outbox_scan_in_flight = true;
+                    tokio::task::spawn_blocking(move || {
+                        let results = channels
+                            .into_iter()
+                            .map(|channel| {
+                                let folder = files::outbox_dir(&root, &channel);
+                                let result = outbox::scan(channel.clone(), folder);
+                                (channel, result)
+                            })
+                            .collect();
+                        let _ = tx.blocking_send(results);
+                    });
                 }
             }
             Some(net_event) = net_rx.recv() => {
@@ -1129,6 +1200,39 @@ async fn run(
                 app.apply_folder_listing(listing);
                 dirty = true;
             }
+            Some(results) = outbox_rx.recv() => {
+                outbox_scan_in_flight = false;
+                let mut candidates = Vec::new();
+                for (channel, result) in results {
+                    match result {
+                        Ok(found) => candidates.extend(found),
+                        Err(error) => app.push_system_to(&channel, error),
+                    }
+                }
+                for candidate in outbox_watcher.stable(candidates, &outbox) {
+                    if let Err(err) = outbox.mark_seen(&candidate.channel, candidate.name.clone()) {
+                        app.push_system_to(
+                            &candidate.channel,
+                            format!(
+                                "couldn't remember outbox file {}: {err}",
+                                candidate.path.display()
+                            ),
+                        );
+                        continue;
+                    }
+                    if let Some(error) = net.send_file(
+                        candidate.channel.clone(),
+                        candidate.path.display().to_string(),
+                        app.size_limit(),
+                    ) {
+                        app.push_system_to(
+                            &candidate.channel,
+                            format!("outbox skipped {}: {error}", candidate.name),
+                        );
+                    }
+                }
+                dirty = true;
+            }
             _ = tick.tick() => {
                 // Reserved for cursor blink / relative-timestamp refresh.
             }
@@ -1234,6 +1338,15 @@ mod tests {
         let paths = paths_to_wipe_for_pairing(data_dir, Path::new("/config"));
 
         assert!(paths.contains(&data_dir.join("channel_renames")));
+    }
+
+    #[test]
+    fn pairing_wipes_local_outboxes() {
+        let data_dir = Path::new("/data");
+
+        let paths = paths_to_wipe_for_pairing(data_dir, Path::new("/config"));
+
+        assert!(paths.contains(&data_dir.join("outbox")));
     }
 
     #[test]

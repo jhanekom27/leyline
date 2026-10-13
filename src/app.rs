@@ -15,7 +15,7 @@ use iroh_tickets::Ticket;
 
 use crate::files::{
     AUTOSAVE_MAX_FILE_SIZE, DEFAULT_MAX_FILE_SIZE, SaveMode, SizeLimit, StagedAttachment,
-    channel_dir, human_size, runs_when_opened,
+    channel_dir, human_size, outbox_dir, runs_when_opened,
 };
 use crate::message::{ChatMessage, FileAttachment, now_unix_ms};
 use crate::net::{DEVICE_SYNC_CHANNEL, NetEvent};
@@ -639,6 +639,9 @@ pub enum InputAction {
     /// `AppState`; the caller only needs to persist it
     /// (`autosave::AutoSave::set`).
     SetAutoSave { channel: String, on: bool },
+    /// Create or remove the active channel's one-way outbox setting. The
+    /// runtime creates and snapshots the folder before applying this state.
+    SetOutbox { channel: String, on: bool },
     /// Move the files root -- the folder every channel's folder lives in --
     /// to the path exactly as typed after `/folder ` (see `run_folder`). The
     /// caller (`files::set_files_root`) expands, creates and remembers it,
@@ -833,6 +836,10 @@ pub struct AppState {
     /// shared it, and a setting that outlived its channel would switch
     /// downloads on for a different room that reuses the name.
     autosave: HashSet<String>,
+    /// The channels whose local `send/` folder is watched for outbound
+    /// files. `outbox.rs` owns durable settings and de-duplication; app
+    /// state only exposes this enabled set to `/outbox`.
+    outbox: HashSet<String>,
     /// The files an auto-save is fetching right now, by channel (stored
     /// name) and content. A repeat of one of them -- a file sent twice, or a
     /// share replayed by someone who can't be told from its sender -- is
@@ -919,6 +926,7 @@ impl AppState {
             files_root: PathBuf::from(std::path::MAIN_SEPARATOR_STR),
             size_limit: SizeLimit::Default,
             autosave: HashSet::new(),
+            outbox: HashSet::new(),
             auto_saving: HashSet::new(),
             browse_requests: 0,
         }
@@ -1012,6 +1020,20 @@ impl AppState {
     /// mirrors `load_renames`.
     pub fn load_autosave(&mut self, channels: HashSet<String>) {
         self.autosave = channels;
+    }
+
+    /// Seeds the enabled one-way outboxes persisted by the caller.
+    pub fn load_outbox(&mut self, channels: HashSet<String>) {
+        self.outbox = channels;
+    }
+
+    /// Applies a successfully persisted outbox change from the runtime.
+    pub fn set_outbox(&mut self, channel: String, on: bool) {
+        if on {
+            self.outbox.insert(channel);
+        } else {
+            self.outbox.remove(&channel);
+        }
     }
 
     /// How big a file may be to share right now (`/maxsize`).
@@ -1722,6 +1744,7 @@ impl AppState {
         self.direct_channels.retain(|_, name| name != channel);
         self.renames.remove(channel);
         self.autosave.remove(channel);
+        self.outbox.remove(channel);
         self.auto_saving.retain(|(name, _)| name != channel);
         self.channels.remove(index);
         if self.active > index {
@@ -1882,7 +1905,7 @@ impl AppState {
     /// the user happens to be looking -- for what concerns one channel and
     /// happens without anyone having asked just now (auto-save). A no-op if
     /// `channel` isn't joined, which is only the case once it has been left.
-    fn push_system_to(&mut self, channel: &str, text: impl Into<String>) {
+    pub fn push_system_to(&mut self, channel: &str, text: impl Into<String>) {
         if let Some(channel) = self.channel_mut(channel) {
             channel.push(TranscriptLine::System(text.into()));
         }
@@ -2085,6 +2108,7 @@ impl AppState {
             "folder" => self.run_folder(arg.trim()),
             "maxsize" => self.run_maxsize(arg.trim()),
             "autosave" => self.run_autosave(arg.trim()),
+            "outbox" => self.run_outbox(arg.trim()),
             "files" => self.run_files(),
             "paste" => self.run_paste(),
             "search" | "s" => self.run_search(arg.trim()),
@@ -2128,7 +2152,7 @@ impl AppState {
              /msg <alias|hex-prefix> [text], /dm <alias|hex-prefix|endpoint-id> [text], \
              /leave [channel], /rename [name], /who, /send [path], \
              /save [hash-prefix], /folder [path], /maxsize [size|off|default], \
-             /autosave [on|off], /files, /paste, \
+             /autosave [on|off], /outbox [on|off], /files, /paste, \
              /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
              ticket for a new device to redeem, /pair <ticket> redeems one (after an \
@@ -2138,6 +2162,7 @@ impl AppState {
              /folder shows where and, with a path, moves them all -- \
              /maxsize shows the biggest file you can share (500 MB to begin with) and, with a size like 2GB, changes it (off lifts it, default restores it) -- \
              /autosave on saves the files your own devices and the peers you have aliased share in this channel as they arrive, up to {autosave_limit}, with no command (off by default, per channel; files from before, and from anyone else, are never fetched this way) -- \
+             /outbox on watches this channel's local send folder and shares new stable files once (off by default; existing, hidden, and temporary files are ignored) -- \
              /files lists the files shared in this channel (type to filter, \u{2191}/\u{2193} pick, \
              Enter save, Ctrl+O open one already saved (never a program or script), Esc close) -- \
              keys: Tab/Shift+Tab switch channels, \
@@ -2838,6 +2863,46 @@ impl AppState {
         };
         self.push_system(self.autosave_notice(&channel));
         changed.then_some(InputAction::SetAutoSave { channel, on })
+    }
+
+    /// Handles `/outbox [on|off]`. The setting is only applied once the
+    /// runtime has created and snapshot the folder successfully.
+    fn run_outbox(&mut self, arg: &str) -> Option<InputAction> {
+        let channel = self.active().name.clone();
+        let on = match arg {
+            "" => {
+                self.push_system(self.outbox_notice(&channel));
+                return None;
+            }
+            "on" => true,
+            "off" => false,
+            _ => {
+                self.push_system("usage: /outbox [on|off]");
+                return None;
+            }
+        };
+        if self.outbox.contains(&channel) == on {
+            self.push_system(self.outbox_notice(&channel));
+            return None;
+        }
+        Some(InputAction::SetOutbox { channel, on })
+    }
+
+    /// What `/outbox` says about the active channel's local one-way folder.
+    fn outbox_notice(&self, channel: &str) -> String {
+        let heading = self.channel_heading(channel);
+        let folder = outbox_dir(&self.files_root, channel);
+        if self.outbox.contains(channel) {
+            format!(
+                "outbox is on for {heading} -- new stable files in {} are shared once; /outbox off turns it off",
+                folder.display()
+            )
+        } else {
+            format!(
+                "outbox is off for {heading} -- /outbox on watches {} for new files to share",
+                folder.display()
+            )
+        }
     }
 
     /// What `/autosave` says about `channel`: whether auto-save is on for it,
@@ -9932,6 +9997,54 @@ mod tests {
             last.starts_with("auto-save is on for #general"),
             "got: {last}"
         );
+    }
+
+    #[test]
+    fn outbox_on_requests_runtime_setup_without_claiming_success_early() {
+        let mut app = app();
+        app.load_files_root(PathBuf::from("/files"));
+
+        match submit(&mut app, "/outbox on") {
+            Some(InputAction::SetOutbox { channel, on }) => {
+                assert_eq!(channel, "general");
+                assert!(on);
+            }
+            _ => panic!("expected InputAction::SetOutbox"),
+        }
+        assert!(
+            !app.outbox.contains("general"),
+            "the runtime must create and persist the folder before state says it is on"
+        );
+    }
+
+    #[test]
+    fn outbox_status_is_per_channel_and_uses_the_send_subfolder() {
+        let mut app = multi_channel_app();
+        app.load_files_root(PathBuf::from("/files"));
+        app.load_outbox(HashSet::from(["general".to_string()]));
+
+        submit(&mut app, "/outbox"); // random is active
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.starts_with("outbox is off for #random"), "got: {last}");
+        assert!(last.contains("/files/random/send"), "got: {last}");
+
+        app.active = 0;
+        submit(&mut app, "/outbox");
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.starts_with("outbox is on for #general"), "got: {last}");
+    }
+
+    #[test]
+    fn a_bad_outbox_argument_is_usage_and_changes_nothing() {
+        let mut app = app();
+
+        assert!(submit(&mut app, "/outbox later").is_none());
+
+        assert_eq!(
+            as_system(app.active().messages.back().unwrap()),
+            "usage: /outbox [on|off]"
+        );
+        assert!(app.outbox.is_empty());
     }
 
     #[test]

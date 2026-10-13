@@ -486,6 +486,7 @@ src/
   channel_registry.rs // persisted channel list, room secrets, known peers
   channel_renames.rs  // persisted local display names for group channels, for /rename
   autosave.rs         // persisted set of channels with auto-save on (their stored names), for /autosave
+  outbox.rs           // persisted one-way send-folder settings, de-duplication, and stable-file polling helpers
   contacts.rs         // persisted local pet names for peers
   dm_registry.rs      // persisted peer id <-> 1:1 DM channel name, for /msg
   direct.rs           // point-to-point (non-gossip) 1:1 messaging: connection lifecycle, framing

@@ -156,6 +156,13 @@ pub fn channel_dir(root: &Path, channel: &str) -> PathBuf {
     root.join(channel_folder(channel))
 }
 
+/// The one-way drop folder for `channel`. It deliberately lives beside that
+/// channel's received files, while remaining a local convention only: no
+/// folder contents are synchronized or ever copied back from a peer.
+pub fn outbox_dir(root: &Path, channel: &str) -> PathBuf {
+    channel_dir(root, channel).join("send")
+}
+
 /// The name of the folder for the channel stored as `channel`: a pure
 /// function of that name, so there is nothing to keep in step with it.
 /// Nothing here can be trusted as a path -- `/join` takes any text, and a

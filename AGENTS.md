@@ -9,6 +9,7 @@ leyline is a peer-to-peer terminal chat app built with Rust, iroh, iroh-gossip, 
 Read only the skill relevant to the requested change:
 - `.agents/skills/architecture/SKILL.md` — boundaries, dependency direction, and cross-cutting changes.
 - `.agents/skills/app-state/SKILL.md` — `AppState`, commands, input, overlays, replies, and threads.
+- `.agents/skills/command-documentation/SKILL.md` — adding, removing, renaming, or changing a user-facing slash command.
 - `.agents/skills/ui-rendering/SKILL.md` — ratatui rendering, layout, and overlays.
 - `.agents/skills/networking/SKILL.md` — iroh, gossip, direct messaging, tickets, and backfill.
 - `.agents/skills/files-and-storage/SKILL.md` — attachments, destinations, persistence, and file safety.
