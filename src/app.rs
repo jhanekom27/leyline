@@ -13,9 +13,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use iroh_blobs::Hash;
 use iroh_tickets::Ticket;
 
+use crate::autosave::{AutoSaveLimit, DEFAULT_AUTOSAVE_LIMIT};
 use crate::files::{
-    AUTOSAVE_MAX_FILE_SIZE, DEFAULT_MAX_FILE_SIZE, SaveMode, SizeLimit, StagedAttachment,
-    channel_dir, human_size, outbox_dir, runs_when_opened,
+    DEFAULT_MAX_FILE_SIZE, SaveMode, SizeLimit, StagedAttachment, channel_dir, human_size,
+    outbox_dir, runs_when_opened,
 };
 use crate::message::{ChatMessage, FileAttachment, now_unix_ms};
 use crate::net::{DEVICE_SYNC_CHANNEL, NetEvent};
@@ -662,11 +663,17 @@ pub enum InputAction {
     /// `term` (already applied synchronously to the loaded scrollback by
     /// `run_search`) -- see `search::run_on_disk_scan`,
     /// `AppState::apply_search_outcome`, and main.rs.
-    Search { channel: String, term: String },
+    Search {
+        channel: String,
+        term: String,
+    },
     /// Share a local file with `channel` -- `path` exactly as typed after
     /// `/send ` (see `run_send`). The caller (`net::Net::send_file`)
     /// validates and imports it; app.rs never touches the filesystem.
-    SendFile { channel: String, path: String },
+    SendFile {
+        channel: String,
+        path: String,
+    },
     /// Share everything staged on `channel` (see `Channel::staged`), with
     /// `caption` -- whatever was typed when `Enter` was pressed, empty for
     /// none -- on the first attachment. The caller
@@ -689,13 +696,23 @@ pub enum InputAction {
     /// name), from `/autosave` (see `run_autosave`). Already applied to
     /// `AppState`; the caller only needs to persist it
     /// (`autosave::AutoSave::set`).
-    SetAutoSave { channel: String, on: bool },
+    SetAutoSave {
+        channel: String,
+        on: bool,
+    },
+    SetAutoSaveLimit(AutoSaveLimit),
     /// Create or remove the active channel's one-way outbox setting. The
     /// runtime creates and snapshots the folder before applying this state.
-    SetOutbox { channel: String, on: bool },
+    SetOutbox {
+        channel: String,
+        on: bool,
+    },
     /// Persist folder sync for one channel. Application of remote entries
     /// and publication of stable local files remain runtime-owned.
-    SetSync { channel: String, mode: SyncMode },
+    SetSync {
+        channel: String,
+        mode: SyncMode,
+    },
     /// Move the files root -- the folder every channel's folder lives in --
     /// to the path exactly as typed after `/folder ` (see `run_folder`). The
     /// caller (`files::set_files_root`) expands, creates and remembers it,
@@ -736,7 +753,10 @@ pub enum InputAction {
     /// which `AppState::apply_folder_listing` matches to the read it was
     /// waiting for. app.rs never touches the filesystem, so the read is the
     /// caller's.
-    ReadFolder { request: u64, dir: PathBuf },
+    ReadFolder {
+        request: u64,
+        dir: PathBuf,
+    },
     /// Stage `paths`, chosen in the file picker, on `channel` -- each
     /// checked like a `/send`ed file (`files::stage_file`) -- and remember
     /// `folder` as where the picker opens next time
@@ -881,6 +901,7 @@ pub struct AppState {
     /// sharing, so every route a file takes -- `/send <path>`, the picker, a
     /// drop, the clipboard -- answers to the same one.
     size_limit: SizeLimit,
+    autosave_limit: AutoSaveLimit,
     /// The channels, by stored name, with auto-save on (`/autosave`) --
     /// seeded at startup from what was remembered across restarts
     /// (`load_autosave`) and changed by `/autosave on|off`. A channel not in
@@ -986,6 +1007,7 @@ impl AppState {
             browse_dir: PathBuf::from(std::path::MAIN_SEPARATOR_STR),
             files_root: PathBuf::from(std::path::MAIN_SEPARATOR_STR),
             size_limit: SizeLimit::Default,
+            autosave_limit: AutoSaveLimit::Default,
             autosave: HashSet::new(),
             outbox: HashSet::new(),
             sync: HashMap::new(),
@@ -1075,6 +1097,10 @@ impl AppState {
     /// `load_files_root`.
     pub fn load_size_limit(&mut self, limit: SizeLimit) {
         self.size_limit = limit;
+    }
+
+    pub fn load_autosave_limit(&mut self, limit: AutoSaveLimit) {
+        self.autosave_limit = limit;
     }
 
     /// Seeds the channels with auto-save on (see `autosave::AutoSave`, which
@@ -2291,13 +2317,13 @@ impl AppState {
     /// `ui::render_input`) to stay uncluttered, so this is where that
     /// detail actually lives.
     fn run_help(&mut self) -> Option<InputAction> {
-        let autosave_limit = human_size(AUTOSAVE_MAX_FILE_SIZE);
+        let autosave_limit = human_size(self.autosave_limit.max_bytes());
         self.push_system(format!(
             "commands: /join <name|ticket>, /invite, /pair [ticket], /forget-device <hex-prefix>, \
              /msg <alias|hex-prefix> [text], /dm <alias|hex-prefix|endpoint-id> [text], \
              /leave [channel], /rename [name], /who, /send [path], \
              /save [hash-prefix], /folder [path], /maxsize [size|off|default], \
-             /autosave [on|off], /outbox [on|off], /files, /paste, \
+             /autosave [on|off|limit <size|default>], /outbox [on|off], /files, /paste, \
              /sync [on|off|pause|resume], \
              /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
@@ -2307,7 +2333,7 @@ impl AppState {
              unlike /msg -- /save keeps each channel's files in a folder of its own, \
              /folder shows where and, with a path, moves them all -- \
              /maxsize shows the biggest file you can share (500 MB to begin with) and, with a size like 2GB, changes it (off lifts it, default restores it) -- \
-             /autosave on saves the files your own devices and the peers you have aliased share in this channel as they arrive, up to {autosave_limit}, with no command (off by default, per channel; files from before, and from anyone else, are never fetched this way) -- \
+             /autosave on saves the files your own devices and the peers you have aliased share in this channel as they arrive, up to the device-wide {autosave_limit} limit, with no command (off by default, per channel; files from before, and from anyone else, are never fetched this way); /autosave limit <size> changes that finite limit for every channel and default restores 25 MB -- \
              /sync on mirrors safe remote index entries into this channel's folder and publishes stable local files (off by default, per channel); it never propagates deletes or renames -- \\
              /outbox on watches this channel's local send folder and shares new stable files once (off by default; existing, hidden, and temporary files are ignored) -- \
              /files lists the files shared in this channel (type to filter, \u{2191}/\u{2193} pick, \
@@ -2877,14 +2903,15 @@ impl AppState {
             );
             return None;
         }
-        if file.size > AUTOSAVE_MAX_FILE_SIZE {
+        let max_bytes = self.autosave_limit.max_bytes();
+        if file.size > max_bytes {
             self.push_system_to(
                 channel,
                 format!(
                     "not auto-saving {} ({}): over the {} auto-save limit -- {by_hand}",
                     file.filename,
                     human_size(file.size),
-                    human_size(AUTOSAVE_MAX_FILE_SIZE)
+                    human_size(max_bytes)
                 ),
             );
             return None;
@@ -2914,9 +2941,7 @@ impl AppState {
             filename: file.filename.clone(),
             providers,
             dir: channel_dir(&self.files_root, channel),
-            mode: SaveMode::Automatic {
-                max_bytes: AUTOSAVE_MAX_FILE_SIZE,
-            },
+            mode: SaveMode::Automatic { max_bytes },
         })
     }
 
@@ -2981,7 +3006,7 @@ impl AppState {
         }
     }
 
-    /// Handles `/autosave [on|off]`: `arg` is everything after `/autosave `
+    /// Handles `/autosave [on|off|limit <size|default>]`: `arg` is everything after `/autosave `
     /// (already trimmed). With nothing, says whether auto-save is on for the
     /// active channel -- it is off until turned on, for every channel -- and
     /// what it would do. With `on` or `off`, switches it for the active
@@ -2990,6 +3015,19 @@ impl AppState {
     /// changed anything: asking for what already holds writes nothing.
     /// Anything else is usage, and changes nothing.
     fn run_autosave(&mut self, arg: &str) -> Option<InputAction> {
+        if let Some(size) = arg.strip_prefix("limit ") {
+            return match AutoSaveLimit::parse(size) {
+                Ok(limit) => {
+                    self.autosave_limit = limit;
+                    self.push_system(self.autosave_limit_notice());
+                    Some(InputAction::SetAutoSaveLimit(limit))
+                }
+                Err(message) => {
+                    self.push_system(message);
+                    None
+                }
+            };
+        }
         let channel = self.active().name.clone();
         let on = match arg {
             "" => {
@@ -2999,7 +3037,7 @@ impl AppState {
             "on" => true,
             "off" => false,
             _ => {
-                self.push_system("usage: /autosave [on|off]");
+                self.push_system("usage: /autosave [on|off|limit <size|default>]");
                 return None;
             }
         };
@@ -3106,7 +3144,7 @@ impl AppState {
     /// words for asking and for having just switched it.
     fn autosave_notice(&self, channel: &str) -> String {
         let heading = self.channel_heading(channel);
-        let limit = human_size(AUTOSAVE_MAX_FILE_SIZE);
+        let limit = human_size(self.autosave_limit.max_bytes());
         let folder = channel_dir(&self.files_root, channel);
         let folder = folder.display();
         if self.autosave.contains(channel) {
@@ -3117,6 +3155,19 @@ impl AppState {
             format!(
                 "auto-save is off for {heading} -- /autosave on saves files from your own devices and the peers you have aliased, up to {limit}, into {folder} as they arrive"
             )
+        }
+    }
+
+    fn autosave_limit_notice(&self) -> String {
+        let default = human_size(DEFAULT_AUTOSAVE_LIMIT);
+        match self.autosave_limit {
+            AutoSaveLimit::Default => format!(
+                "automatic downloads are limited to {default} (the default) -- /autosave limit <size> changes it for every channel"
+            ),
+            AutoSaveLimit::Bytes(bytes) => format!(
+                "automatic downloads are limited to {} for every channel -- /autosave limit <size> changes it, /autosave limit default restores the {default} default",
+                human_size(bytes)
+            ),
         }
     }
 
@@ -6841,6 +6892,28 @@ mod tests {
     }
 
     #[test]
+    fn autosave_limit_changes_the_automatic_request_and_refuses_off() {
+        let mut app = app_with_autosave();
+        app.load_contacts(alice());
+
+        match submit(&mut app, "/autosave limit 1KB") {
+            Some(InputAction::SetAutoSaveLimit(AutoSaveLimit::Bytes(1024))) => {}
+            _ => panic!("expected an auto-save limit action"),
+        }
+        assert!(
+            arrive(
+                &mut app,
+                "general",
+                file_message_of_size(1, PEER_ID, "over.bin", 1025)
+            )
+            .is_none()
+        );
+
+        assert!(submit(&mut app, "/autosave limit off").is_none());
+        assert!(newest_notice(&app, "general").contains("auto-save limit"));
+    }
+
+    #[test]
     fn a_bare_maxsize_reports_a_chosen_limit_and_no_limit_too_without_changing_either() {
         let mut app = app();
 
@@ -10078,7 +10151,7 @@ mod tests {
     /// `SaveMode` of every auto-save.
     fn automatic() -> SaveMode {
         SaveMode::Automatic {
-            max_bytes: AUTOSAVE_MAX_FILE_SIZE,
+            max_bytes: DEFAULT_AUTOSAVE_LIMIT,
         }
     }
 
@@ -10318,7 +10391,10 @@ mod tests {
 
             assert!(action.is_none(), "{typed}");
             let last = as_system(app.active().messages.back().unwrap());
-            assert_eq!(last, "usage: /autosave [on|off]", "{typed}");
+            assert_eq!(
+                last, "usage: /autosave [on|off|limit <size|default>]",
+                "{typed}"
+            );
         }
         assert!(app.autosave.is_empty());
     }
@@ -10351,9 +10427,15 @@ mod tests {
         submit(&mut app, "/help");
 
         let last = as_system(app.active().messages.back().unwrap());
-        assert!(last.contains("/autosave [on|off]"), "got: {last}");
         assert!(
-            last.contains(&format!("up to {}", human_size(AUTOSAVE_MAX_FILE_SIZE))),
+            last.contains("/autosave [on|off|limit <size|default>]"),
+            "got: {last}"
+        );
+        assert!(
+            last.contains(&format!(
+                "up to the device-wide {}",
+                human_size(DEFAULT_AUTOSAVE_LIMIT)
+            )),
             "got: {last}"
         );
     }
@@ -10542,8 +10624,8 @@ mod tests {
         let mut app = app_with_autosave();
         app.load_contacts(alice());
 
-        let at = file_message_of_size(1, PEER_ID, "at.bin", AUTOSAVE_MAX_FILE_SIZE);
-        let over = file_message_of_size(2, PEER_ID, "over.bin", AUTOSAVE_MAX_FILE_SIZE + 1);
+        let at = file_message_of_size(1, PEER_ID, "at.bin", DEFAULT_AUTOSAVE_LIMIT);
+        let over = file_message_of_size(2, PEER_ID, "over.bin", DEFAULT_AUTOSAVE_LIMIT + 1);
 
         assert!(arrive(&mut app, "general", at).is_some());
         assert!(arrive(&mut app, "general", over).is_none());

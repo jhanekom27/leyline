@@ -1,9 +1,10 @@
 ---
 id: LEY-26.9
 title: Make the auto-save size limit a device-wide setting
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-10-13 06:56'
+updated_date: '2026-10-13 15:24'
 labels:
   - files
   - trust-safety
@@ -26,10 +27,28 @@ Decided while reviewing LEY-26.1: make it a device-wide setting as the starting 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 `/autosave limit <size>` sets the largest file auto-save will fetch, for every channel on this device, and `/autosave limit default` restores 25 MB; a size is a number and a unit, read as `/maxsize` reads them, and the choice survives restarts
-- [ ] #2 A bare `/autosave`, and `/autosave on` and `/autosave off`, report the limit in force, and the notice for a file skipped as too big names it
-- [ ] #3 Something that is not a size, including `off`, is refused with what to type and leaves the limit as it was, so there is always a ceiling
-- [ ] #4 The limit is enforced as before whatever its value: against the announced size before any network is touched, and against the real size of the file before it is downloaded, so a sender who understates a file still cannot exceed it
-- [ ] #5 Pairing leaves the limit alone, as it does `/maxsize` and the files root: it is a preference of this device
-- [ ] #6 Tests cover parsing and refusals, persistence, and both checks against a raised and a lowered limit; README, features.md, concept.md, `/help` and the command hint are updated
+- [x] #1 `/autosave limit <size>` sets the largest file auto-save will fetch, for every channel on this device, and `/autosave limit default` restores 25 MB; a size is a number and a unit, read as `/maxsize` reads them, and the choice survives restarts
+- [x] #2 A bare `/autosave`, and `/autosave on` and `/autosave off`, report the limit in force, and the notice for a file skipped as too big names it
+- [x] #3 Something that is not a size, including `off`, is refused with what to type and leaves the limit as it was, so there is always a ceiling
+- [x] #4 The limit is enforced as before whatever its value: against the announced size before any network is touched, and against the real size of the file before it is downloaded, so a sender who understates a file still cannot exceed it
+- [x] #5 Pairing leaves the limit alone, as it does `/maxsize` and the files root: it is a preference of this device
+- [x] #6 Tests cover parsing and refusals, persistence, and both checks against a raised and a lowered limit; README, features.md, concept.md, `/help` and the command hint are updated
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+Add a persisted device-wide AutoSaveLimit with a 25 MB default and no off state; thread it through /autosave limit commands, startup persistence, announced and verified size checks; update docs and tests across all command surfaces.
+<!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implemented persisted device-wide autosave_limit with a 25 MB default, no off state, and shared size syntax. The active value now enforces both announced-size rejection and verified automatic-download limits; pairing leaves it intact. Final validation: cargo fmt, cargo test (965 passed), cargo clippy (existing warnings only), cargo build --release, and git diff --check.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Added a persistent device-wide /autosave limit setting with a mandatory finite safety ceiling, dual enforcement, complete command documentation, and tests.
+<!-- SECTION:FINAL_SUMMARY:END -->

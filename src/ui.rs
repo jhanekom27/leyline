@@ -99,7 +99,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/save [hash]",
     "/folder [path]",
     "/maxsize [size|off]",
-    "/autosave [on|off]",
+    "/autosave [on|off|limit <size|default>]",
     "/outbox [on|off]",
     "/sync [on|off|pause|resume]",
     "/files",
@@ -3760,7 +3760,7 @@ mod tests {
 
     #[test]
     fn the_autosave_command_is_among_the_hints() {
-        assert!(COMMAND_HINTS.contains(&"/autosave [on|off]"));
+        assert!(COMMAND_HINTS.contains(&"/autosave [on|off|limit <size|default>]"));
     }
 
     #[test]

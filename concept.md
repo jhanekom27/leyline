@@ -420,8 +420,9 @@ answered in the channel its file arrived in, wherever you are looking
   asked only of peers who are themselves trusted -- your own devices
   (certified under your user key) and peers you have aliased -- and those are
   known by their connection, so a forged share fetches nothing.
-- *How big.* A file announced over `files::AUTOSAVE_MAX_FILE_SIZE` is skipped
-  up front; and since the announced size is only a number in a message,
+- *How big.* A file announced over the persisted device-wide
+  `autosave::AutoSaveLimit` (25 MB by default, never disabled) is skipped up
+  front; and since the announced size is only a number in a message,
   `BackfillStore::fetch_file` also reads the real one -- from its own store,
   or by asking providers for the verified size
   (`iroh_blobs::get::request::get_verified_size`, checked against the hash)

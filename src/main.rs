@@ -52,7 +52,7 @@ use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use app::{AppState, InputAction, SaveRequest};
-use autosave::AutoSave;
+use autosave::{AutoSave, limit as autosave_limit, set_limit as set_autosave_limit};
 use backfill::BackfillStore;
 use channel_registry::ChannelRegistry;
 use channel_renames::ChannelRenames;
@@ -102,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize channel renames")?;
     let autosave = AutoSave::load(dirs.data_dir().join("autosave"))
         .context("failed to initialize auto-save settings")?;
+    let autosave_limit = autosave_limit(&data_dir)?;
     let outbox = Outbox::load(dirs.data_dir().join("outbox"))
         .context("failed to initialize outbox settings")?;
     let sync_settings = SyncSettings::load(dirs.data_dir().join("sync"))
@@ -169,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
         contacts,
         channel_renames,
         autosave,
+        autosave_limit,
         outbox,
         sync_settings,
         dm_registry,
@@ -432,6 +434,7 @@ struct Session {
     /// `AppState` (`load_autosave`) at startup; written when `/autosave`
     /// switches a channel and when one is left.
     autosave: AutoSave,
+    autosave_limit: autosave::AutoSaveLimit,
     /// Enabled one-way outboxes and their durable de-duplication records.
     outbox: Outbox,
     /// Enabled receive-only channel-folder mirrors.
@@ -509,6 +512,7 @@ async fn run(
         mut contacts,
         mut channel_renames,
         mut autosave,
+        autosave_limit,
         mut outbox,
         mut sync_settings,
         mut dm_registry,
@@ -526,6 +530,7 @@ async fn run(
     app.load_contacts(contacts.all());
     app.load_renames(channel_renames.all());
     app.load_autosave(autosave.channels());
+    app.load_autosave_limit(autosave_limit);
     app.load_outbox(outbox.channels());
     app.load_sync(sync_settings.modes());
     app.load_settings(settings.bell_enabled());
@@ -858,6 +863,11 @@ async fn run(
                                     } else {
                                         format!("couldn't remember that auto-save is off: {err} -- it will be on again after a restart")
                                     });
+                                }
+                            }
+                            Some(InputAction::SetAutoSaveLimit(limit)) => {
+                                if let Err(message) = set_autosave_limit(&data_dir, limit) {
+                                    app.push_system(message);
                                 }
                             }
                             // `/folder <path>`: only the filesystem can say

@@ -1,14 +1,14 @@
-//! Persisted record of which channels have auto-save on (`/autosave`): the
-//! stored names of those channels and nothing else -- off is simply not being
-//! in the list. Local only, never sent over the wire.
+//! Persisted auto-save settings: which channels have it on (`/autosave`) and
+//! the finite device-wide limit for automatic downloads (`/autosave limit`).
+//! Both are local only, never sent over the wire.
 //!
 //! Keyed by a channel's stored name, as its folder is
 //! (`files::channel_dir`), so it is forgotten when the channel is left
 //! (`AutoSave::set(.., false)`): a ticket's name is chosen by whoever shared
 //! it, and a setting that outlived its channel would switch downloads on for
 //! a different room that happens to reuse the name, which nobody asked for.
-//! Pairing wipes the file for the same reason (main.rs's
-//! `paths_to_wipe_for_pairing`).
+//! Pairing wipes the channel file for the same reason (main.rs's
+//! `paths_to_wipe_for_pairing`), but leaves the device-wide limit alone.
 //!
 //! Mirrors `channel_renames.rs`'s persisted-postcard-file pattern: tiny and
 //! rarely changed, so the whole file is simply rewritten on every change.
@@ -20,6 +20,86 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use tracing::warn;
+
+const LIMIT_FILE: &str = "autosave_limit";
+pub const DEFAULT_AUTOSAVE_LIMIT: u64 = 25 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoSaveLimit {
+    Default,
+    Bytes(u64),
+}
+
+impl AutoSaveLimit {
+    pub fn max_bytes(self) -> u64 {
+        match self {
+            Self::Default => DEFAULT_AUTOSAVE_LIMIT,
+            Self::Bytes(bytes) => bytes,
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        if text.eq_ignore_ascii_case("default") {
+            return Ok(Self::Default);
+        }
+        let malformed = || {
+            format!(
+                "can't read '{text}' as an auto-save limit -- give a number and a unit (B, KB, MB, GB or TB), like 750MB or 2GB, or say default"
+            )
+        };
+        let (number, unit) = text.split_at(
+            text.find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .unwrap_or(text.len()),
+        );
+        let unit: u64 = match unit.trim().to_ascii_uppercase().as_str() {
+            "B" => 1,
+            "KB" => 1 << 10,
+            "MB" => 1 << 20,
+            "GB" => 1 << 30,
+            "TB" => 1 << 40,
+            _ => return Err(malformed()),
+        };
+        let number: f64 = number.parse().map_err(|_| malformed())?;
+        let bytes = number * unit as f64;
+        if bytes < 1.0 {
+            return Err(format!(
+                "an auto-save limit of '{text}' would refuse every file -- /autosave limit <size> sets a real one, /autosave limit default restores the default"
+            ));
+        }
+        if bytes >= u64::MAX as f64 {
+            return Err(format!(
+                "'{text}' is too big to count -- /autosave limit <size> sets a finite limit instead"
+            ));
+        }
+        Ok(Self::Bytes(bytes as u64))
+    }
+}
+
+pub fn limit(data_dir: &std::path::Path) -> anyhow::Result<AutoSaveLimit> {
+    let path = data_dir.join(LIMIT_FILE);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(AutoSaveLimit::Default),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    Ok(AutoSaveLimit::parse(&text).unwrap_or_else(|reason| {
+        warn!("ignoring {}: {reason}", path.display());
+        AutoSaveLimit::Default
+    }))
+}
+
+pub fn set_limit(data_dir: &std::path::Path, limit: AutoSaveLimit) -> Result<(), String> {
+    let path = data_dir.join(LIMIT_FILE);
+    let recorded = match limit {
+        AutoSaveLimit::Default => match fs::remove_file(&path) {
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
+        AutoSaveLimit::Bytes(bytes) => fs::write(&path, format!("{bytes}B")),
+    };
+    recorded.map_err(|err| format!("can't remember the auto-save limit: {err}"))
+}
 
 /// Local, whole-file-rewrite-on-change store of the channels with auto-save
 /// on.
@@ -200,5 +280,26 @@ mod tests {
                 .join("autosave")
                 .is_file()
         );
+    }
+
+    #[test]
+    fn auto_save_limit_persists_a_finite_size_and_default_forgets_it() {
+        let data = tempfile::tempdir().unwrap();
+        set_limit(data.path(), AutoSaveLimit::Bytes(3 << 20)).unwrap();
+        assert_eq!(limit(data.path()).unwrap(), AutoSaveLimit::Bytes(3 << 20));
+
+        set_limit(data.path(), AutoSaveLimit::Default).unwrap();
+        assert_eq!(limit(data.path()).unwrap(), AutoSaveLimit::Default);
+        assert!(!data.path().join(LIMIT_FILE).exists());
+    }
+
+    #[test]
+    fn auto_save_limit_parses_maxsize_syntax_but_refuses_off() {
+        assert_eq!(
+            AutoSaveLimit::parse("1.5 GB"),
+            Ok(AutoSaveLimit::Bytes(3 << 29))
+        );
+        assert_eq!(AutoSaveLimit::parse("default"), Ok(AutoSaveLimit::Default));
+        assert!(AutoSaveLimit::parse("off").is_err());
     }
 }

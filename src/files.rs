@@ -60,13 +60,6 @@ const MAX_COLLISION_ATTEMPTS: u32 = 1000;
 /// duplicated on disk locally.
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
 
-/// Largest file auto-save will fetch (`SaveMode::Automatic`): small enough
-/// that a few shares into a channel set to save them can't fill the disk, big
-/// enough for the documents, pictures and small archives passed between your
-/// own machines. Separate from `/maxsize`, which limits what you *share*, and
-/// not configurable yet -- anything bigger is still one `/save` away.
-pub const AUTOSAVE_MAX_FILE_SIZE: u64 = 25 * 1024 * 1024;
-
 /// How a save came about, which decides how far a file is trusted to be what
 /// its sender said it was, and where the outcome is reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

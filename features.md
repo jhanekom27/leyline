@@ -429,8 +429,8 @@ mechanisms, not one, since they trade off differently:
   than by what a message says, and its bytes are checked by their hash.
   A forged share leads to asking the real devices, which don't have the
   blob, and fails.
-  The size is checked twice. A file announced as over the limit
-  (`files::AUTOSAVE_MAX_FILE_SIZE`, 25 MB -- not `/maxsize`, which limits
+  The size is checked twice. A file announced as over the persisted,
+  device-wide `autosave::AutoSaveLimit` (25 MB by default -- not `/maxsize`, which limits
   what you share) is skipped before any network is touched; and because
   the announced size is only a number in a message,
   `BackfillStore::fetch_file` reads the real one too: a blob already in
