@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use iroh::EndpointAddr;
+use iroh_docs::Capability;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -37,6 +38,23 @@ struct ChannelRecord {
     name: String,
     secret: RoomSecret,
     peers: Vec<EndpointAddr>,
+    docs: Option<Capability>,
+}
+
+#[derive(Deserialize)]
+struct ChannelRecordV1 {
+    name: String,
+    secret: RoomSecret,
+    peers: Vec<EndpointAddr>,
+}
+
+/// Everything networking needs to restore a joined channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnownChannel {
+    pub name: String,
+    pub secret: RoomSecret,
+    pub peers: Vec<EndpointAddr>,
+    pub docs: Option<Capability>,
 }
 
 /// Local, whole-file-rewrite-on-change store of joined channels and known
@@ -95,6 +113,18 @@ impl ChannelRegistry {
             .unwrap_or_default()
     }
 
+    pub fn snapshot(&self) -> Vec<KnownChannel> {
+        self.channels
+            .iter()
+            .map(|channel| KnownChannel {
+                name: channel.name.clone(),
+                secret: channel.secret,
+                peers: channel.peers.clone(),
+                docs: channel.docs.clone(),
+            })
+            .collect()
+    }
+
     /// Ensures `channel` has a registry entry recording `secret`, creating
     /// one with no known peers yet if it's new. A no-op (including no
     /// write to disk) if already recorded -- `secret` is only used the
@@ -109,7 +139,29 @@ impl ChannelRegistry {
             name: channel.to_string(),
             secret,
             peers: Vec::new(),
+            docs: None,
         });
+        self.save()
+    }
+
+    /// Records the channel document's write capability after the network
+    /// opens it. Existing pre-index records gain it on their next startup.
+    pub fn record_docs(&mut self, channel: &str, docs: Capability) -> anyhow::Result<()> {
+        let Some(record) = self
+            .channels
+            .iter_mut()
+            .find(|record| record.name == channel)
+        else {
+            anyhow::bail!("cannot persist docs capability for unknown channel {channel}");
+        };
+        if record
+            .docs
+            .as_ref()
+            .is_some_and(|known| known.id() == docs.id())
+        {
+            return Ok(());
+        }
+        record.docs = Some(docs);
         self.save()
     }
 
@@ -171,10 +223,22 @@ impl ChannelRegistry {
 /// Decodes the registry file's contents, tolerating corruption by logging
 /// and falling back to an empty registry -- see `ChannelRegistry::load`.
 fn decode(bytes: &[u8]) -> Vec<ChannelRecord> {
-    postcard::from_bytes(bytes).unwrap_or_else(|err| {
-        warn!("dropping corrupt channel registry: {err}");
-        Vec::new()
-    })
+    if let Ok(records) = postcard::from_bytes(bytes) {
+        return records;
+    }
+    if let Ok(records) = postcard::from_bytes::<Vec<ChannelRecordV1>>(bytes) {
+        return records
+            .into_iter()
+            .map(|record| ChannelRecord {
+                name: record.name,
+                secret: record.secret,
+                peers: record.peers,
+                docs: None,
+            })
+            .collect();
+    }
+    warn!("dropping corrupt channel registry");
+    Vec::new()
 }
 
 #[cfg(test)]

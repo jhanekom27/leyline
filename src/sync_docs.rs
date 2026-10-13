@@ -14,16 +14,53 @@ use iroh_gossip::net::Gossip;
 struct Peer {
     router: Router,
     docs: Docs,
-    _data: tempfile::TempDir,
+    _data: Option<tempfile::TempDir>,
+}
+
+#[tokio::test]
+async fn docs_reconcile_changes_made_while_a_persistent_peer_is_offline() {
+    let alpha = Peer::start().await;
+    let beta_data = tempfile::tempdir().unwrap();
+    let beta = Peer::start_at(beta_data.path(), None).await;
+    let alpha_author = alpha.docs.author_default().await.unwrap();
+    let alpha_doc = alpha.docs.create().await.unwrap();
+    let ticket = alpha_doc
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await
+        .unwrap();
+    let _beta_doc = beta.docs.import(ticket.clone()).await.unwrap();
+    let key = b"files/offline.txt";
+
+    beta.shutdown().await;
+    let added = alpha_doc
+        .set_bytes(
+            alpha_author,
+            key.to_vec(),
+            b"written while offline".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    let beta = Peer::start_at(beta_data.path(), None).await;
+    let beta_doc = beta.docs.import(ticket).await.unwrap();
+    eventual_hash(&beta_doc, key, Some(added)).await;
+
+    alpha.shutdown().await;
+    beta.shutdown().await;
 }
 
 impl Peer {
     async fn start() -> Self {
         let data = tempfile::tempdir().unwrap();
+        let path = data.path().to_path_buf();
+        Self::start_at(&path, Some(data)).await
+    }
+
+    async fn start_at(path: &std::path::Path, data: Option<tempfile::TempDir>) -> Self {
         let endpoint = Endpoint::bind(presets::Minimal).await.unwrap();
-        let blobs = FsStore::load(data.path().join("blobs")).await.unwrap();
+        let blobs = FsStore::load(path.join("blobs")).await.unwrap();
         let gossip = Gossip::builder().spawn(endpoint.clone());
-        let docs_dir = data.path().join("docs");
+        let docs_dir = path.join("docs");
         std::fs::create_dir_all(&docs_dir).unwrap();
         let docs = Docs::persistent(docs_dir)
             .spawn(endpoint.clone(), blobs.clone().into(), gossip.clone())

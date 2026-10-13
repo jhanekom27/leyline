@@ -84,6 +84,12 @@ impl BackfillStore {
         BlobsProtocol::new(&self.store, None)
     }
 
+    /// The shared persistent blob store used by iroh-docs for index metadata.
+    /// Keeping one store lets docs use the endpoint's existing blob protocol.
+    pub fn blob_store(&self) -> FsStore {
+        self.store.clone()
+    }
+
     /// This channel's current manifest root, if we've recorded any messages
     /// for it yet -- `None` means nothing has been recorded (e.g. a channel
     /// just joined with no local history), which is also a valid state to

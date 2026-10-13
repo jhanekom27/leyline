@@ -13,7 +13,7 @@ pub(super) fn topic_for_secret(secret: &RoomSecret) -> TopicId {
 /// A decoded ticket's payload, as returned by `parse_join_arg`: its room
 /// secret, the sharer's address, and whether it's DM-flagged (see
 /// `ticket::ChannelTicket::dm`).
-type ParsedTicket = (RoomSecret, EndpointAddr, bool);
+type ParsedTicket = (RoomSecret, EndpointAddr, bool, Option<Capability>);
 
 /// Interprets a `/join` argument as either a bare channel name or an
 /// invite ticket.
@@ -29,7 +29,10 @@ type ParsedTicket = (RoomSecret, EndpointAddr, bool);
 /// `NetEvent::DmJoined`).
 pub(super) fn parse_join_arg(arg: &str) -> Result<(String, Option<ParsedTicket>), String> {
     match ChannelTicket::decode_string(arg) {
-        Ok(ticket) => Ok((ticket.name, Some((ticket.secret, ticket.addr, ticket.dm)))),
+        Ok(ticket) => Ok((
+            ticket.name,
+            Some((ticket.secret, ticket.addr, ticket.dm, ticket.docs)),
+        )),
         Err(ParseError::Kind { .. }) => Ok((arg.trim().to_string(), None)),
         Err(err) => Err(format!(
             "that looks like an invite ticket but it won't decode (maybe it got truncated when copied?): {err}"

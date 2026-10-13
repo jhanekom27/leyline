@@ -24,6 +24,7 @@ mod settings;
 mod storage;
 #[cfg(test)]
 mod sync_docs;
+mod sync_index;
 mod term_events;
 mod thread;
 mod ticket;
@@ -41,7 +42,6 @@ use anyhow::Context;
 use arboard::Clipboard;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
 use crossterm::execute;
-use iroh::EndpointAddr;
 use iroh_tickets::Ticket;
 use tokio::sync::mpsc;
 use tokio::time::interval;
@@ -70,7 +70,6 @@ use search::{SearchOutcome, run_on_disk_scan};
 use settings::Settings;
 use storage::MessageStore;
 use term_events::TermEvents;
-use ticket::RoomSecret;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -128,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
     // What to rejoin from the previous session -- see channel_registry.rs
     // and `Net::start`. Empty on a first run (just "general" then) --
     // unless `--pair` just seeded it with another device's channels.
-    let known_channels = channel_snapshot(&registry);
+    let known_channels = registry.snapshot();
 
     let (net_tx, net_rx) = mpsc::channel(64);
     let (net, joined_channels, active_channel) = Net::start(
@@ -136,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
         user_key,
         args.join,
         known_channels,
+        data_dir.join("docs"),
         settings.nickname(),
         net_tx,
         backfill.clone(),
@@ -229,24 +229,6 @@ fn parse_args() -> anyhow::Result<Args> {
     Ok(Args { join, pair })
 }
 
-/// Snapshots every currently-known channel's name, room secret, and known
-/// peer addresses -- the shape both `Net::start`'s `known_channels` and a
-/// pairing ticket's payload (`net::Net::create_pairing_ticket`) need.
-/// Shared so the two can never drift apart.
-fn channel_snapshot(registry: &ChannelRegistry) -> Vec<(String, RoomSecret, Vec<EndpointAddr>)> {
-    registry
-        .channel_names()
-        .into_iter()
-        .map(|name| {
-            let secret = registry
-                .secret_for(&name)
-                .expect("a recorded channel always has a room secret");
-            let addrs = registry.bootstrap_for(&name);
-            (name, secret, addrs)
-        })
-        .collect()
-}
-
 /// Local state that would otherwise conflict with or leak into the
 /// identity a confirmed live `/pair <ticket>` redeem is about to adopt --
 /// see `restart_for_pairing`. Paths are relative to `data_dir`/
@@ -263,6 +245,7 @@ fn paths_to_wipe_for_pairing(data_dir: &Path, config_dir: &Path) -> Vec<PathBuf>
         data_dir.join("channels"),
         data_dir.join("messages"),
         data_dir.join("blobs"),
+        data_dir.join("docs"),
         data_dir.join("contacts"),
         data_dir.join("channel_renames"),
         data_dir.join("autosave"),
@@ -511,6 +494,10 @@ async fn run(
             .expect("just-joined channel must have a recorded secret");
         if let Err(err) = registry.record_channel(name, secret) {
             warn!(channel = %name, "failed to persist joined channel: {err}");
+        } else if let Some(docs) = net.docs_for(name)
+            && let Err(err) = registry.record_docs(name, docs)
+        {
+            warn!(channel = %name, "failed to persist channel index capability: {err}");
         }
         match store.load(name) {
             Ok(history) => {
@@ -686,7 +673,7 @@ async fn run(
                                 app.push_system(format!("invite for {heading}: {ticket}{suffix}"));
                             }
                             Some(InputAction::Pair) => {
-                                let snapshot = channel_snapshot(&registry);
+                                let snapshot = registry.snapshot();
                                 let ticket = net.create_pairing_ticket(snapshot).encode_string();
                                 let copied = clipboard.as_mut().is_some_and(|clipboard| {
                                     clipboard.set_text(ticket.clone()).is_ok()
@@ -952,6 +939,10 @@ async fn run(
                     let is_new = !registry.channel_names().iter().any(|known| known == name);
                     if let Err(err) = registry.record_channel(name, secret) {
                         warn!(channel = %name, "failed to persist joined channel: {err}");
+                    } else if let Some(docs) = net.docs_for(name)
+                        && let Err(err) = registry.record_docs(name, docs)
+                    {
+                        warn!(channel = %name, "failed to persist channel index capability: {err}");
                     } else if is_new && !matches!(&net_event, NetEvent::ChannelSyncJoined(_)) {
                         // Tell our other devices too, over the private
                         // device-sync channel (see `Net::
@@ -1047,6 +1038,13 @@ async fn run(
                         if !forgotten_devices.is_forgotten(&announce.sender) {
                             net.sync_channel(&tag, announce);
                         }
+                    }
+                    NetEvent::IndexChanged(channel, key) => {
+                        debug!(
+                            %channel,
+                            path = %String::from_utf8_lossy(&key),
+                            "replicated file index changed; filesystem application is deferred"
+                        );
                     }
                     // A peer reached us over a point-to-point connection
                     // for the first time this session (see `direct.rs`) --

@@ -19,18 +19,21 @@ use iroh::{
     address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router,
 };
 use iroh_blobs::Hash;
+use iroh_docs::Capability;
 use iroh_gossip::{
     api::{Event as GossipEvent, GossipReceiver, GossipSender},
     net::{GOSSIP_ALPN, Gossip},
     proto::TopicId,
 };
 use iroh_tickets::{ParseError, Ticket};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::backfill::BackfillStore;
+use crate::channel_registry::KnownChannel;
 use crate::direct::{self, Direct};
 use crate::files::{self, SaveMode, StagedAttachment, StagedSource};
 use crate::message::{
@@ -38,6 +41,7 @@ use crate::message::{
     IdentityAnnounce, VersionAnnounce, now_unix_ms,
 };
 use crate::pairing::{self, PairingProtocol};
+use crate::sync_index::SyncIndex;
 use crate::ticket::{ChannelTicket, PairingTicket, RoomSecret};
 use crate::version;
 
@@ -204,10 +208,24 @@ pub enum NetEvent {
     /// plain text -- shared as an ordinary chat message, the same as if it
     /// had been typed and sent.
     ClipboardText(String, String),
+    /// A replicated file-index entry changed. The runtime deliberately does
+    /// not apply it to the filesystem; a later sync-folder feature owns that.
+    IndexChanged(String, Vec<u8>),
     /// `/paste` couldn't find anything to share (an empty or unreadable
     /// clipboard, or the clipboard itself was unavailable) -- see
     /// `Net::paste`.
     PasteFailed(String),
+}
+
+/// Metadata replicated as the value for a path-keyed channel index entry.
+/// The path itself is the document key; this data is deliberately only an
+/// index description and never instructs the runtime to write a file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileIndexEntry {
+    pub content_hash: Hash,
+    pub size: u64,
+    pub modified_unix_ms: u64,
+    pub author: [u8; 32],
 }
 
 /// A channel's gossip topic is derived from its private `RoomSecret`, not
@@ -229,6 +247,7 @@ pub enum NetEvent {
 /// has to abort these tasks explicitly to drop it.
 struct JoinedChannel {
     secret: RoomSecret,
+    docs: Capability,
     sender: GossipSender,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -289,6 +308,7 @@ pub struct Net {
     /// mirrors `pairing` above. See `direct.rs` for the point-to-point
     /// connection lifecycle this owns.
     direct: Arc<Direct>,
+    sync_index: SyncIndex,
 }
 
 impl Net {
@@ -319,7 +339,8 @@ impl Net {
         secret_key: SecretKey,
         user_key: SecretKey,
         join_ticket: Option<String>,
-        known_channels: Vec<(String, RoomSecret, Vec<EndpointAddr>)>,
+        known_channels: Vec<KnownChannel>,
+        docs_dir: PathBuf,
         nickname: Option<String>,
         events_tx: mpsc::Sender<NetEvent>,
         backfill: BackfillStore,
@@ -367,11 +388,20 @@ impl Net {
         }
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
+        let (sync_index, docs_protocol) = SyncIndex::start(
+            docs_dir,
+            endpoint.clone(),
+            backfill.blob_store(),
+            gossip.clone(),
+            events_tx.clone(),
+        )
+        .await?;
         let pairing = Arc::new(PairingProtocol::new());
         let direct = Arc::new(Direct::new(endpoint.clone(), events_tx.clone()));
         let router = Router::builder(endpoint)
             .accept(GOSSIP_ALPN, gossip.clone())
             .accept(iroh_blobs::ALPN, backfill.protocol_handler())
+            .accept(iroh_docs::ALPN, docs_protocol)
             .accept(pairing::PAIRING_ALPN, pairing.clone())
             .accept(direct::DIRECT_ALPN, direct.clone())
             .spawn();
@@ -392,6 +422,7 @@ impl Net {
             user_key_bytes,
             pairing,
             direct,
+            sync_index,
         };
 
         // A ticket naming our own identity can't reach anyone -- an invite
@@ -420,9 +451,9 @@ impl Net {
         // still its own private room rather than a well-known public one.
         let general_known = known_channels
             .iter()
-            .find(|(name, _, _)| name.as_str() == DEFAULT_CHANNEL);
+            .find(|known| known.name == DEFAULT_CHANNEL);
         let general_secret = general_known
-            .map(|(_, secret, _)| *secret)
+            .map(|known| known.secret)
             .or_else(|| {
                 ticket
                     .as_ref()
@@ -431,28 +462,34 @@ impl Net {
             })
             .unwrap_or_else(RoomSecret::generate);
         let mut general_bootstrap = general_known
-            .map(|(_, _, addrs)| addrs.clone())
+            .map(|known| known.peers.clone())
             .unwrap_or_default();
         if let Some(t) = ticket.as_ref().filter(|t| t.name == DEFAULT_CHANNEL) {
             general_bootstrap.push(t.addr.clone());
         }
-        net.subscribe_and_register(DEFAULT_CHANNEL, general_secret, general_bootstrap)
-            .await
-            .context("failed to join default channel")?;
+        let general_docs = general_known.and_then(|known| known.docs.clone());
+        net.subscribe_and_register(
+            DEFAULT_CHANNEL,
+            general_secret,
+            general_docs,
+            general_bootstrap,
+        )
+        .await
+        .context("failed to join default channel")?;
         joined.push(DEFAULT_CHANNEL.to_string());
 
-        for (name, secret, addrs) in &known_channels {
-            if name.as_str() == DEFAULT_CHANNEL || name.as_str() == DEVICE_SYNC_CHANNEL {
+        for known in &known_channels {
+            if known.name == DEFAULT_CHANNEL || known.name == DEVICE_SYNC_CHANNEL {
                 continue;
             }
-            let mut bootstrap = addrs.clone();
-            if let Some(t) = ticket.as_ref().filter(|t| t.name.as_str() == name.as_str()) {
+            let mut bootstrap = known.peers.clone();
+            if let Some(t) = ticket.as_ref().filter(|t| t.name == known.name) {
                 bootstrap.push(t.addr.clone());
             }
-            net.subscribe_and_register(name, *secret, bootstrap)
+            net.subscribe_and_register(&known.name, known.secret, known.docs.clone(), bootstrap)
                 .await
-                .with_context(|| format!("failed to rejoin channel {name:?}"))?;
-            joined.push(name.clone());
+                .with_context(|| format!("failed to rejoin channel {:?}", known.name))?;
+            joined.push(known.name.clone());
         }
 
         // Every device also joins its own private device-sync channel
@@ -467,12 +504,13 @@ impl Net {
         let device_sync_secret = RoomSecret::derive_from_user_key(&user_key_bytes);
         let device_sync_bootstrap = known_channels
             .iter()
-            .find(|(name, _, _)| name.as_str() == DEVICE_SYNC_CHANNEL)
-            .map(|(_, _, addrs)| addrs.clone())
+            .find(|known| known.name == DEVICE_SYNC_CHANNEL)
+            .map(|known| known.peers.clone())
             .unwrap_or_default();
         net.subscribe_and_register(
             DEVICE_SYNC_CHANNEL,
             device_sync_secret,
+            None,
             device_sync_bootstrap,
         )
         .await
@@ -480,7 +518,7 @@ impl Net {
 
         let active = match &ticket {
             Some(t) if !joined.contains(&t.name) => {
-                net.subscribe_and_register(&t.name, t.secret, vec![t.addr.clone()])
+                net.subscribe_and_register(&t.name, t.secret, t.docs.clone(), vec![t.addr.clone()])
                     .await
                     .with_context(|| format!("failed to join channel {:?}", t.name))?;
                 joined.push(t.name.clone());
@@ -491,6 +529,18 @@ impl Net {
         };
 
         Ok((net, joined, active))
+    }
+
+    /// Publishes metadata for a path into an already-joined channel index.
+    /// This does not read or write any channel-folder data.
+    pub fn set_index_entry(
+        &self,
+        channel: &str,
+        path: String,
+        entry: FileIndexEntry,
+    ) -> anyhow::Result<()> {
+        let metadata = postcard::to_stdvec(&entry).context("failed to encode file index entry")?;
+        self.sync_index.set(channel, path, metadata)
     }
 
     /// Subscribes to `secret`'s topic, registers `name` to the resulting
@@ -506,6 +556,7 @@ impl Net {
         &self,
         name: &str,
         secret: RoomSecret,
+        docs: Option<Capability>,
         bootstrap: Vec<EndpointAddr>,
     ) -> anyhow::Result<()> {
         for addr in &bootstrap {
@@ -514,6 +565,11 @@ impl Net {
         let bootstrap_ids: Vec<EndpointId> = bootstrap.iter().map(|addr| addr.id).collect();
 
         let topic = topic_for_secret(&secret);
+        let docs = self
+            .sync_index
+            .join(name, docs, bootstrap.clone())
+            .await
+            .with_context(|| format!("failed to join index for channel {name}"))?;
         let (sender, receiver) = self
             .gossip
             .subscribe(topic, bootstrap_ids.clone())
@@ -540,6 +596,7 @@ impl Net {
                 name.to_string(),
                 JoinedChannel {
                     secret,
+                    docs,
                     sender,
                     tasks,
                 },
@@ -559,6 +616,14 @@ impl Net {
             .expect("channels lock poisoned")
             .get(name)
             .map(|c| c.secret)
+    }
+
+    pub fn docs_for(&self, name: &str) -> Option<Capability> {
+        self.channels
+            .lock()
+            .expect("channels lock poisoned")
+            .get(name)
+            .map(|channel| channel.docs.clone())
     }
 
     /// Our own canonical user identity -- the shared user key's public
@@ -620,7 +685,7 @@ impl Net {
             .expect("channels lock poisoned")
             .get(&name)
             .map(|c| c.secret);
-        let ticket_secret = ticket.as_ref().map(|(secret, _, _)| *secret);
+        let ticket_secret = ticket.as_ref().map(|(secret, _, _, _)| *secret);
         if let (Some(existing), Some(from_ticket)) = (existing_secret, ticket_secret)
             && existing != from_ticket
         {
@@ -631,7 +696,7 @@ impl Net {
 
         let self_ticket = ticket
             .as_ref()
-            .is_some_and(|(_, addr, _)| is_self(addr, self.our_id));
+            .is_some_and(|(_, addr, _, _)| is_self(addr, self.our_id));
         // The peer a DM-flagged ticket names as its sharer, so this side
         // can record them as our DM partner for `name` too (see
         // `crate::dm_registry`) -- `None` for a bare name (nothing to read
@@ -639,9 +704,9 @@ impl Net {
         // self-referential one (can't DM yourself).
         let dm_peer = ticket
             .as_ref()
-            .filter(|(_, _, dm)| *dm)
+            .filter(|(_, _, dm, _)| *dm)
             .filter(|_| !self_ticket)
-            .map(|(_, addr, _)| *addr.id.as_bytes());
+            .map(|(_, addr, _, _)| *addr.id.as_bytes());
 
         if existing_secret.is_some() {
             let event = match dm_peer {
@@ -655,7 +720,8 @@ impl Net {
             return None;
         }
         let secret = ticket_secret.unwrap_or_else(RoomSecret::generate);
-        let bootstrap = ticket.map(|(_, addr, _)| addr);
+        let docs_capability = ticket.as_ref().and_then(|(_, _, _, docs)| docs.clone());
+        let bootstrap = ticket.map(|(_, addr, _, _)| addr);
         let bootstrap = if self_ticket { None } else { bootstrap };
         let message = self_ticket.then(|| {
             format!(
@@ -663,17 +729,30 @@ impl Net {
             )
         });
 
-        let topic = topic_for_secret(&secret);
         let gossip = self.gossip.clone();
         let address_lookup = self.address_lookup.clone();
         let channels = Arc::clone(&self.channels);
         let events_tx = self.events_tx.clone();
         let endpoint = self.router.endpoint().clone();
+        let sync_index = self.sync_index.clone();
         tokio::spawn(async move {
             if let Some(addr) = &bootstrap {
                 address_lookup.add_endpoint_info(addr.clone());
             }
             let bootstrap_ids: Vec<EndpointId> = bootstrap.iter().map(|addr| addr.id).collect();
+            let docs = match sync_index
+                .join(&name, docs_capability, bootstrap.iter().cloned().collect())
+                .await
+            {
+                Ok(docs) => docs,
+                Err(err) => {
+                    let _ = events_tx
+                        .send(NetEvent::JoinFailed(name, err.to_string()))
+                        .await;
+                    return;
+                }
+            };
+            let topic = topic_for_secret(&secret);
 
             match gossip.subscribe(topic, bootstrap_ids.clone()).await {
                 Ok(topic_handle) => {
@@ -692,6 +771,7 @@ impl Net {
                         name.clone(),
                         JoinedChannel {
                             secret,
+                            docs,
                             sender,
                             tasks,
                         },
@@ -742,17 +822,27 @@ impl Net {
             .filter(|addr| !is_self(addr, self.our_id))
             .collect();
 
-        let topic = topic_for_secret(&secret);
         let gossip = self.gossip.clone();
         let address_lookup = self.address_lookup.clone();
         let channels = Arc::clone(&self.channels);
         let events_tx = self.events_tx.clone();
         let endpoint = self.router.endpoint().clone();
+        let sync_index = self.sync_index.clone();
         tokio::spawn(async move {
             for addr in &bootstrap {
                 address_lookup.add_endpoint_info(addr.clone());
             }
             let bootstrap_ids: Vec<EndpointId> = bootstrap.iter().map(|addr| addr.id).collect();
+            let docs = match sync_index.join(&name, None, bootstrap.clone()).await {
+                Ok(docs) => docs,
+                Err(err) => {
+                    let _ = events_tx
+                        .send(NetEvent::JoinFailed(name, err.to_string()))
+                        .await;
+                    return;
+                }
+            };
+            let topic = topic_for_secret(&secret);
 
             match gossip.subscribe(topic, bootstrap_ids.clone()).await {
                 Ok(topic_handle) => {
@@ -771,6 +861,7 @@ impl Net {
                         name.clone(),
                         JoinedChannel {
                             secret,
+                            docs,
                             sender,
                             tasks,
                         },
@@ -808,6 +899,7 @@ impl Net {
                 for task in joined.tasks {
                     task.abort();
                 }
+                self.sync_index.leave(channel);
                 debug!(%channel, "left channel");
             }
             None => warn!(%channel, "tried to leave a channel that wasn't joined"),
@@ -1331,16 +1423,13 @@ impl Net {
     /// topic id for each channel and could never actually form a gossip
     /// mesh with the very device it just paired with. Synchronous, like
     /// `ticket_for`.
-    pub fn create_pairing_ticket(
-        &self,
-        channels: Vec<(String, RoomSecret, Vec<EndpointAddr>)>,
-    ) -> PairingTicket {
+    pub fn create_pairing_ticket(&self, channels: Vec<KnownChannel>) -> PairingTicket {
         let our_addr = self.router.endpoint().addr();
         let channels = channels
             .into_iter()
-            .map(|(name, secret, mut peers)| {
-                peers.push(our_addr.clone());
-                (name, secret, peers)
+            .map(|mut channel| {
+                channel.peers.push(our_addr.clone());
+                channel
             })
             .collect();
         self.pairing
@@ -1369,6 +1458,7 @@ impl Net {
             secret,
             addr: self.router.endpoint().addr(),
             dm,
+            docs: self.docs_for(channel),
         }
         .encode_string()
     }
@@ -1596,12 +1686,17 @@ mod tests {
             secret,
             addr: addr.clone(),
             dm: false,
+            docs: None,
         }
         .encode_string();
 
         let (name, ticket) = parse_join_arg(&encoded).unwrap();
         assert_eq!(name, "general");
-        assert_eq!(ticket, Some((secret, addr, false)));
+        let (parsed_secret, parsed_addr, dm, docs) = ticket.unwrap();
+        assert_eq!(parsed_secret, secret);
+        assert_eq!(parsed_addr, addr);
+        assert!(!dm);
+        assert!(docs.is_none());
     }
 
     #[test]
@@ -1613,12 +1708,17 @@ mod tests {
             secret,
             addr: addr.clone(),
             dm: true,
+            docs: None,
         }
         .encode_string();
 
         let (name, ticket) = parse_join_arg(&encoded).unwrap();
         assert_eq!(name, "dm-alice");
-        assert_eq!(ticket, Some((secret, addr, true)));
+        let (parsed_secret, parsed_addr, dm, docs) = ticket.unwrap();
+        assert_eq!(parsed_secret, secret);
+        assert_eq!(parsed_addr, addr);
+        assert!(dm);
+        assert!(docs.is_none());
     }
 
     #[test]
@@ -1628,6 +1728,7 @@ mod tests {
             secret: RoomSecret::generate(),
             addr: sample_addr(),
             dm: false,
+            docs: None,
         }
         .encode_string();
         // Simulate a ticket cut off partway through, e.g. by a terminal

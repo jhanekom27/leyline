@@ -29,9 +29,9 @@ use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use tracing::warn;
 
-use crate::channel_registry::ChannelRegistry;
+use crate::channel_registry::{ChannelRegistry, KnownChannel};
 use crate::identity;
-use crate::ticket::{PairingTicket, RoomSecret};
+use crate::ticket::PairingTicket;
 
 /// ALPN for the pairing protocol -- registered on the same `Router` as
 /// gossip and blobs (see `net.rs`), but only ever used for this one-shot
@@ -67,7 +67,7 @@ pub struct PairingPayload {
     /// material as raw bytes rather than depending on an external crate's
     /// wire format for something this sensitive.
     pub user_key: [u8; 32],
-    pub channels: Vec<(String, RoomSecret, Vec<EndpointAddr>)>,
+    pub channels: Vec<KnownChannel>,
 }
 
 /// Redacts the raw user key so an accidental `{:?}` can't leak it --
@@ -132,7 +132,7 @@ impl PairingProtocol {
         &self,
         addr: EndpointAddr,
         user_key: [u8; 32],
-        channels: Vec<(String, RoomSecret, Vec<EndpointAddr>)>,
+        channels: Vec<KnownChannel>,
     ) -> PairingTicket {
         let secret: [u8; 32] = rand::random();
         *self.pending.lock().expect("pairing lock poisoned") = Some(PendingPairing {
@@ -255,10 +255,13 @@ pub async fn bootstrap(
 
     identity::persist(user_key_path, &SecretKey::from_bytes(&payload.user_key))
         .context("failed to persist the received user key")?;
-    for (name, secret, peers) in payload.channels {
-        registry.record_channel(&name, secret)?;
-        for peer in peers {
-            registry.record_peer(&name, peer)?;
+    for channel in payload.channels {
+        registry.record_channel(&channel.name, channel.secret)?;
+        if let Some(docs) = channel.docs {
+            registry.record_docs(&channel.name, docs)?;
+        }
+        for peer in channel.peers {
+            registry.record_peer(&channel.name, peer)?;
         }
     }
     Ok(())
@@ -272,6 +275,7 @@ mod tests {
     use iroh::TransportAddr;
 
     use super::*;
+    use crate::ticket::RoomSecret;
 
     fn sample_addr() -> EndpointAddr {
         EndpointAddr::from_parts(
@@ -319,12 +323,17 @@ mod tests {
     #[test]
     fn consume_returns_the_snapshotted_payload() {
         let pairing = PairingProtocol::new();
-        let channels = vec![("general".to_string(), RoomSecret::generate(), vec![])];
+        let channels = vec![KnownChannel {
+            name: "general".to_string(),
+            secret: RoomSecret::generate(),
+            peers: vec![],
+            docs: None,
+        }];
         let ticket = pairing.create_ticket(sample_addr(), [7; 32], channels);
         let payload = pairing.consume(ticket.secret).unwrap();
         assert_eq!(payload.user_key, [7; 32]);
         assert_eq!(payload.channels.len(), 1);
-        assert_eq!(payload.channels[0].0, "general");
+        assert_eq!(payload.channels[0].name, "general");
     }
 
     // The tests below exercise the real protocol end to end over loopback
@@ -346,7 +355,12 @@ mod tests {
     #[tokio::test]
     async fn redeem_over_a_real_connection_returns_the_exact_payload() {
         let (router, pairing) = spawn_pairing_server().await;
-        let channels = vec![("general".to_string(), RoomSecret::generate(), vec![])];
+        let channels = vec![KnownChannel {
+            name: "general".to_string(),
+            secret: RoomSecret::generate(),
+            peers: vec![],
+            docs: None,
+        }];
         let ticket = pairing.create_ticket(router.endpoint().addr(), [9; 32], channels);
 
         let client = Endpoint::bind(presets::Minimal).await.unwrap();
@@ -354,7 +368,7 @@ mod tests {
 
         assert_eq!(payload.user_key, [9; 32]);
         assert_eq!(payload.channels.len(), 1);
-        assert_eq!(payload.channels[0].0, "general");
+        assert_eq!(payload.channels[0].name, "general");
 
         client.close().await;
         router.shutdown().await.unwrap();
