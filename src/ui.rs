@@ -15,7 +15,7 @@ use ratatui::widgets::{
 };
 use textwrap::wrap;
 
-use crate::app::{AppState, Channel, SharedFile, TranscriptLine, hex_id};
+use crate::app::{AppState, Channel, FileOffer, FilesNotice, SharedFile, TranscriptLine, hex_id};
 use crate::files::{StagedAttachment, human_size};
 use crate::hyperlink;
 use crate::markdown;
@@ -664,6 +664,7 @@ fn render_files(frame: &mut Frame, app: &AppState) {
         .title_bottom(files_footer(
             app,
             highlighted.map(|position| &files[position]),
+            overlay.notice,
         ))
         .border_type(BorderType::Rounded);
     let inner = block.inner(area);
@@ -744,17 +745,39 @@ fn files_title(heading: &str, shown: usize, total: usize, width: usize) -> Strin
     format!("{lead}{}{counts} ", truncate_chars(heading, room))
 }
 
-/// What the files overlay's bottom border says: the keys that do something
-/// for the highlighted file -- `Enter` saves one that isn't saved, `Ctrl+O`
-/// opens one that is -- and nothing for the other, so no key on offer is a
-/// dead one.
-fn files_footer(app: &AppState, highlighted: Option<&SharedFile<'_>>) -> Line<'static> {
+/// What the files overlay's bottom border says: its `notice` -- why the last
+/// key did nothing -- if it has one, in the picker's notice style, else the
+/// keys that do something for the highlighted file (`AppState::file_offer`):
+/// `Enter` saves one that isn't saved, `Ctrl+O` opens a saved one that can be
+/// opened, and a saved program or script is offered neither -- so no key on
+/// offer is a dead one.
+fn files_footer(
+    app: &AppState,
+    highlighted: Option<&SharedFile<'_>>,
+    notice: Option<FilesNotice>,
+) -> Line<'static> {
+    if let Some(notice) = notice {
+        let text = match notice {
+            FilesNotice::AlreadySaved => " already saved · Ctrl+O opens it ",
+            FilesNotice::NotSaved => " not saved yet · Enter saves it ",
+            FilesNotice::SavedNotOpened => {
+                " already saved · won't open programs or scripts from here "
+            }
+        };
+        return Line::styled(
+            text,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
     Line::from(match highlighted {
         None => " Esc close ",
-        Some(shared) if app.saved_copy(shared.file.hash).is_some() => {
-            " ↑/↓ move · Ctrl+O open · Esc close "
-        }
-        Some(_) => " ↑/↓ move · Enter save · Esc close ",
+        Some(shared) => match app.file_offer(shared) {
+            FileOffer::Save => " ↑/↓ move · Enter save · Esc close ",
+            FileOffer::Open(_) => " ↑/↓ move · Ctrl+O open · Esc close ",
+            FileOffer::SavedOnly => " ↑/↓ move · Esc close ",
+        },
     })
 }
 
@@ -3629,6 +3652,128 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_a_saved_file_says_so_in_the_bottom_border_until_the_next_key() {
+        let mut app = app_with_shared_files();
+        open_files(&mut app);
+        mark_saved(&mut app, "notes.txt"); // the highlighted row
+
+        press(&mut app, KeyCode::Enter);
+
+        let rows = files_box(&app);
+        let bottom = rows.last().unwrap();
+        assert!(
+            bottom.contains("already saved · Ctrl+O opens it"),
+            "got: {bottom}"
+        );
+        assert!(
+            !bottom.contains("Esc close"),
+            "the notice takes the hints' place: {bottom}"
+        );
+        // Yellow and bold, as the picker's notices are.
+        let area = files_area(Rect::new(0, 0, 110, 24));
+        let column = bottom
+            .find("already")
+            .map(|at| bottom[..at].chars().count());
+        let cell = &render_to_buffer(&app, 110, 24)[(
+            area.x + column.expect("found above") as u16,
+            area.bottom() - 1,
+        )];
+        assert_eq!(cell.fg, Color::Yellow);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+
+        press(&mut app, KeyCode::Down);
+
+        let rows = files_box(&app);
+        let bottom = rows.last().unwrap();
+        assert!(
+            bottom.contains("Enter save"),
+            "the hints are back: {bottom}"
+        );
+        assert!(!bottom.contains("already saved"), "got: {bottom}");
+    }
+
+    #[test]
+    fn ctrl_o_on_an_unsaved_file_says_so_in_the_bottom_border() {
+        let mut app = app_with_shared_files();
+        open_files(&mut app);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+
+        let rows = files_box(&app);
+        let bottom = rows.last().unwrap();
+        assert!(
+            bottom.contains("not saved yet · Enter saves it"),
+            "got: {bottom}"
+        );
+        assert!(!bottom.contains("Esc close"), "got: {bottom}");
+    }
+
+    /// The overlay open on `general`, where the newest file is `setup.exe`,
+    /// the next `notes.txt`, and those two are saved.
+    fn app_viewing_a_saved_program() -> AppState {
+        let mut app = app_with_shared_files();
+        app.load_history(
+            "general",
+            vec![shared_file(
+                4,
+                crate::message::now_unix_ms(),
+                [7; 32],
+                "setup.exe",
+                10,
+            )],
+        );
+        open_files(&mut app);
+        let saved = |name: &str| {
+            (
+                iroh_blobs::Hash::new(name.as_bytes()),
+                PathBuf::from(format!("/files/general/{name}")),
+            )
+        };
+        app.apply_saved_files(
+            "general",
+            HashMap::from([saved("setup.exe"), saved("notes.txt")]),
+        );
+        app
+    }
+
+    #[test]
+    fn a_saved_program_is_offered_no_key_but_a_saved_document_still_is() {
+        let mut app = app_viewing_a_saved_program();
+
+        // `setup.exe` is the newest, so the highlighted row.
+        let rows = files_box(&app);
+        let bottom = rows.last().unwrap();
+        assert!(
+            bottom.contains("↑/↓ move") && bottom.contains("Esc close"),
+            "got: {bottom}"
+        );
+        assert!(
+            !bottom.contains("Enter") && !bottom.contains("Ctrl+O"),
+            "neither key has anything to do for it: {bottom}"
+        );
+
+        press(&mut app, KeyCode::Down); // `notes.txt`, saved too
+
+        let rows = files_box(&app);
+        let bottom = rows.last().unwrap();
+        assert!(bottom.contains("Ctrl+O open"), "got: {bottom}");
+    }
+
+    #[test]
+    fn both_keys_on_a_saved_program_say_it_will_not_be_opened_from_here() {
+        let mut app = app_viewing_a_saved_program();
+        let said = "already saved · won't open programs or scripts from here";
+
+        press(&mut app, KeyCode::Enter);
+        let rows = files_box(&app);
+        assert!(rows.last().unwrap().contains(said), "Enter: {rows:#?}");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        let rows = files_box(&app);
+        assert!(rows.last().unwrap().contains(said), "Ctrl+O: {rows:#?}");
+    }
+
+    #[test]
     fn with_nothing_to_act_on_the_bottom_border_only_offers_to_close() {
         let mut app = app_with_shared_files();
         open_files(&mut app);
@@ -3757,6 +3902,7 @@ mod tests {
         open_files(&mut app);
         mark_saved(&mut app, "map.png");
         type_text(&mut app, "a");
+        press(&mut app, KeyCode::Enter); // on saved `map.png`: a notice
 
         for width in 1..=30 {
             for height in 1..=8 {

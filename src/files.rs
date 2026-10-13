@@ -335,6 +335,100 @@ fn open_command(path: &Path) -> Command {
     command
 }
 
+/// The extensions (lowercase, no dot) of files that run, install or apply
+/// something when the OS opens them: programs and what installs them,
+/// scripts, and the shortcuts, launchers and settings files that send the OS
+/// wherever their author chose. See `runs_when_opened`.
+///
+/// Best effort, and wider than any one system needs: a file's name is a
+/// peer's to choose and says nothing about where it will be opened, so a
+/// script that merely opens in an editor on one system is listed because
+/// another runs it. It is not a sandbox -- what it doesn't name (a document
+/// with macros, an archive, a web page) the OS opens as it always did.
+const RUNS_WHEN_OPENED: &[&str] = &[
+    // Programs, and what installs them.
+    "exe",
+    "com",
+    "scr",
+    "pif",
+    "msi",
+    "msp",
+    "msix",
+    "appx",
+    "application",
+    "jar",
+    "jnlp",
+    "pkg",
+    "mpkg",
+    "dmg",
+    "deb",
+    "rpm",
+    "appimage",
+    // Scripts.
+    "bat",
+    "cmd",
+    "ps1",
+    "vbs",
+    "vbe",
+    "js",
+    "jse",
+    "wsf",
+    "wsh",
+    "hta",
+    "py",
+    "pyw",
+    "pl",
+    "rb",
+    "sh",
+    "bash",
+    "zsh",
+    "ksh",
+    "csh",
+    "command",
+    "tool",
+    // Shortcuts, launchers and settings that apply themselves.
+    "lnk",
+    "url",
+    "webloc",
+    "fileloc",
+    "inetloc",
+    "desktop",
+    "terminal",
+    "reg",
+    "cpl",
+    "chm",
+    "mobileconfig",
+];
+
+/// Whether opening `path` -- a saved copy of a file, whose *name* is what the
+/// OS goes by -- would run, install or apply something instead of just
+/// showing it: its extension is on `RUNS_WHEN_OPENED`. `Ctrl+O` in the files
+/// overlay refuses such a file, which is saved like any other but never
+/// handed to the OS from there (`app::AppState::file_offer`).
+///
+/// Only the file's own name counts, not the folders above it, and only its
+/// last extension, as the OS reads it: `report.pdf.exe` is a program and
+/// `setup.exe.txt` is not. The name is read twice, as written and as
+/// Windows reads it -- trailing dots and blanks dropped, and a `:` and all
+/// after it taken for a stream of the file before it -- because Windows
+/// opens `setup.exe.` and `setup.exe::$DATA` as `setup.exe`, and a peer can
+/// pick either as a name that gets past a plain look at the extension.
+pub fn runs_when_opened(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let as_windows_reads_it = name.split(':').next().unwrap_or_default();
+    [&*name, as_windows_reads_it].into_iter().any(|reading| {
+        reading
+            .trim_end_matches(['.', ' '])
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| {
+                RUNS_WHEN_OPENED.contains(&extension.to_ascii_lowercase().as_str())
+            })
+    })
+}
+
 /// A file, or a pasted image, waiting in a channel's staging area to be
 /// shared -- see `app::Channel::staged`. Staging separates *choosing*
 /// something to share (`Ctrl+V`/`/paste`) from *sending* it, so what is
@@ -1119,6 +1213,122 @@ mod tests {
         let mut missing = Command::new("leyline-no-such-launcher");
 
         assert!(missing.arg("/x").spawn().is_err());
+    }
+
+    /// `runs_when_opened` for a file called `name` in some channel folder.
+    fn runs(name: &str) -> bool {
+        runs_when_opened(&Path::new("/files/general").join(name))
+    }
+
+    #[test]
+    fn programs_scripts_and_shortcuts_are_known_by_their_extension_whatever_its_case() {
+        for name in [
+            "setup.exe",
+            "SETUP.EXE",
+            "Setup.Exe",
+            "installer.msi",
+            "tool.jar",
+            "run.bat",
+            "run.cmd",
+            "run.ps1",
+            "run.vbs",
+            "run.js",
+            "run.py",
+            "run.sh",
+            "start.command",
+            "app.pkg",
+            "disk.dmg",
+            "link.lnk",
+            "page.url",
+            "app.desktop",
+            "settings.mobileconfig",
+            "app.AppImage",
+        ] {
+            assert!(runs(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn ordinary_files_are_left_alone() {
+        for name in [
+            "report.pdf",
+            "photo.JPG",
+            "notes.txt",
+            "archive.zip",
+            "song.mp3",
+            "clip.mp4",
+            "data.csv",
+            "photo (1).png",
+            "README",
+            "Makefile",
+            // The extension is what follows a dot, not any name that is one.
+            "exe",
+            "sh",
+            "executable.txt",
+            "a.b.c",
+        ] {
+            assert!(!runs(name), "{name}");
+        }
+        assert!(!runs_when_opened(Path::new("/")), "no name, nothing to run");
+    }
+
+    #[test]
+    fn only_the_last_extension_counts() {
+        assert!(runs("report.pdf.exe"), "a program dressed as a document");
+        assert!(runs("archive.tar.sh"));
+        assert!(!runs("setup.exe.txt"), "a text file with a misleading stem");
+        assert!(!runs("notes.exe.pdf"));
+    }
+
+    #[test]
+    fn a_dotfile_named_for_an_extension_still_counts() {
+        assert!(runs(".exe"));
+    }
+
+    #[test]
+    fn only_the_file_name_counts_not_the_folders_above_it() {
+        assert!(!runs_when_opened(Path::new("/files/tools.exe/notes.txt")));
+        assert!(runs_when_opened(Path::new("/files/docs.txt/setup.exe")));
+    }
+
+    #[test]
+    fn the_names_windows_would_open_as_a_program_are_caught_too() {
+        // Windows drops trailing dots and blanks, and takes a `:` for the
+        // start of a stream of the file named before it.
+        for name in [
+            "setup.exe.",
+            "setup.exe ",
+            "setup.exe. .",
+            "setup.exe::$DATA",
+            "setup.exe:hidden",
+            "SETUP.EXE::$data",
+        ] {
+            assert!(runs(name), "{name:?}");
+        }
+        // A `:` or a trailing dot alone doesn't make a document a program.
+        for name in [
+            "notes: part 1.txt",
+            "2026-10-13T10:40:12.log",
+            "report.pdf.",
+        ] {
+            assert!(!runs(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn the_list_holds_only_extensions_that_can_match() {
+        // `runs_when_opened` compares a lowercase extension with no dot, so
+        // an entry that isn't exactly that can never match anything -- a typo
+        // that would quietly let a kind of file through.
+        for extension in RUNS_WHEN_OPENED {
+            assert!(
+                !extension.is_empty()
+                    && extension
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                "{extension:?}"
+            );
+        }
     }
 
     #[test]

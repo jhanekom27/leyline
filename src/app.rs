@@ -13,7 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use iroh_blobs::Hash;
 use iroh_tickets::Ticket;
 
-use crate::files::{StagedAttachment, channel_dir};
+use crate::files::{StagedAttachment, channel_dir, runs_when_opened};
 use crate::message::{ChatMessage, FileAttachment, now_unix_ms};
 use crate::net::{DEVICE_SYNC_CHANNEL, NetEvent};
 use crate::picker::{FilePicker, FolderListing, Step};
@@ -129,6 +129,43 @@ pub struct FilesOverlay {
     /// moment -- app.rs can't look for itself -- and nothing outside an open
     /// overlay needs it, so it lives and dies with it.
     saved: HashMap<Hash, PathBuf>,
+    /// What the last key did not do, and why -- see `FilesNotice`. Dropped by
+    /// the next key (`AppState::handle_files_key`) or paste
+    /// (`AppState::edit_files_query`).
+    pub notice: Option<FilesNotice>,
+}
+
+/// Why a key in the files overlay did nothing, said in its bottom border
+/// until the next key (`FilesOverlay::notice`). `Enter` and `Ctrl+O` each fit
+/// only some of the files (`FileOffer`), and a key that doesn't fit the
+/// highlighted one must not look like a dead key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesNotice {
+    /// `Enter` on a file that is already saved and can be opened: it is not
+    /// saved a second time, `Ctrl+O` opens it.
+    AlreadySaved,
+    /// `Ctrl+O` on a file that isn't saved: there is nothing to open yet,
+    /// `Enter` saves it.
+    NotSaved,
+    /// `Enter` or `Ctrl+O` on a file that is already saved but runs
+    /// something when opened (`files::runs_when_opened`): it is not saved a
+    /// second time, and leyline won't open it -- a program or script is
+    /// opened by hand, from the file manager, if at all.
+    SavedNotOpened,
+}
+
+/// What `Enter` and `Ctrl+O` can do for a file in the files overlay, worked
+/// out in one place (`AppState::file_offer`) so the bottom border and the
+/// two keys can't disagree about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOffer<'a> {
+    /// Not saved: `Enter` saves it.
+    Save,
+    /// Saved, and the copy at this path can be opened: `Ctrl+O` opens it.
+    Open(&'a Path),
+    /// Saved, but a kind of file that runs something when opened
+    /// (`files::runs_when_opened`): neither key has anything to do for it.
+    SavedOnly,
 }
 
 /// One file shared in a channel, as the files overlay lists it: the
@@ -592,8 +629,10 @@ pub enum InputAction {
     /// `AppState::apply_saved_files`, before the next frame is drawn.
     CheckSavedFiles(String),
     /// Open the saved file at `path` with the OS's default application --
-    /// `Ctrl+O` in the files overlay (`open_highlighted_file`). The caller
-    /// checks it is still there and hands it over
+    /// `Ctrl+O` in the files overlay (`open_highlighted_file`). Never for a
+    /// file that runs something when opened (`files::runs_when_opened`):
+    /// the overlay refuses those, so the caller hands over whatever it is
+    /// given -- once it has checked the file is still there
     /// (`files::open_in_default_app`).
     OpenFile(PathBuf),
     /// Share whatever's on the OS clipboard with `channel` -- from `/paste`
@@ -1574,6 +1613,7 @@ impl AppState {
             query: String::new(),
             selected: 0,
             saved: HashMap::new(),
+            notice: None,
         });
         Some(InputAction::CheckSavedFiles(channel))
     }
@@ -1585,8 +1625,12 @@ impl AppState {
     /// the overlay. `Ctrl+C` still force-quits, since `Esc` no longer does
     /// while it's open. Every other key is ignored -- like the switcher this
     /// is a dedicated mode, so a stray keystroke can't leak into the input
-    /// box.
+    /// box. Whatever key it is, it first drops the notice about the one
+    /// before (`FilesNotice`), which only the key that raises one puts back.
     fn handle_files_key(&mut self, key: KeyEvent) -> Option<InputAction> {
+        if let Some(overlay) = &mut self.viewing_files {
+            overlay.notice = None;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => self.should_quit = true,
@@ -1607,11 +1651,13 @@ impl AppState {
     /// Applies `edit` to the open overlay's query and puts the highlight back
     /// on the first match. The one place the query changes, so a typed
     /// character, a `Backspace` and a paste can't disagree about where the
-    /// highlight lands. A no-op if the overlay isn't open.
+    /// highlight lands. A paste doesn't pass through `handle_files_key`, so
+    /// this drops the notice too. A no-op if the overlay isn't open.
     fn edit_files_query(&mut self, edit: impl FnOnce(&mut String)) {
         if let Some(overlay) = &mut self.viewing_files {
             edit(&mut overlay.query);
             overlay.selected = 0;
+            overlay.notice = None;
         }
     }
 
@@ -1707,18 +1753,42 @@ impl AppState {
             .map(PathBuf::as_path)
     }
 
+    /// What `Enter` and `Ctrl+O` can do for `shared`, the one answer the
+    /// bottom border and both keys go by: save it if it isn't saved, open its
+    /// saved copy if that is something to open, and otherwise leave it be --
+    /// a copy that runs something when opened (`runs_when_opened`) is never
+    /// handed to the OS from here, so it is saved and that is all. Judged by
+    /// the saved copy's own name, not the one it was announced under: that is
+    /// the one the OS will go by.
+    pub fn file_offer(&self, shared: &SharedFile<'_>) -> FileOffer<'_> {
+        match self.saved_copy(shared.file.hash) {
+            None => FileOffer::Save,
+            Some(path) if runs_when_opened(path) => FileOffer::SavedOnly,
+            Some(path) => FileOffer::Open(path),
+        }
+    }
+
     /// `Enter` in the files overlay: saves the highlighted file exactly as
     /// `/save` would -- the same providers, folder and notices
     /// (`save_request`) -- and closes the overlay, so those notices, and a
     /// failure's, show in the transcript instead of behind the overlay. Does
     /// nothing, leaving the overlay open, while nothing is highlighted -- and
-    /// when the file is already saved, which `Ctrl+O` opens instead: saving
-    /// it again would only leave a second copy (`name (1).ext`) beside the
-    /// first.
+    /// when the file is already saved (`file_offer`): saving it again would
+    /// only leave a second copy (`name (1).ext`) beside the first. The
+    /// overlay says so (`FilesNotice`), pointing at `Ctrl+O` if that opens
+    /// it, rather than leave `Enter` looking dead.
     fn save_highlighted_file(&mut self) -> Option<InputAction> {
         let shared = self.highlighted_file()?;
-        if self.saved_copy(shared.file.hash).is_some() {
-            return None;
+        match self.file_offer(&shared) {
+            FileOffer::Save => {}
+            FileOffer::Open(_) => {
+                self.notify_files(FilesNotice::AlreadySaved);
+                return None;
+            }
+            FileOffer::SavedOnly => {
+                self.notify_files(FilesNotice::SavedNotOpened);
+                return None;
+            }
         }
         let (hash, filename, sender) = (
             shared.file.hash,
@@ -1731,15 +1801,36 @@ impl AppState {
 
     /// `Ctrl+O` in the files overlay: opens the highlighted file's saved copy
     /// with the OS's default application, and closes the overlay. Does
-    /// nothing, leaving it open, while the file isn't saved -- there is
-    /// nothing to open, `Enter` saves it -- or nothing is highlighted.
+    /// nothing, leaving it open, while nothing is highlighted -- and when
+    /// there is nothing to open (`file_offer`): the file isn't saved yet and
+    /// `Enter` saves it, or its copy runs something when opened
+    /// (`files::runs_when_opened`) and is never handed to the OS from here.
+    /// The overlay says which (`FilesNotice`).
     fn open_highlighted_file(&mut self) -> Option<InputAction> {
         let shared = self.highlighted_file()?;
-        let path = self.saved_copy(shared.file.hash)?.to_path_buf();
+        let path = match self.file_offer(&shared) {
+            FileOffer::Open(path) => path.to_path_buf(),
+            FileOffer::Save => {
+                self.notify_files(FilesNotice::NotSaved);
+                return None;
+            }
+            FileOffer::SavedOnly => {
+                self.notify_files(FilesNotice::SavedNotOpened);
+                return None;
+            }
+        };
         let filename = shared.file.filename.clone();
         self.viewing_files = None;
         self.push_system(format!("opening {filename}..."));
         Some(InputAction::OpenFile(path))
+    }
+
+    /// Has the open overlay say `notice` in its bottom border, until the next
+    /// key. A no-op if the overlay isn't open.
+    fn notify_files(&mut self, notice: FilesNotice) {
+        if let Some(overlay) = &mut self.viewing_files {
+            overlay.notice = Some(notice);
+        }
     }
 
     /// Hands the files overlay what the disk says about `channel`'s saved
@@ -2337,7 +2428,7 @@ impl AppState {
              unlike /msg -- /save keeps each channel's files in a folder of its own, \
              /folder shows where and, with a path, moves them all -- \
              /files lists the files shared in this channel (type to filter, \u{2191}/\u{2193} pick, \
-             Enter save, Ctrl+O open one already saved, Esc close) -- \
+             Enter save, Ctrl+O open one already saved (never a program or script), Esc close) -- \
              keys: Tab/Shift+Tab switch channels, \
              Ctrl+P jump to a channel (type to filter, \u{2191}/\u{2193} pick, Enter confirm), \
              a bare /send opens a file picker (type to filter, \u{2191}/\u{2193} pick, Space mark, \
@@ -8572,6 +8663,34 @@ mod tests {
             .query
     }
 
+    fn files_notice(app: &AppState) -> Option<FilesNotice> {
+        app.viewing_files
+            .as_ref()
+            .expect("the files overlay is open")
+            .notice
+    }
+
+    /// The overlay open on `general`, whose one file was announced as
+    /// `announced` and -- if the disk has said so -- is saved at `saved_at`.
+    fn app_viewing_file(announced: &str, saved_at: Option<&str>) -> AppState {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, announced, b"content"),
+        );
+        open_files(&mut app);
+        if let Some(path) = saved_at {
+            mark_saved(&mut app, "general", hash_of(b"content"), path);
+        }
+        app
+    }
+
+    /// `app_viewing_file` on `report.pdf`, `saved` or not.
+    fn app_viewing_report(saved: bool) -> AppState {
+        app_viewing_file("report.pdf", saved.then_some("/files/general/report.pdf"))
+    }
+
     /// The names of the files the open overlay lists, top to bottom.
     fn listed(app: &AppState) -> Vec<String> {
         app.files_matches()
@@ -8827,6 +8946,7 @@ mod tests {
         assert!(app.handle_key(key(KeyCode::Enter)).is_none());
         assert!(ctrl_o(&mut app).is_none());
         assert!(app.viewing_files.is_some());
+        assert_eq!(files_notice(&app), None, "no file, nothing to say about it");
     }
 
     #[test]
@@ -9214,6 +9334,158 @@ mod tests {
             before,
             "no `saving` notice either"
         );
+    }
+
+    #[test]
+    fn enter_on_a_file_already_saved_says_so_and_what_to_press_instead_works() {
+        let mut app = app_viewing_report(true);
+        assert_eq!(files_notice(&app), None, "nothing to say before a key");
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(files_notice(&app), Some(FilesNotice::AlreadySaved));
+        match ctrl_o(&mut app).expect("the notice points at Ctrl+O, which opens it") {
+            InputAction::OpenFile(path) => {
+                assert_eq!(path, PathBuf::from("/files/general/report.pdf"));
+            }
+            _ => panic!("expected InputAction::OpenFile"),
+        }
+    }
+
+    #[test]
+    fn ctrl_o_on_a_file_that_is_not_saved_says_so_and_what_to_press_instead_works() {
+        let mut app = app_viewing_report(false);
+
+        assert!(ctrl_o(&mut app).is_none());
+
+        assert_eq!(files_notice(&app), Some(FilesNotice::NotSaved));
+        let (_, _, filename, ..) = save_fields(app.handle_key(key(KeyCode::Enter)));
+        assert_eq!(filename, "report.pdf", "the notice points at Enter");
+    }
+
+    #[test]
+    fn a_notice_is_gone_at_the_next_key_whatever_it_is() {
+        let keys = [
+            key(KeyCode::Up),
+            key(KeyCode::Down),
+            key(KeyCode::Char('x')),
+            key(KeyCode::Backspace),
+            key(KeyCode::Left), // not a key the overlay uses
+            key(KeyCode::Tab),  // nor this
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), // nor a chord
+        ];
+        for pressed in keys {
+            let mut app = app_viewing_report(true);
+            app.handle_key(key(KeyCode::Enter));
+            assert_eq!(files_notice(&app), Some(FilesNotice::AlreadySaved));
+
+            app.handle_key(pressed);
+
+            assert_eq!(files_notice(&app), None, "after {pressed:?}");
+        }
+    }
+
+    #[test]
+    fn pressing_the_same_key_again_says_it_again() {
+        let mut app = app_viewing_report(true);
+
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(files_notice(&app), Some(FilesNotice::AlreadySaved));
+    }
+
+    #[test]
+    fn a_paste_drops_the_notice_too() {
+        let mut app = app_viewing_report(true);
+        app.handle_key(key(KeyCode::Enter));
+
+        app.paste_text("rep");
+
+        assert_eq!(files_notice(&app), None);
+    }
+
+    #[test]
+    fn a_notice_does_not_outlive_its_overlay() {
+        let mut app = app_viewing_report(true);
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Esc));
+
+        open_files(&mut app);
+
+        assert_eq!(files_notice(&app), None);
+    }
+
+    #[test]
+    fn what_a_file_is_offered_follows_whether_it_is_saved_and_whether_opening_it_would_run_it() {
+        let unsaved_program = app_viewing_file("setup.exe", None);
+        assert_eq!(
+            unsaved_program.file_offer(&unsaved_program.files_matches()[0]),
+            FileOffer::Save,
+            "saving a program is as safe as saving anything"
+        );
+
+        let saved_document = app_viewing_file("report.pdf", Some("/files/general/report.pdf"));
+        assert_eq!(
+            saved_document.file_offer(&saved_document.files_matches()[0]),
+            FileOffer::Open(Path::new("/files/general/report.pdf"))
+        );
+
+        let saved_program = app_viewing_file("setup.exe", Some("/files/general/setup.exe"));
+        assert_eq!(
+            saved_program.file_offer(&saved_program.files_matches()[0]),
+            FileOffer::SavedOnly
+        );
+    }
+
+    #[test]
+    fn ctrl_o_on_a_saved_program_is_refused_and_nothing_is_opened() {
+        let mut app = app_viewing_file("setup.exe", Some("/files/general/setup.exe"));
+        let before = app.active().messages.len();
+
+        let action = ctrl_o(&mut app);
+
+        assert!(action.is_none(), "nothing for the caller to open");
+        assert!(app.viewing_files.is_some(), "still open");
+        assert_eq!(files_notice(&app), Some(FilesNotice::SavedNotOpened));
+        assert_eq!(
+            app.active().messages.len(),
+            before,
+            "no `opening` line either"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_saved_program_says_it_is_saved_and_is_not_opened_from_here() {
+        let mut app = app_viewing_file("setup.exe", Some("/files/general/setup.exe"));
+        let before = app.active().messages.len();
+
+        let action = app.handle_key(key(KeyCode::Enter));
+
+        assert!(action.is_none(), "not saved a second time");
+        assert_eq!(files_notice(&app), Some(FilesNotice::SavedNotOpened));
+        assert_eq!(app.active().messages.len(), before);
+    }
+
+    #[test]
+    fn a_program_that_is_not_saved_yet_is_saved_like_any_file() {
+        let mut app = app_viewing_file("setup.exe", None);
+
+        let (_, _, filename, ..) = save_fields(app.handle_key(key(KeyCode::Enter)));
+
+        assert_eq!(filename, "setup.exe");
+    }
+
+    #[test]
+    fn the_saved_copys_name_decides_not_the_one_the_file_was_announced_under() {
+        // `files::sanitize_filename` keeps only the last component of a name,
+        // so a peer's "setup.exe/" is saved as `setup.exe` -- which is what
+        // the OS would run.
+        let mut app = app_viewing_file("setup.exe/", Some("/files/general/setup.exe"));
+
+        assert!(ctrl_o(&mut app).is_none());
+
+        assert_eq!(files_notice(&app), Some(FilesNotice::SavedNotOpened));
     }
 
     #[test]

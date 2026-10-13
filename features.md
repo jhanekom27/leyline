@@ -295,9 +295,30 @@ mechanisms, not one, since they trade off differently:
   `save_request` as `/save`, so providers, folder, notices and failures are
   `/save`'s, and closes the overlay, which would otherwise hide that
   feedback behind it. `Ctrl+O` opens an already saved file with the OS's
-  default application. `Enter` on a saved file does nothing, so a file is
-  never saved twice by accident, and the bottom border offers whichever of
-  the two the highlighted row can do.
+  default application. `Enter` on a saved file does not save it again, so a
+  file is never saved twice by accident, and the bottom border offers
+  whichever of the two the highlighted row can do. A key the row doesn't
+  offer -- `Enter` on a saved file, `Ctrl+O` on an unsaved one -- would look
+  dead, so it leaves a `FilesNotice` that takes the hints' place in the
+  bottom border, in the picker's notice style, until the next key or paste
+  (`already saved · Ctrl+O opens it`, `not saved yet · Enter saves it`).
+  What the keys can do for a row is worked out once -- `AppState::file_offer`,
+  a `FileOffer` -- so the bottom border and both keys agree.
+  `Ctrl+O` is the one place leyline makes the OS act on a file a peer chose:
+  `/save` only writes bytes, and a file leyline saves has none of the OS's
+  usual download caution (checked on macOS: no quarantine flag, only
+  `com.apple.provenance`). So a file whose extension means it runs, installs
+  or applies something when opened -- programs and installers, scripts,
+  shortcuts and launchers -- is saved like any other but never handed over:
+  `files::runs_when_opened` checks the saved copy's own name, which is what
+  the OS will go by, against `RUNS_WHEN_OPENED`. The list is wider than any
+  one system needs, since a peer's file name says nothing about where it
+  will be opened. The name is read as written and as Windows reads it
+  (trailing dots and blanks dropped, a `:` and what follows taken for a
+  stream), so `setup.exe.` and `setup.exe::$DATA` are caught like
+  `setup.exe`. Such a row is offered neither key; a press says
+  `already saved · won't open programs or scripts from here`, and the file is
+  opened by hand from the file manager, if at all.
   "Saved" is a fact about the disk, which app.rs never touches, and nothing
   recorded it. `NetEvent::FileSaved` now carries the channel and the content
   hash, and main.rs writes each finished save into `saved_files.rs` -- a
@@ -319,8 +340,9 @@ mechanisms, not one, since they trade off differently:
   thread; main.rs checks the file is still there first.
   Not covered: files shared further back than the channel's loaded history,
   files saved before this existed (they show as unsaved until saved again),
-  and any check of what kind of file is being opened -- see LEY-25.7's
-  notes.
+  and any check of what a file is beyond its extension -- the list is a
+  safety net, not a sandbox: a document with macros, an archive or a web
+  page still opens as the OS always did. See LEY-25.7's notes.
 
 ## Networking & sharing
 

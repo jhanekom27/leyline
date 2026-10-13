@@ -386,7 +386,10 @@ from `saved_files.rs`: a record, written when a save finishes
 channel's copy of which file is at which path, checked against the
 filesystem each time the overlay opens -- a copy that has been deleted counts
 as unsaved again. `Enter` saves exactly as `/save` does, and `Ctrl+O` hands a
-saved copy to the OS to open (`files::open_in_default_app`).
+saved copy to the OS to open (`files::open_in_default_app`) -- unless its
+extension says it runs something when opened, a program, script, installer or
+shortcut (`files::runs_when_opened`): that is saved like any file and never
+opened from here, since a peer chose its name and the OS would go by it.
 
 ## Point-to-point messaging
 
@@ -453,7 +456,7 @@ src/
   search.rs           // shared match predicate + on-disk scan for /search
   thread.rs           // reply-chain (ancestors + descendants) builder for /thread
   backfill.rs         // iroh-blobs history manifests for offline backfill
-  files.rs            // /save destination resolution (a folder per channel under the files root), filename safety, sizes, outgoing-file checks + staged attachments, drag-and-drop paste detection, opening a saved file with the OS
+  files.rs            // /save destination resolution (a folder per channel under the files root), filename safety, sizes, outgoing-file checks + staged attachments, drag-and-drop paste detection, opening a saved file with the OS (and which kinds -- programs, scripts -- never to)
   saved_files.rs      // persisted record of which channel's copy of which file /save put where, for the /files overlay's check mark and open key
   term_events.rs      // crossterm EventStream wrapper: a drop a terminal types out (Warp) becomes one paste
   picker.rs           // in-TUI file picker behind a bare /send: pure state, folder reads, remembered start folder
