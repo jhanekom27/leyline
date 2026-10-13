@@ -190,6 +190,7 @@ impl AppState {
             | NetEvent::ClipboardText(..)
             | NetEvent::PasteFailed(..)
             | NetEvent::RemoteIndex(..)
+            | NetEvent::RemoteIndexDelete { .. }
             | NetEvent::SyncFileSaved { .. }
             | NetEvent::DirectJoined { .. } => None,
         }

@@ -32,7 +32,7 @@ async fn docs_reconcile_changes_made_while_a_persistent_peer_is_offline() {
     let key = b"files/offline.txt";
 
     beta.shutdown().await;
-    let added = alpha_doc
+    alpha_doc
         .set_bytes(
             alpha_author,
             key.to_vec(),
@@ -40,10 +40,11 @@ async fn docs_reconcile_changes_made_while_a_persistent_peer_is_offline() {
         )
         .await
         .unwrap();
+    alpha_doc.del(alpha_author, key.to_vec()).await.unwrap();
 
     let beta = Peer::start_at(beta_data.path(), None).await;
     let beta_doc = beta.docs.import(ticket).await.unwrap();
-    eventual_hash(&beta_doc, key, Some(added)).await;
+    eventual_hash(&beta_doc, key, None).await;
 
     alpha.shutdown().await;
     beta.shutdown().await;

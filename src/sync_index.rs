@@ -163,6 +163,24 @@ impl SyncIndex {
         Ok(())
     }
 
+    /// Publishes a tombstone for one path so offline peers converge later.
+    pub fn delete(&self, channel: &str, path: String) -> anyhow::Result<()> {
+        let doc = self
+            .indexes
+            .lock()
+            .expect("indexes lock poisoned")
+            .get(channel)
+            .map(|index| index.doc.clone())
+            .ok_or_else(|| anyhow::anyhow!("channel index is not joined: {channel}"))?;
+        let author = self.author;
+        tokio::spawn(async move {
+            if let Err(err) = doc.del(author, path).await {
+                warn!("failed to delete channel index entry: {err}");
+            }
+        });
+        Ok(())
+    }
+
     /// Whether the resolved entry for `path` already names `content_hash`.
     /// Local publication uses this to recognize a file that sync just wrote
     /// into the folder and avoid turning that remote update into a new write.
@@ -246,6 +264,19 @@ fn watch(
                         warn!(%channel, "dropping non-UTF-8 remote index path");
                         continue;
                     };
+                    if entry.content_hash() == Hash::EMPTY {
+                        if events_tx
+                            .send(NetEvent::RemoteIndexDelete {
+                                channel: channel.clone(),
+                                path,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                     let hash = entry.content_hash();
                     if content_status == ContentStatus::Complete {
                         if !send_remote_entry(&channel, path, hash, &blobs, &events_tx).await {
@@ -386,12 +417,15 @@ mod tests {
                 )
                 .is_empty()
         );
-        let candidate = watcher
+        let change = watcher
             .stable(
                 sync_publish::scan("general".into(), source_root.path().join("general")).unwrap(),
             )
             .pop()
             .unwrap();
+        let sync_publish::Change::Present(candidate) = change else {
+            panic!("stable file must be a present change");
+        };
         let hash = alpha.backfill.add_file(&candidate.path).await.unwrap();
         alpha
             .index
@@ -434,6 +468,38 @@ mod tests {
             std::fs::read(destination).unwrap(),
             b"published from a channel folder"
         );
+        alpha.shutdown().await;
+        beta.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn publishes_a_live_tombstone_to_a_remote_peer() {
+        let alpha = Peer::start().await;
+        let mut beta = Peer::start().await;
+        let capability = alpha.index.join("general", None, vec![]).await.unwrap();
+        beta.index
+            .join(
+                "general",
+                Some(capability),
+                vec![alpha.router.endpoint().addr()],
+            )
+            .await
+            .unwrap();
+
+        alpha.index.delete("general", "removed.txt".into()).unwrap();
+        let deleted = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(NetEvent::RemoteIndexDelete { channel, path }) =
+                    beta.events.recv().await
+                {
+                    break (channel, path);
+                }
+            }
+        })
+        .await
+        .expect("remote tombstone did not arrive");
+
+        assert_eq!(deleted, ("general".into(), "removed.txt".into()));
         alpha.shutdown().await;
         beta.shutdown().await;
     }

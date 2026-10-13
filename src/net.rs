@@ -211,6 +211,9 @@ pub enum NetEvent {
     /// A decoded index entry received from another member.  The runtime owns
     /// validation and any filesystem application.
     RemoteIndex(RemoteIndexEntry),
+    /// A remote document tombstone. The runtime decides whether moving a
+    /// matching local file into recoverable trash is safe.
+    RemoteIndexDelete { channel: String, path: String },
     /// A remote index file reached its final local destination. The runtime
     /// records it as sync-originated before the local publisher next scans.
     SyncFileSaved {
@@ -593,6 +596,13 @@ impl Net {
                 warn!(%channel, "failed to publish sync index entry: {err}");
             }
         });
+    }
+
+    /// Publishes one stable local absence as a document tombstone.
+    pub fn publish_index_delete(&self, channel: String, relative: String) {
+        if let Err(err) = self.sync_index.delete(&channel, relative) {
+            warn!(%channel, "failed to publish sync index tombstone: {err}");
+        }
     }
 
     /// Subscribes to `secret`'s topic, registers `name` to the resulting

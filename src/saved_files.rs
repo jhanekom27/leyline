@@ -65,6 +65,27 @@ impl SavedFiles {
         Ok(Self { path, records })
     }
 
+    /// Updates a recorded path after runtime has moved a verified copy.
+    pub fn move_path(&mut self, channel: &str, from: &Path, to: &Path) -> anyhow::Result<()> {
+        let from = from
+            .to_str()
+            .with_context(|| format!("{} is not valid UTF-8", from.display()))?;
+        let to = to
+            .to_str()
+            .with_context(|| format!("{} is not valid UTF-8", to.display()))?;
+        let mut changed = false;
+        for record in &mut self.records {
+            if record.channel == channel && record.path == from {
+                record.path = to.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            self.save()?;
+        }
+        Ok(())
+    }
+
     /// Records that `channel`'s copy of the file `hash` is at `copy`,
     /// replacing whatever was recorded for that file in that channel before
     /// (a file saved a second time is only known by its newest copy).

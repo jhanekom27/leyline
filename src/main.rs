@@ -1096,7 +1096,32 @@ async fn run(
                                 ));
                             } else {
                                 let root = files::channel_dir(&files_root, &remote.channel);
-                                match sync_apply::reserve(&root, &remote.path) {
+                                let relocation = saved_files
+                                    .present_in(&remote.channel)
+                                    .get(&remote.entry.content_hash)
+                                    .cloned()
+                                    .map(|source| {
+                                        sync_apply::relocate(&root, &source, &remote.path)
+                                            .map(|result| (source, result))
+                                    });
+                                match relocation {
+                                    Some(Ok((source, sync_apply::Relocation::Moved(destination)))) => {
+                                        if let Err(err) = saved_files.move_path(
+                                            &remote.channel,
+                                            &source,
+                                            &destination,
+                                        ) {
+                                            warn!(%remote.channel, "failed to update relocated sync file: {err}");
+                                        }
+                                        record_remote_sync_file(
+                                            &mut sync_publish_watcher,
+                                            remote.channel,
+                                            remote.path,
+                                            destination,
+                                        );
+                                    }
+                                    Some(Ok((_source, sync_apply::Relocation::AlreadyThere))) => {}
+                                    Some(Ok((_, sync_apply::Relocation::Unavailable))) | None => match sync_apply::reserve(&root, &remote.path) {
                                     Ok(destination) => net.save_synced_file(
                                         remote.channel,
                                         remote.entry.content_hash,
@@ -1106,6 +1131,37 @@ async fn run(
                                         files::DEFAULT_MAX_FILE_SIZE,
                                     ),
                                     Err(reason) => app.push_system_to(&remote.channel, reason),
+                                    },
+                                    Some(Err(reason)) => app.push_system_to(&remote.channel, reason),
+                                }
+                            }
+                        }
+                    }
+                    NetEvent::RemoteIndexDelete { channel, path } => {
+                        if app.sync_enabled(&channel) {
+                            if !sync_publish_watcher.may_remove_remote(&channel, &path) {
+                                app.push_system_to(
+                                    &channel,
+                                    format!("sync kept locally changed {path} after a remote delete"),
+                                );
+                            } else {
+                                let root = files::channel_dir(&files_root, &channel);
+                                match sync_apply::trash(&root, &path) {
+                                    Ok(sync_apply::Trash::Moved(trash)) => {
+                                        let source = root.join(&path);
+                                        if let Err(err) = saved_files.move_path(&channel, &source, &trash) {
+                                            warn!(%channel, "failed to update trashed sync file: {err}");
+                                        }
+                                        sync_publish_watcher.removed_remote(&channel, &path);
+                                        app.push_system_to(
+                                            &channel,
+                                            format!("sync moved {path} to {}", trash.display()),
+                                        );
+                                    }
+                                    Ok(sync_apply::Trash::Missing) => {
+                                        sync_publish_watcher.removed_remote(&channel, &path);
+                                    }
+                                    Err(reason) => app.push_system_to(&channel, reason),
                                 }
                             }
                         }
@@ -1118,11 +1174,12 @@ async fn run(
                     } => {
                         let root = files::channel_dir(&files_root, &channel);
                         match path.strip_prefix(&root).ok().and_then(|path| path.to_str()) {
-                            Some(relative) => sync_publish_watcher
-                                .suppress_remote(
-                                    channel.clone(),
-                                    relative.replace(std::path::MAIN_SEPARATOR, "/"),
-                                ),
+                            Some(relative) => record_remote_sync_file(
+                                &mut sync_publish_watcher,
+                                channel.clone(),
+                                relative.replace(std::path::MAIN_SEPARATOR, "/"),
+                                path.clone(),
+                            ),
                             None => warn!(path = %path.display(), "sync file completed outside its channel folder"),
                         }
                         if let Err(err) = saved_files.record(&channel, hash, &path) {
@@ -1334,7 +1391,11 @@ async fn run(
                         Err(error) => app.push_system_to(&channel, error),
                     }
                 }
-                for candidate in sync_publish_watcher.stable(candidates) {
+                let changes = sync_publish_watcher.stable(candidates);
+                for candidate in changes.iter().filter_map(|change| match change {
+                    sync_publish::Change::Present(candidate) => Some(candidate),
+                    sync_publish::Change::Absent { .. } => None,
+                }) {
                     if candidate.size > files::DEFAULT_MAX_FILE_SIZE {
                         app.push_system_to(
                             &candidate.channel,
@@ -1355,12 +1416,17 @@ async fn run(
                         .try_into()
                         .unwrap_or(u64::MAX);
                     net.publish_index_file(
-                        candidate.channel,
-                        candidate.path,
-                        candidate.relative,
+                        candidate.channel.clone(),
+                        candidate.path.clone(),
+                        candidate.relative.clone(),
                         candidate.size,
                         modified_unix_ms,
                     );
+                }
+                for change in changes {
+                    if let sync_publish::Change::Absent { channel, relative } = change {
+                        net.publish_index_delete(channel, relative);
+                    }
                 }
                 dirty = true;
             }
@@ -1384,6 +1450,25 @@ async fn run(
     net.shutdown().await?;
 
     Ok(app.restart_with_ticket)
+}
+fn record_remote_sync_file(
+    watcher: &mut sync_publish::Watcher,
+    channel: String,
+    relative: String,
+    path: PathBuf,
+) {
+    match std::fs::metadata(&path) {
+        Ok(metadata) => watcher.record_remote(&sync_publish::Candidate {
+            channel,
+            path,
+            relative,
+            size: metadata.len(),
+            modified: metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        }),
+        Err(err) => warn!(path = %path.display(), "failed to inspect synced file: {err}"),
+    }
 }
 
 #[cfg(test)]

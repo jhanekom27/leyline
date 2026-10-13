@@ -2,7 +2,6 @@
 //!
 //! This module only observes local regular files. The runtime runs scans on
 //! Tokio's blocking pool, and networking owns blob imports and index writes.
-//! Deletes and renames deliberately produce no publication action.
 
 use std::collections::HashMap;
 use std::fs;
@@ -16,6 +15,11 @@ pub struct Candidate {
     pub relative: String,
     pub size: u64,
     pub modified: SystemTime,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    Present(Candidate),
+    Absent { channel: String, relative: String },
 }
 
 /// Recursively inventories eligible regular files below a channel folder.
@@ -81,48 +85,77 @@ fn scan_directory(
 #[derive(Default)]
 pub struct Watcher {
     previous: HashMap<(String, String), (u64, SystemTime)>,
-    remote: HashMap<(String, String), Option<(u64, SystemTime)>>,
+    remote: HashMap<(String, String), (u64, SystemTime)>,
+    published: HashMap<(String, String), ()>,
+    pending_absences: HashMap<(String, String), ()>,
 }
 
 impl Watcher {
-    /// Records a destination written by remote sync. Its first subsequent
-    /// inventory supplies the local timestamp; it remains suppressed until a
-    /// later scan observes a changed size or timestamp.
-    pub fn suppress_remote(&mut self, channel: String, relative: String) {
-        self.remote.insert((channel, relative), None);
+    /// Records a destination written by remote sync so later inventories do
+    /// not publish it back. The caller supplies the final on-disk metadata
+    /// after the atomic write completes.
+    pub fn record_remote(&mut self, candidate: &Candidate) {
+        let key = (candidate.channel.clone(), candidate.relative.clone());
+        let stamp = (candidate.size, candidate.modified);
+        self.previous.insert(key.clone(), stamp);
+        self.remote.insert(key, stamp);
     }
-    pub fn stable(&mut self, candidates: Vec<Candidate>) -> Vec<Candidate> {
+
+    /// Whether a remote tombstone may safely move this path to trash. A path
+    /// is removable only when it still exactly matches a file sync wrote;
+    /// locally-created and locally-edited files are kept as conflicts.
+    pub fn may_remove_remote(&self, channel: &str, relative: &str) -> bool {
+        let key = (channel.to_string(), relative.to_string());
+        self.remote
+            .get(&key)
+            .is_some_and(|stamp| self.previous.get(&key) == Some(stamp))
+    }
+
+    /// Forgets a remote path after its tombstone was applied, preventing the
+    /// local scan from publishing that same absence back into the document.
+    pub fn removed_remote(&mut self, channel: &str, relative: &str) {
+        let key = (channel.to_string(), relative.to_string());
+        self.previous.remove(&key);
+        self.remote.remove(&key);
+        self.published.remove(&key);
+        self.pending_absences.remove(&key);
+    }
+
+    pub fn stable(&mut self, candidates: Vec<Candidate>) -> Vec<Change> {
         let mut current = HashMap::new();
-        let mut stable = Vec::new();
+        let mut changes = Vec::new();
         for candidate in candidates {
             let key = (candidate.channel.clone(), candidate.relative.clone());
             let stamp = (candidate.size, candidate.modified);
-            let changed_remote = if let Some(remote_stamp) = self.remote.get_mut(&key) {
-                match remote_stamp {
-                    None => {
-                        *remote_stamp = Some(stamp);
-                        current.insert(key, stamp);
-                        continue;
-                    }
-                    Some(known) if known == &stamp => {
-                        current.insert(key, stamp);
-                        continue;
-                    }
-                    Some(_) => true,
-                }
-            } else {
-                false
-            };
-            if changed_remote {
+            self.pending_absences.remove(&key);
+            if self.remote.get(&key) == Some(&stamp) {
+                current.insert(key, stamp);
+                continue;
+            }
+            if self.remote.contains_key(&key) {
                 self.remote.remove(&key);
             }
             if self.previous.get(&key) == Some(&stamp) {
-                stable.push(candidate.clone());
+                self.published.insert(key.clone(), ());
+                changes.push(Change::Present(candidate.clone()));
             }
             current.insert(key, stamp);
         }
+        for key in self.published.clone().into_keys() {
+            if current.contains_key(&key) {
+                continue;
+            }
+            if self.pending_absences.insert(key.clone(), ()).is_some() {
+                self.published.remove(&key);
+                self.remote.remove(&key);
+                changes.push(Change::Absent {
+                    channel: key.0,
+                    relative: key.1,
+                });
+            }
+        }
         self.previous = current;
-        stable
+        changes
     }
 }
 
@@ -208,8 +241,17 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            watcher.stable(scan("general".into(), folder).unwrap())[0].relative,
-            "after-restart.txt"
+            watcher.stable(scan("general".into(), folder.clone()).unwrap())[0],
+            Change::Present(Candidate {
+                channel: "general".into(),
+                path: folder.join("after-restart.txt"),
+                relative: "after-restart.txt".into(),
+                size: 9,
+                modified: fs::metadata(folder.join("after-restart.txt"))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+            })
         );
     }
 
@@ -219,7 +261,11 @@ mod tests {
         let path = root.path().join("remote conflict.txt");
         fs::write(&path, b"remote").unwrap();
         let mut watcher = Watcher::default();
-        watcher.suppress_remote("general".into(), "remote conflict.txt".into());
+        let candidate = scan("general".into(), root.path().to_path_buf())
+            .unwrap()
+            .pop()
+            .unwrap();
+        watcher.record_remote(&candidate);
 
         assert!(
             watcher
@@ -244,5 +290,56 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn watcher_emits_only_a_stable_absence_for_a_published_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("note.txt");
+        fs::write(&path, b"note").unwrap();
+        let mut watcher = Watcher::default();
+        assert!(
+            watcher
+                .stable(scan("general".into(), root.path().to_path_buf()).unwrap())
+                .is_empty()
+        );
+        assert!(matches!(
+            watcher
+                .stable(scan("general".into(), root.path().to_path_buf()).unwrap())
+                .as_slice(),
+            [Change::Present(_)]
+        ));
+
+        fs::remove_file(path).unwrap();
+        assert!(
+            watcher
+                .stable(scan("general".into(), root.path().to_path_buf()).unwrap())
+                .is_empty()
+        );
+        assert_eq!(
+            watcher.stable(scan("general".into(), root.path().to_path_buf()).unwrap()),
+            vec![Change::Absent {
+                channel: "general".into(),
+                relative: "note.txt".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn remote_delete_is_allowed_only_while_remote_content_is_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("note.txt");
+        fs::write(&path, b"remote").unwrap();
+        let mut watcher = Watcher::default();
+        let candidate = scan("general".into(), root.path().to_path_buf())
+            .unwrap()
+            .pop()
+            .unwrap();
+        watcher.record_remote(&candidate);
+        assert!(watcher.may_remove_remote("general", "note.txt"));
+
+        fs::write(&path, b"local edit").unwrap();
+        watcher.stable(scan("general".into(), root.path().to_path_buf()).unwrap());
+        assert!(!watcher.may_remove_remote("general", "note.txt"));
     }
 }
