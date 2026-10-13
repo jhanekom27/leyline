@@ -120,7 +120,8 @@ mechanisms, not one, since they trade off differently:
   `/send <path>`, broadcasting a content hash + filename that peers fetch
   on demand (`/save <hash-prefix>`), the same way a history manifest is
   fetched today. Receiving never downloads anything automatically; a saved
-  file always lands in the OS Downloads folder (`files.rs`).
+  file lands in the OS Downloads folder (`files.rs`) -- in a folder of its
+  channel's, see "Per-channel save folders" below.
 - [x] **Clipboard paste-to-share** -- `/paste` (or the `Ctrl+V` keybinding)
   extends `arboard` (previously write-only, for `/invite`'s copy) to read
   the clipboard too: a real file (e.g. a Finder/Explorer copy, sharing its
@@ -238,6 +239,42 @@ mechanisms, not one, since they trade off differently:
   it right now -- its sender may be offline` instead of a raw network
   error. A provider id comes from a message, so one that isn't a valid key
   is skipped rather than failing the save for everyone else.
+- [x] **Per-channel save folders** -- every channel used to save into one
+  flat `~/Downloads/leyline/`, so files from different channels and people
+  mixed together and collided into `name (1).ext`. `/save` now writes into
+  `<files root>/<channel folder>/`, made when the first file lands in it;
+  `files::resolve_destination`, filename sanitization and the
+  `name (1).ext` handling are untouched, they just get a different
+  directory. `run_save` works that directory out
+  (`InputAction::SaveFile::dir`), so the path stays pure and testable and
+  app.rs still does no I/O. The folder is named from the channel's
+  *stored* name (`app::Channel::name`, its identity), never its label, so
+  `/rename` and `/alias` can't move it (`files::channel_dir`). A stored
+  name is not safe path material -- `/join` takes any text, and a ticket
+  brings a name chosen by whoever shared it -- and two channels must never
+  share a folder, even where `General` and `general` are one name (macOS,
+  Windows). So a name that is already a safe folder name everywhere
+  (lowercase ASCII letters, digits, `-` and `_`, not too long, not a
+  Windows device name such as `con` or `lpt1`) is the folder itself --
+  `general`, `project-x` -- and anything else becomes a readable form of
+  it, a `~` and 16 hex digits of the blake3 hash of the exact name:
+  `Team-Alpha~83f57e5b1e8db868`. A `~` never occurs in a plain name, so
+  the two kinds can't meet, and the hash keeps apart whatever differs only
+  by case, Unicode form, punctuation or what lies past the cut; the
+  readable part is only for the eye. The function is pure and frozen --
+  nothing is stored, and changing it would strand folders. A file shared
+  in several channels goes to the active channel's folder when that
+  carries it, else to the first joined channel that does, and leaving a
+  channel never touches its folder.
+  The folders live under one files root, `~/Downloads/leyline` unless
+  `/folder <path>` has moved it; a bare `/folder` says where the active
+  channel's folder is. The root is remembered in a one-line `files_root`
+  file in the data directory -- not a new field of the postcard `settings`
+  file, for the reason given for the picker's remembered folder -- and
+  pairing leaves it alone, being a preference of this device. It is the
+  groundwork for the `/files` overlay, auto-save, the outbox and synced
+  folders (LEY-25.7, LEY-26), which each need one stable place per
+  channel.
 
 ## Networking & sharing
 

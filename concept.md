@@ -342,12 +342,28 @@ a channel before its history can sync to you.
 A shared file is a `ChatMessage` whose `attachment` names a content hash in
 the same `iroh-blobs` store that backs history backfill; nothing is fetched
 until someone runs `/save`. Peers serve files out of that store, never out
-of the Downloads folder: `/send` imports a copy into it, and `/save`
-downloads into it first and only then exports a copy to Downloads
-(`files.rs`). So moving or deleting what you saved changes nothing for
-anyone else, and since the store is never garbage-collected, everyone who
-has saved a file keeps serving it -- a file outlives the session of its
-sender.
+of the folder a file was saved into: `/send` imports a copy into it, and
+`/save` downloads into it first and only then exports a copy into the
+channel's folder (`files.rs`, below). So moving or deleting what you saved
+changes nothing for anyone else, and since the store is never
+garbage-collected, everyone who has saved a file keeps serving it -- a
+file outlives the session of its sender.
+
+Where a saved file goes is `files.rs`'s business, and none of the
+network's: `<files root>/<channel folder>/<name>`, the root being
+`~/Downloads/leyline` unless `/folder <path>` moved it (kept in a one-line
+`files_root` file in the data directory). A channel's folder is named from
+its stored name -- its identity, never the label `/rename` and `/alias`
+change -- by a pure function (`files::channel_dir`): a name that is
+already safe as a folder name everywhere is the folder itself, and any
+other becomes a readable form of it, a `~` and a hash of the exact name.
+A channel's name can be chosen by whoever shared its ticket, so nothing of
+it reaches the filesystem but letters, digits, `-`, `_` and `~`; and
+since a `~` can't occur in the plain names and the hash tells the rest
+apart, two channels never share a folder, even on a filesystem that
+ignores case. app.rs works the folder out (`InputAction::SaveFile::dir`)
+without touching the disk; `files::resolve_destination` makes it when the
+first file lands in it, and settles name clashes inside it.
 
 Nothing records who has saved what, so `/save` asks everyone it knows
 (`AppState::providers_for`): the sender first, then the peers online in
@@ -424,7 +440,7 @@ src/
   search.rs           // shared match predicate + on-disk scan for /search
   thread.rs           // reply-chain (ancestors + descendants) builder for /thread
   backfill.rs         // iroh-blobs history manifests for offline backfill
-  files.rs            // /save destination resolution, filename safety, sizes, outgoing-file checks + staged attachments, drag-and-drop paste detection
+  files.rs            // /save destination resolution (a folder per channel under the files root), filename safety, sizes, outgoing-file checks + staged attachments, drag-and-drop paste detection
   term_events.rs      // crossterm EventStream wrapper: a drop a terminal types out (Warp) becomes one paste
   picker.rs           // in-TUI file picker behind a bare /send: pure state, folder reads, remembered start folder
   version.rs          // build version/git-hash constants, newer-than-ours comparison

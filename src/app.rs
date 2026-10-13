@@ -13,7 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use iroh_blobs::Hash;
 use iroh_tickets::Ticket;
 
-use crate::files::StagedAttachment;
+use crate::files::{StagedAttachment, channel_dir};
 use crate::message::{ChatMessage, now_unix_ms};
 use crate::net::{DEVICE_SYNC_CHANNEL, NetEvent};
 use crate::picker::{FilePicker, FolderListing, Step};
@@ -515,18 +515,27 @@ pub enum InputAction {
         caption: String,
     },
     /// Fetch a previously shared file and save it locally -- `hash`,
-    /// `filename`, and `providers` already resolved by `run_save`, from a
-    /// typed hash-prefix (see `resolve_attachment`) or, with none, as the
+    /// `filename`, `providers` and `dir` already resolved by `run_save`, from
+    /// a typed hash-prefix (see `resolve_attachment`) or, with none, as the
     /// newest file in the active channel (see `newest_shared_file`).
     /// `providers` are who to ask for it, best bet first: the file's sender,
-    /// then the other peers known in its channel (see `providers_for`). The
-    /// caller (`net::Net::save_file`) picks the destination and performs
-    /// the download; app.rs never touches the filesystem.
+    /// then the other peers known in its channel (see `providers_for`). `dir`
+    /// is the folder it is saved into: its channel's, under the files root
+    /// (see `channel_of_file`). The caller picks the file's name inside it
+    /// (`files::resolve_destination`) and performs the download
+    /// (`net::Net::save_file`); app.rs never touches the filesystem.
     SaveFile {
         hash: Hash,
         filename: String,
         providers: Vec<[u8; 32]>,
+        dir: PathBuf,
     },
+    /// Move the files root -- the folder every channel's folder lives in --
+    /// to the path exactly as typed after `/folder ` (see `run_folder`). The
+    /// caller (`files::set_files_root`) expands, creates and remembers it,
+    /// then reports back through `AppState::load_files_root`: app.rs never
+    /// touches the filesystem, so it can't tell whether the path will do.
+    SetFilesRoot(String),
     /// Share whatever's on the OS clipboard with `channel` -- from `/paste`
     /// or the `Ctrl+V`/`Cmd+V` keybinding (see `run_paste`). The caller
     /// (`net::Net::paste`) reads the clipboard and decides what it found;
@@ -671,6 +680,12 @@ pub struct AppState {
     /// (`load_browse_dir`) and updated whenever files are chosen. The
     /// filesystem root until seeded, so there is always somewhere to open.
     browse_dir: PathBuf,
+    /// The files root: the folder every channel's folder of saved files
+    /// lives in (`files::channel_dir`) -- seeded at startup from what was
+    /// remembered across restarts (`load_files_root`) and replaced when
+    /// `/folder <path>` takes effect. The filesystem root until seeded, like
+    /// `browse_dir`, so a save can never land in the working directory.
+    files_root: PathBuf,
     /// Counts the folder reads the picker has asked for (`ReadFolder`), so
     /// every one has an id of its own -- across pickers too, which is what
     /// keeps a slow answer to a closed picker's read from landing in the
@@ -745,6 +760,7 @@ impl AppState {
             restart_with_ticket: None,
             picking_file: None,
             browse_dir: PathBuf::from(std::path::MAIN_SEPARATOR_STR),
+            files_root: PathBuf::from(std::path::MAIN_SEPARATOR_STR),
             browse_requests: 0,
         }
     }
@@ -812,6 +828,15 @@ impl AppState {
     /// before the event loop starts -- mirrors `load_contacts`.
     pub fn load_browse_dir(&mut self, dir: PathBuf) {
         self.browse_dir = dir;
+    }
+
+    /// Seeds the files root (see `files::files_root`, which resolves what
+    /// was remembered across restarts) -- and replaces it once a `/folder
+    /// <path>` has taken effect (`InputAction::SetFilesRoot`). Intended to be
+    /// called once, right after `AppState::new`, before the event loop
+    /// starts -- mirrors `load_browse_dir`.
+    pub fn load_files_root(&mut self, root: PathBuf) {
+        self.files_root = root;
     }
 
     /// Merges a batch of possibly-historical messages fetched via backfill
@@ -1985,6 +2010,7 @@ impl AppState {
             "who" => self.run_who(),
             "send" => self.run_send(arg.trim()),
             "save" => self.run_save(arg.trim()),
+            "folder" => self.run_folder(arg.trim()),
             "paste" => self.run_paste(),
             "search" | "s" => self.run_search(arg.trim()),
             "reply" => self.run_reply(arg.trim()),
@@ -2025,13 +2051,15 @@ impl AppState {
             "commands: /join <name|ticket>, /invite, /pair [ticket], /forget-device <hex-prefix>, \
              /msg <alias|hex-prefix> [text], /dm <alias|hex-prefix|endpoint-id> [text], \
              /leave [channel], /rename [name], /who, /send [path], \
-             /save [hash-prefix], /paste, /alias <hex-prefix> <name>, /nick <name>, \
-             /search <term> (or /s), /reply [text], \
+             /save [hash-prefix], /folder [path], /paste, /alias <hex-prefix> <name>, \
+             /nick <name>, /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
              ticket for a new device to redeem, /pair <ticket> redeems one (after an \
              Enter/Esc confirmation -- this replaces this device's identity and data) -- \
              /dm connects directly to a peer's endpoint id with no ticket or gossip channel, \
-             unlike /msg -- keys: Tab/Shift+Tab switch channels, \
+             unlike /msg -- /save keeps each channel's files in a folder of its own, \
+             /folder shows where and, with a path, moves them all -- \
+             keys: Tab/Shift+Tab switch channels, \
              Ctrl+P jump to a channel (type to filter, \u{2191}/\u{2193} pick, Enter confirm), \
              a bare /send opens a file picker (type to filter, \u{2191}/\u{2193} pick, Space mark, \
              Enter open a folder or stage the marked files, Backspace up a level, Esc cancel), \
@@ -2677,7 +2705,8 @@ impl AppState {
     /// "most recent message" default -- name an older file by its prefix.
     /// Either way the file goes through the same `InputAction::SaveFile`,
     /// asking its sender and every other peer known where it was shared
-    /// (`providers_for`), not only the sender.
+    /// (`providers_for`), not only the sender, and landing in the folder of
+    /// the channel it was shared in (`channel_of_file`).
     fn run_save(&mut self, arg: &str) -> Option<InputAction> {
         let file = if arg.is_empty() {
             self.newest_shared_file()
@@ -2687,11 +2716,13 @@ impl AppState {
         match file {
             Ok((hash, filename, sender)) => {
                 let providers = self.providers_for(hash, sender);
+                let dir = channel_dir(&self.files_root, self.channel_of_file(hash));
                 self.push_system(format!("saving {filename}..."));
                 Some(InputAction::SaveFile {
                     hash,
                     filename,
                     providers,
+                    dir,
                 })
             }
             Err(err) => {
@@ -2699,6 +2730,28 @@ impl AppState {
                 None
             }
         }
+    }
+
+    /// Handles `/folder [path]`: `arg` is everything after `/folder `
+    /// (already trimmed). With no path, says where received files go: the
+    /// active channel's folder -- named from its stored name, so `/rename`
+    /// and `/alias` don't move it -- and the files root it is under. With
+    /// one, moves the files root there: strips one layer of quotes, as
+    /// `/send` does, and asks the caller to do it
+    /// (`InputAction::SetFilesRoot`), since whether the path will do depends
+    /// on the filesystem, which app.rs never touches.
+    fn run_folder(&mut self, arg: &str) -> Option<InputAction> {
+        if arg.is_empty() {
+            let channel = self.active().name.clone();
+            self.push_system(format!(
+                "files from {} are saved in {} -- every channel's folder is under {}, which /folder <path> moves",
+                self.channel_heading(&channel),
+                channel_dir(&self.files_root, &channel).display(),
+                self.files_root.display()
+            ));
+            return None;
+        }
+        Some(InputAction::SetFilesRoot(strip_quotes(arg).to_string()))
     }
 
     /// Handles `/paste` (and the `Ctrl+V`/`Cmd+V` keybinding in
@@ -3002,6 +3055,30 @@ impl AppState {
                 _ => None,
             })
             .ok_or_else(|| "no file from another peer to save in this channel".to_string())
+    }
+
+    /// The channel a saved file belongs to -- the one whose folder it goes
+    /// in (`files::channel_dir`), as its stored name: the active channel if
+    /// its transcript carries the file, else the first joined channel that
+    /// does. A file shared in several channels is saved to the one you are
+    /// looking at when it can be; `/save <prefix>` can also name a file from
+    /// a channel you aren't in, and then it goes where it was shared.
+    ///
+    /// # Panics
+    /// Panics if no joined channel carries `hash` -- the callers have just
+    /// found the file in a transcript (`resolve_attachment`,
+    /// `newest_shared_file`).
+    fn channel_of_file(&self, hash: Hash) -> &str {
+        let active = self.active();
+        let channel = if active.carries_file(hash) {
+            active
+        } else {
+            self.channels
+                .iter()
+                .find(|channel| channel.carries_file(hash))
+                .expect("a file /save resolved was found in some channel's transcript")
+        };
+        &channel.name
     }
 
     /// Who `/save` asks for the file `hash`, best bet first: its `sender`;
@@ -5693,6 +5770,7 @@ mod tests {
                 hash: resolved_hash,
                 filename,
                 providers,
+                ..
             } => {
                 assert_eq!(resolved_hash, hash);
                 assert_eq!(filename, "report.pdf");
@@ -5753,7 +5831,17 @@ mod tests {
                 hash,
                 filename,
                 providers,
+                ..
             } => (hash, filename, providers),
+            _ => panic!("expected InputAction::SaveFile"),
+        }
+    }
+
+    /// The folder a `/save` asked to save into -- panicking on anything
+    /// else.
+    fn save_dir(action: Option<InputAction>) -> PathBuf {
+        match action.expect("a /save with a file to save returns an action") {
+            InputAction::SaveFile { dir, .. } => dir,
             _ => panic!("expected InputAction::SaveFile"),
         }
     }
@@ -6090,6 +6178,218 @@ mod tests {
         let (_, _, providers) = save_request(submit(&mut app, &format!("/save {prefix}")));
 
         assert_eq!(providers, vec![PEER_ID, PEER_ID_3, PEER_ID_2]);
+    }
+
+    #[test]
+    fn save_goes_into_the_folder_of_the_channel_the_file_was_shared_in() {
+        let mut app = multi_channel_app(); // "random" is active
+        app.load_files_root(PathBuf::from("/files"));
+        receive(
+            &mut app,
+            "random",
+            file_message(1, PEER_ID, "here.pdf", b"here"),
+        );
+
+        let dir = save_dir(submit(&mut app, "/save"));
+
+        assert_eq!(dir, PathBuf::from("/files/random"));
+    }
+
+    #[test]
+    fn save_by_prefix_goes_into_the_folder_of_the_channel_that_carried_the_file() {
+        let mut app = multi_channel_app(); // "random" is active
+        app.load_files_root(PathBuf::from("/files"));
+        let message = file_message(1, PEER_ID, "elsewhere.pdf", b"elsewhere");
+        let prefix = message.attachment.as_ref().unwrap().hash.to_hex()[..8].to_string();
+        receive(&mut app, "general", message);
+
+        let dir = save_dir(submit(&mut app, &format!("/save {prefix}")));
+
+        assert_eq!(
+            dir,
+            PathBuf::from("/files/general"),
+            "not the active channel's, which never had the file"
+        );
+    }
+
+    #[test]
+    fn a_file_shared_in_two_channels_is_saved_where_you_are_looking_when_it_can_be() {
+        let mut app = multi_channel_app(); // "random" is active, "general" joined first
+        app.load_files_root(PathBuf::from("/files"));
+        let content = b"same bytes";
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", content),
+        );
+        receive(
+            &mut app,
+            "random",
+            file_message(2, PEER_ID_2, "report.pdf", content),
+        );
+        let prefix = &iroh_blobs::Hash::new(content).to_hex()[..8];
+
+        let from_random = save_dir(submit(&mut app, &format!("/save {prefix}")));
+        app.active = 0; // general
+        let from_general = save_dir(submit(&mut app, &format!("/save {prefix}")));
+
+        assert_eq!(from_random, PathBuf::from("/files/random"));
+        assert_eq!(from_general, PathBuf::from("/files/general"));
+    }
+
+    #[test]
+    fn a_file_shared_in_two_other_channels_goes_to_the_first_one_joined() {
+        let mut app = AppState::new(
+            SELF_ID,
+            vec![
+                "general".to_string(),
+                "random".to_string(),
+                "other".to_string(),
+            ],
+            "other",
+        );
+        app.load_files_root(PathBuf::from("/files"));
+        let content = b"same bytes";
+        receive(
+            &mut app,
+            "random",
+            file_message(1, PEER_ID, "report.pdf", content),
+        );
+        receive(
+            &mut app,
+            "general",
+            file_message(2, PEER_ID_2, "report.pdf", content),
+        );
+        let prefix = &iroh_blobs::Hash::new(content).to_hex()[..8];
+
+        let dir = save_dir(submit(&mut app, &format!("/save {prefix}")));
+
+        assert_eq!(dir, PathBuf::from("/files/general"));
+    }
+
+    #[test]
+    fn renaming_a_channel_does_not_move_its_folder() {
+        let mut app = app_for_the_switcher();
+        app.load_files_root(PathBuf::from("/files"));
+        app.active = 2; // project-x
+        receive(
+            &mut app,
+            "project-x",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        let before = save_dir(submit(&mut app, "/save"));
+
+        submit(&mut app, "/rename proj");
+        let after = save_dir(submit(&mut app, "/save"));
+
+        assert_eq!(app.channel_label("project-x"), "proj");
+        assert_eq!(before, PathBuf::from("/files/project-x"));
+        assert_eq!(after, before, "the label changed, the stored name did not");
+    }
+
+    #[test]
+    fn aliasing_a_peer_does_not_move_the_folder_of_a_conversation_with_them() {
+        let mut app = app_for_the_switcher(); // `Alice` labels the DM `dm-Alice`
+        app.load_files_root(PathBuf::from("/files"));
+        app.active = 1;
+        receive(
+            &mut app,
+            "dm-Alice",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        let before = save_dir(submit(&mut app, "/save"));
+
+        submit(
+            &mut app,
+            &format!("/alias {} Carol", &hex_id(&PEER_ID)[..8]),
+        );
+        let after = save_dir(submit(&mut app, "/save"));
+
+        assert_eq!(app.channel_label("dm-Alice"), "Carol");
+        assert_eq!(before, channel_dir(Path::new("/files"), "dm-Alice"));
+        assert_eq!(after, before, "the label changed, the stored name did not");
+    }
+
+    #[test]
+    fn a_dm_and_a_dm_chat_save_into_folders_named_from_their_stored_names() {
+        let mut app = app_for_the_switcher(); // `dm-Alice` and `p2p-08080808`
+        app.load_files_root(PathBuf::from("/files"));
+        receive(
+            &mut app,
+            "dm-Alice",
+            file_message(1, PEER_ID, "a.pdf", b"from alice"),
+        );
+        receive(
+            &mut app,
+            "p2p-08080808",
+            file_message(2, PEER_ID_2, "b.pdf", b"from bob"),
+        );
+
+        app.active = 1;
+        let dm = save_dir(submit(&mut app, "/save"));
+        app.active = 3;
+        let chat = save_dir(submit(&mut app, "/save"));
+
+        assert_eq!(dm, channel_dir(Path::new("/files"), "dm-Alice"));
+        assert_eq!(chat, PathBuf::from("/files/p2p-08080808"));
+        assert_ne!(dm, chat);
+    }
+
+    #[test]
+    fn a_bare_folder_says_where_received_files_go() {
+        let mut app = app_for_the_switcher();
+        app.load_files_root(PathBuf::from("/files"));
+        app.active = 2; // project-x
+        submit(&mut app, "/rename proj");
+
+        let action = submit(&mut app, "/folder");
+
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("#proj"), "names the channel, got: {last}");
+        assert!(
+            last.contains("/files/project-x"),
+            "the channel's folder is the stored name's, got: {last}"
+        );
+        assert!(last.contains("under /files,"), "and the root, got: {last}");
+    }
+
+    #[test]
+    fn folder_with_a_path_asks_to_move_the_files_root_and_strips_one_layer_of_quotes() {
+        let mut app = app();
+
+        for (typed, expected) in [
+            ("~/Documents/leyline", "~/Documents/leyline"),
+            ("\"/my files\"", "/my files"),
+            ("  relative/dir  ", "relative/dir"),
+        ] {
+            match submit(&mut app, &format!("/folder {typed}")) {
+                Some(InputAction::SetFilesRoot(path)) => assert_eq!(path, expected, "{typed}"),
+                _ => panic!("expected InputAction::SetFilesRoot for {typed}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_files_root_that_took_effect_decides_where_the_next_save_goes() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        app.load_files_root(PathBuf::from("/old"));
+        assert_eq!(
+            save_dir(submit(&mut app, "/save")),
+            PathBuf::from("/old/general")
+        );
+
+        app.load_files_root(PathBuf::from("/new"));
+
+        assert_eq!(
+            save_dir(submit(&mut app, "/save")),
+            PathBuf::from("/new/general")
+        );
     }
 
     #[test]

@@ -1,19 +1,41 @@
 //! Local filesystem policy for shared files -- see features.md's "File
 //! sharing" idea. Kept separate from backfill.rs (which only knows about
-//! content-addressed blobs, not real paths) and net.rs (transport): this is
-//! where a peer's announced filename turns into an actual, safe path on
-//! disk, where "where did it go" gets answered with zero configuration,
-//! and -- on the way out -- where a file someone wants to share is checked
-//! before it is staged (`stage_file`/`stage_image`) and where a pasted path
-//! is recognized as a drag-and-drop (`dropped_files`).
+//! content-addressed blobs, not real paths) and net.rs (transport): this
+//! is where a peer's announced filename turns into an actual, safe path on
+//! disk -- in a folder of its own channel's (`channel_dir`) under the one
+//! files root (`files_root`) -- where "where did it go" gets answered with
+//! zero configuration, and -- on the way out -- where a file someone wants
+//! to share is checked before it is staged (`stage_file`/`stage_image`) and
+//! where a pasted path is recognized as a drag-and-drop (`dropped_files`).
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+use tracing::warn;
 
 /// Subfolder created under the OS Downloads directory (or the fallback
 /// below) so everything leyline has ever saved lives in one place instead
 /// of cluttering the top-level Downloads folder.
 const SUBDIR: &str = "leyline";
+
+/// File in leyline's data directory that remembers where received files go
+/// -- see `files_root`. A one-line text file of its own, deliberately not a
+/// field of the postcard `settings` file, for the reason picker.rs's
+/// `REMEMBERED_FOLDER` gives: postcard isn't self-describing, so a longer
+/// struct would fail to decode an existing file and silently reset the
+/// nickname and bell setting saved in it.
+const FILES_ROOT_FILE: &str = "files_root";
+
+/// The longest channel name used as a folder name just as it is, and the
+/// longest readable part of any other -- see `channel_folder`.
+const MAX_FOLDER_NAME_CHARS: usize = 48;
+
+/// How many hex digits of the hash of its name a channel folder carries when
+/// the name isn't safe as it is: 64 bits, so that two names ending up in one
+/// folder is out of the question -- by accident, and by design too, since a
+/// channel's name can come from whoever shared its ticket.
+const FOLDER_HASH_HEX_DIGITS: usize = 16;
 
 /// How many "name (n).ext" candidates to try before giving up -- a safety
 /// valve against a pathological loop, not a realistic limit.
@@ -25,16 +47,152 @@ const MAX_COLLISION_ATTEMPTS: u32 = 1000;
 /// store, so a shared file's bytes are duplicated on disk locally.
 pub const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
 
-/// Where downloaded files land by default: the OS Downloads folder (via
-/// `directories::UserDirs`) under a `leyline/` subfolder, so a saved file
-/// ends up somewhere the user would actually think to look, with zero
-/// configuration. Falls back to `fallback_base` (leyline's own data
-/// directory) if no Downloads folder can be resolved at all -- e.g. no
-/// resolvable home directory -- so saving always has somewhere to go.
-pub fn downloads_dir(fallback_base: &Path) -> PathBuf {
+/// Where received files go until `set_files_root` says otherwise: the OS
+/// Downloads folder (via `directories::UserDirs`) under a `leyline/`
+/// subfolder, so a saved file ends up somewhere the user would actually
+/// think to look, with zero configuration. Falls back to `fallback_base`
+/// (leyline's own data directory) if no Downloads folder can be resolved at
+/// all -- e.g. no resolvable home directory -- so saving always has
+/// somewhere to go.
+fn downloads_dir(fallback_base: &Path) -> PathBuf {
     directories::UserDirs::new()
         .and_then(|dirs| dirs.download_dir().map(|dir| dir.join(SUBDIR)))
         .unwrap_or_else(|| fallback_base.join("downloads"))
+}
+
+/// The files root: the one folder every channel's folder lives in
+/// (`channel_dir`). What `set_files_root` last recorded in `data_dir`, else
+/// `downloads_dir` -- the `leyline` subfolder of the OS Downloads folder,
+/// which is where every saved file went before channels had folders.
+///
+/// Read like `settings::Settings::load` reads its file: no file is simply
+/// the default, and content that isn't an absolute path (hand-edited, or cut
+/// short by a crash mid-write) is logged and ignored -- but a genuine I/O
+/// error (permission denied, say) is returned, rather than quietly sending
+/// files somewhere the user didn't choose.
+pub fn files_root(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    let path = data_dir.join(FILES_ROOT_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(downloads_dir(data_dir));
+        }
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let root = PathBuf::from(text.trim_end_matches('\n'));
+    if root.is_absolute() {
+        Ok(root)
+    } else {
+        warn!(
+            "ignoring {}: {text:?} is not an absolute path",
+            path.display()
+        );
+        Ok(downloads_dir(data_dir))
+    }
+}
+
+/// Moves the files root to `typed` -- as typed after `/folder `, so `~` and
+/// a relative path are expanded (`expand_path`) -- and remembers it in
+/// `data_dir`. The folder is created now, so a path that can't work (under
+/// a plain file, no permission) is refused here, with the reason, instead
+/// of failing the next `/save`. Files already saved stay where they are.
+/// Returns the root as it now stands, for the caller to apply; the message
+/// is for the user.
+pub fn set_files_root(data_dir: &Path, typed: &str) -> Result<PathBuf, String> {
+    let root = expand_path(typed);
+    let text = root
+        .to_str()
+        .ok_or_else(|| format!("can't use {}: its name isn't valid UTF-8", root.display()))?;
+    create_folder(&root).map_err(|err| format!("can't use {}: {err}", root.display()))?;
+    std::fs::write(data_dir.join(FILES_ROOT_FILE), text).map_err(|err| {
+        format!(
+            "can't remember {} as the files folder: {err}",
+            root.display()
+        )
+    })?;
+    Ok(root)
+}
+
+/// The folder inside `root` that holds `channel`'s saved files -- `channel`
+/// being its stored name (`app::Channel::name`), never the label shown for
+/// it, so `/rename` and `/alias` can't move the folder. Not created here:
+/// `resolve_destination` makes it when a file is saved into it.
+pub fn channel_dir(root: &Path, channel: &str) -> PathBuf {
+    root.join(channel_folder(channel))
+}
+
+/// The name of the folder for the channel stored as `channel`: a pure
+/// function of that name, so there is nothing to keep in step with it.
+/// Nothing here can be trusted as a path -- `/join` takes any text, and a
+/// ticket brings a name chosen by whoever shared it -- and no two channels
+/// may share a folder, even where `General` and `general` are one name.
+///
+/// A name that is already a safe folder name everywhere -- lowercase ASCII
+/// letters, digits, `-` and `_`, starting with a letter or digit, not too
+/// long, and not one Windows reserves for a device -- is the folder
+/// itself: `general`, `project-x`, `dm-07070707`. Anything else becomes a
+/// readable approximation, a `~`, and a hash of the exact name
+/// (`Team-Alpha~83f57e5b1e8db868`). A `~` never occurs in a plain name, so
+/// a hashed folder can't be a plain one; and two different names hash
+/// differently, which also keeps apart those that differ only by case,
+/// Unicode form, punctuation, or whatever lies past the cut. What reaches
+/// the filesystem is only letters, digits, `-`, `_` and `~`, never longer
+/// than 48 characters + 17: no separators, `..`, characters Windows
+/// refuses, control or direction marks, trailing dots, or device names.
+///
+/// Frozen once folders exist: changing this would strand them.
+fn channel_folder(channel: &str) -> String {
+    if is_plain_folder_name(channel) {
+        return channel.to_string();
+    }
+    let hash = blake3::hash(channel.as_bytes()).to_hex();
+    format!(
+        "{}~{}",
+        readable_part(channel),
+        &hash[..FOLDER_HASH_HEX_DIGITS]
+    )
+}
+
+/// Whether `name` can be a folder name as it is -- see `channel_folder`.
+fn is_plain_folder_name(name: &str) -> bool {
+    let plain_char = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    name.starts_with(plain_char)
+        && name.len() <= MAX_FOLDER_NAME_CHARS
+        && name
+            .chars()
+            .all(|c| plain_char(c) || matches!(c, '-' | '_'))
+        && !is_windows_device_name(name)
+}
+
+/// Whether Windows reserves `name` (already lowercase) for a device, which
+/// makes it impossible to create a folder of that name there.
+fn is_windows_device_name(name: &str) -> bool {
+    let numbered = |prefix: &str| {
+        name.strip_prefix(prefix)
+            .is_some_and(|rest| matches!(rest.as_bytes(), [b'0'..=b'9']))
+    };
+    matches!(name, "con" | "prn" | "aux" | "nul") || numbered("com") || numbered("lpt")
+}
+
+/// The part of a hashed channel folder's name that a person can read: the
+/// name's letters and digits (of any script) and `_`, with every run of
+/// anything else squeezed into one `-`, cut to `MAX_FOLDER_NAME_CHARS`.
+/// `channel` if nothing is left -- a name of nothing but punctuation or
+/// emoji. Purely for the eye: the hash is what keeps folders apart.
+fn readable_part(name: &str) -> String {
+    let words: Vec<&str> = name
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|word| !word.is_empty())
+        .collect();
+    let readable: String = words
+        .join("-")
+        .chars()
+        .take(MAX_FOLDER_NAME_CHARS)
+        .collect();
+    match readable.trim_end_matches('-') {
+        "" => "channel".to_string(),
+        readable => readable.to_string(),
+    }
 }
 
 /// Reduces a peer-announced filename to a single, safe path component:
@@ -52,28 +210,32 @@ pub fn sanitize_filename(name: &str) -> String {
     }
 }
 
+/// Creates `dir` and any of its parents that are missing. The one failure
+/// worth a clearer message than the raw OS error is `dir`, or one of its
+/// parents, already being a plain file rather than a folder -- e.g. a
+/// `leyline` binary sitting directly in Downloads, colliding with the
+/// `leyline/` folder the files root defaults to -- so `create_dir_all` can
+/// never succeed there, however many times it is retried. Confirmed in the
+/// wild: that is exactly what "File exists (os error 17)" meant. A parent
+/// being the file is reported by the OS as "Not a directory" instead, which
+/// says even less, so the message names the file in the way.
+fn create_folder(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir).map_err(|err| match dir.ancestors().find(|path| path.is_file()) {
+        Some(file) => std::io::Error::other(format!(
+            "{} already exists and isn't a folder -- rename it, remove it, or move it elsewhere so leyline can save files there",
+            file.display()
+        )),
+        None => err,
+    })
+}
+
 /// Resolves a collision-free destination for `filename` inside `dir`,
 /// creating `dir` if it doesn't exist yet. Never overwrites an existing
 /// file and never prompts: if `filename` is already taken, tries
 /// `name (1).ext`, `name (2).ext`, etc. -- the browser convention -- until
 /// a free path is found.
 pub fn resolve_destination(dir: &Path, filename: &str) -> std::io::Result<PathBuf> {
-    if let Err(err) = std::fs::create_dir_all(dir) {
-        // The one case worth a clearer message than the raw OS error:
-        // `dir` (or one of its ancestors) is already a plain file rather
-        // than a folder -- e.g. a `leyline` binary sitting directly in
-        // Downloads, colliding with the `leyline/` subfolder `downloads_dir`
-        // always asks for -- so `create_dir_all` can never succeed there
-        // no matter how many times it's retried. Confirmed in the wild:
-        // this is exactly what "File exists (os error 17)" meant here.
-        if dir.is_file() {
-            return Err(std::io::Error::other(format!(
-                "{} already exists and isn't a folder -- rename it, remove it, or move it elsewhere so leyline can create its downloads folder there",
-                dir.display()
-            )));
-        }
-        return Err(err);
-    }
+    create_folder(dir)?;
 
     let safe_name = sanitize_filename(filename);
     if let Some(path) = try_claim(dir, &safe_name)? {
@@ -545,6 +707,349 @@ mod tests {
         let path = resolve_destination(dir.path(), "report.pdf").unwrap();
 
         assert_eq!(path, dir.path().join("report (1).pdf"));
+    }
+
+    #[test]
+    fn resolve_destination_names_the_file_in_the_way_when_it_is_a_parent_of_the_folder() {
+        // The same report, one level down: the channel folder sits below the
+        // `leyline` file, so the OS says "Not a directory" -- and the message
+        // has to name the file that is actually in the way.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("leyline");
+        std::fs::write(&blocked, b"not a folder").unwrap();
+
+        let err = resolve_destination(&blocked.join("general"), "report.pdf").unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains(&blocked.display().to_string()),
+            "got: {message}"
+        );
+        assert!(
+            !message.contains("os error"),
+            "should replace the cryptic OS error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn each_channel_saves_into_a_folder_of_its_own_created_on_demand() {
+        let root = tempfile::tempdir().unwrap();
+        let general = channel_dir(root.path(), "general");
+        let project = channel_dir(root.path(), "project-x");
+        assert!(!general.exists() && !project.exists());
+
+        let first = resolve_destination(&project, "report.pdf").unwrap();
+        // Collisions are still settled inside one channel's folder...
+        let second = resolve_destination(&project, "report.pdf").unwrap();
+        // ...and the same name in another channel's is no collision at all.
+        let other = resolve_destination(&general, "report.pdf").unwrap();
+
+        assert_eq!(first, root.path().join("project-x/report.pdf"));
+        assert_eq!(second, root.path().join("project-x/report (1).pdf"));
+        assert_eq!(other, root.path().join("general/report.pdf"));
+    }
+
+    #[test]
+    fn a_name_that_is_safe_everywhere_is_its_own_folder() {
+        for name in [
+            "general",
+            "project-x",
+            "dm-07070707",
+            "p2p-08080808",
+            "snake_case-2",
+            "0",
+            "a",
+        ] {
+            assert_eq!(channel_folder(name), name);
+        }
+    }
+
+    #[test]
+    fn any_other_name_becomes_a_readable_part_and_the_hash_of_the_exact_name() {
+        // Pinned, hashes included (blake3, checked against an independent
+        // implementation): any change would strand the folders already made
+        // under these names.
+        assert_eq!(channel_folder("Team Alpha"), "Team-Alpha~83f57e5b1e8db868");
+        assert_eq!(channel_folder("General"), "General~529526552c68187d");
+        assert_eq!(channel_folder("dm-Alice"), "dm-Alice~65abe3107fac5dc4");
+    }
+
+    #[test]
+    fn the_readable_part_keeps_letters_of_any_script_and_squeezes_the_rest() {
+        let readable = |name: &str| channel_folder(name).split('~').next().unwrap().to_string();
+
+        assert_eq!(readable("B\u{fc}ro & Co."), "B\u{fc}ro-Co");
+        assert_eq!(
+            readable("\u{65e5}\u{672c}\u{8a9e}"),
+            "\u{65e5}\u{672c}\u{8a9e}"
+        );
+        assert_eq!(readable("  --my_project--  "), "my_project");
+        assert_eq!(readable("a / b \\ c"), "a-b-c");
+        for nothing_to_read in ["", "\u{1f3ae}", "...", "///"] {
+            assert_eq!(readable(nothing_to_read), "channel", "{nothing_to_read:?}");
+        }
+    }
+
+    #[test]
+    fn a_safe_name_is_only_its_own_folder_up_to_a_length_limit() {
+        let longest = "a".repeat(MAX_FOLDER_NAME_CHARS);
+        assert_eq!(channel_folder(&longest), longest);
+
+        let too_long = format!("{longest}a");
+        assert!(channel_folder(&too_long).starts_with(&format!("{longest}~")));
+    }
+
+    #[test]
+    fn a_name_windows_reserves_for_a_device_is_not_its_own_folder() {
+        for name in [
+            "con", "prn", "aux", "nul", "com0", "com1", "com9", "lpt0", "lpt9",
+        ] {
+            assert!(
+                channel_folder(name).starts_with(&format!("{name}~")),
+                "{name}"
+            );
+        }
+        // Near misses are ordinary names.
+        for name in ["console", "com", "com10", "auxiliary", "nul-1", "lpt"] {
+            assert_eq!(channel_folder(name), name);
+        }
+    }
+
+    /// Names that are trouble somewhere: a separator or a traversal, a
+    /// character Windows refuses, a reserved device name in any case, a
+    /// trailing dot or space, an invisible control or direction mark, a
+    /// leading dash or tilde, something hidden, something enormous.
+    fn awkward_names() -> Vec<String> {
+        let mut names: Vec<String> = [
+            "",
+            ".",
+            "..",
+            "...",
+            "/",
+            "\\",
+            "../../etc/passwd",
+            "..\\..\\Windows\\System32",
+            "a/b",
+            "a\\b",
+            "C:\\Users\\me",
+            "/etc/passwd",
+            "con",
+            "CON",
+            "Con",
+            "nul",
+            "AUX",
+            "com1",
+            "COM9",
+            "lpt1",
+            "LPT0",
+            "nul.txt",
+            "name.",
+            "name ",
+            " name",
+            "name...",
+            "a:b",
+            "a<b>",
+            "a|b",
+            "a?b",
+            "a*b",
+            "a\"b",
+            "tab\there",
+            "new\nline",
+            "nul\0byte",
+            "\u{202e}evil\u{202c}",
+            "zero\u{200b}width",
+            "-rf",
+            "~",
+            "~root",
+            "$HOME",
+            "%APPDATA%",
+            ".hidden",
+            "thumbs.db",
+            "\u{1f3ae}",
+            "General",
+            "\u{dc}n\u{ef}c\u{f6}d\u{e9}",
+        ]
+        .map(String::from)
+        .to_vec();
+        names.push("x".repeat(300));
+        names.push("\u{e9}".repeat(300));
+        names.push("\u{1d400}".repeat(300)); // a letter that takes 4 bytes
+        names.push("\u{65e5}".repeat(300));
+        names
+    }
+
+    #[test]
+    fn a_channel_folder_is_safe_on_every_platform_whatever_the_name() {
+        let devices: Vec<String> = ["con", "prn", "aux", "nul"]
+            .into_iter()
+            .map(String::from)
+            .chain((0..=9).flat_map(|n| [format!("com{n}"), format!("lpt{n}")]))
+            .collect();
+        for name in awkward_names() {
+            let folder = channel_folder(&name);
+            let context = format!("{name:?} -> {folder:?}");
+
+            // Only letters, digits, `-`, `_` and `~`: no separator, dot,
+            // character Windows refuses, control or direction mark, or space.
+            assert!(
+                folder
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '~')),
+                "{context}"
+            );
+            // Not an option to a shell command, nor a `~user` to expand.
+            assert!(!folder.starts_with(['-', '~']), "{context}");
+            // One ordinary path component: not `.`, `..` or a root.
+            let mut components = Path::new(&folder).components();
+            assert!(
+                matches!(components.next(), Some(std::path::Component::Normal(_))),
+                "{context}"
+            );
+            assert!(components.next().is_none(), "{context}");
+            assert!(!devices.contains(&folder.to_lowercase()), "{context}");
+            // Short enough for any filesystem's 255 bytes, as documented.
+            assert!(folder.len() <= 255, "{context}");
+            assert!(
+                folder.chars().count() <= MAX_FOLDER_NAME_CHARS + 1 + FOLDER_HASH_HEX_DIGITS,
+                "{context}"
+            );
+        }
+    }
+
+    #[test]
+    fn different_channels_never_share_a_folder_even_where_case_is_ignored() {
+        let long = "long".repeat(30);
+        let names = [
+            // Only the case differs: one name on macOS and Windows.
+            "general".to_string(),
+            "General".to_string(),
+            "GENERAL".to_string(),
+            "dm-alice".to_string(),
+            "dm-Alice".to_string(),
+            // Different characters, the same readable part.
+            "a-b".to_string(),
+            "a--b".to_string(),
+            "a b".to_string(),
+            "a/b".to_string(),
+            "a?b".to_string(),
+            "a.b".to_string(),
+            "a:b".to_string(),
+            // The same letter, as one character or as two.
+            "caf\u{e9}".to_string(),
+            "cafe\u{301}".to_string(),
+            // The same start, cut at the same place.
+            format!("{long}x"),
+            format!("{long}y"),
+            // A device name, in two cases.
+            "con".to_string(),
+            "CON".to_string(),
+            // One made to look like the folder of another.
+            "General~529526552c68187d".to_string(),
+            // Nothing to read in any of these.
+            String::new(),
+            "\u{1f3ae}".to_string(),
+            "\u{1f3b2}".to_string(),
+        ];
+
+        let mut folders = std::collections::HashSet::new();
+        for name in &names {
+            let folder = channel_folder(name).to_lowercase();
+            assert!(
+                folders.insert(folder.clone()),
+                "{name:?} shares {folder:?} with another channel"
+            );
+        }
+    }
+
+    #[test]
+    fn a_channel_folder_is_always_directly_under_the_root() {
+        let root = Path::new("/files");
+
+        assert_eq!(channel_dir(root, "general"), root.join("general"));
+        for name in awkward_names() {
+            assert_eq!(channel_dir(root, &name).parent(), Some(root), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn the_files_root_is_the_downloads_folder_until_one_is_set() {
+        let data = tempfile::tempdir().unwrap();
+
+        assert_eq!(files_root(data.path()).unwrap(), downloads_dir(data.path()));
+    }
+
+    #[test]
+    fn a_files_root_that_was_set_is_what_a_restart_reads_back() {
+        let data = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let wanted = elsewhere.path().join("received");
+
+        let root = set_files_root(data.path(), wanted.to_str().unwrap()).unwrap();
+
+        assert_eq!(root, wanted);
+        assert!(
+            wanted.is_dir(),
+            "made at once, so a bad path fails now and not at the next save"
+        );
+        assert_eq!(files_root(data.path()).unwrap(), wanted);
+    }
+
+    #[test]
+    fn setting_the_files_root_again_replaces_it() {
+        let data = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let first = elsewhere.path().join("first");
+        let second = elsewhere.path().join("second");
+
+        set_files_root(data.path(), first.to_str().unwrap()).unwrap();
+        set_files_root(data.path(), second.to_str().unwrap()).unwrap();
+
+        assert_eq!(files_root(data.path()).unwrap(), second);
+    }
+
+    #[test]
+    fn a_files_root_setting_that_is_not_an_absolute_path_is_ignored() {
+        let data = tempfile::tempdir().unwrap();
+        for content in ["", "\n", "relative/dir", "~/Downloads"] {
+            std::fs::write(data.path().join(FILES_ROOT_FILE), content).unwrap();
+
+            assert_eq!(
+                files_root(data.path()).unwrap(),
+                downloads_dir(data.path()),
+                "{content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_files_root_setting_that_cannot_be_read_is_an_error_not_a_quiet_default() {
+        let data = tempfile::tempdir().unwrap();
+        // A folder where the file should be: not "missing", so not the default.
+        std::fs::create_dir(data.path().join(FILES_ROOT_FILE)).unwrap();
+
+        let err = files_root(data.path()).unwrap_err();
+
+        assert!(err.to_string().contains(FILES_ROOT_FILE), "got: {err}");
+    }
+
+    #[test]
+    fn set_files_root_refuses_a_path_under_a_file_and_remembers_nothing() {
+        let data = tempfile::tempdir().unwrap();
+        let blocker = data.path().join("not-a-folder");
+        std::fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("inside");
+
+        let message = set_files_root(data.path(), path.to_str().unwrap()).unwrap_err();
+
+        assert!(
+            message.starts_with(&format!("can't use {}: ", path.display())),
+            "got: {message}"
+        );
+        assert!(
+            message.contains(&blocker.display().to_string()),
+            "names the file in the way, got: {message}"
+        );
+        assert!(!data.path().join(FILES_ROOT_FILE).exists());
     }
 
     #[test]

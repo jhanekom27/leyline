@@ -48,7 +48,7 @@ use channel_renames::ChannelRenames;
 use contacts::Contacts;
 use direct_registry::DirectRegistry;
 use dm_registry::DmRegistry;
-use files::{downloads_dir, dropped_files, resolve_destination, stage_file, stage_image};
+use files::{dropped_files, resolve_destination, set_files_root, stage_file, stage_image};
 use forgotten_devices::ForgottenDevices;
 use message::ChatMessage;
 use net::{DEVICE_SYNC_CHANNEL, Net, NetEvent};
@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize settings")?;
     let forgotten_devices = ForgottenDevices::load(dirs.data_dir().join("forgotten_devices"))
         .context("failed to initialize forgotten devices")?;
+    let files_root = files::files_root(&data_dir)?;
 
     let secret_key = identity::load_or_generate(&dirs.config_dir().join("identity"))
         .context("failed to load or generate identity")?;
@@ -142,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         direct_registry,
         settings,
         forgotten_devices,
+        files_root,
         data_dir,
     };
 
@@ -375,9 +377,13 @@ struct Session {
     direct_registry: DirectRegistry,
     settings: Settings,
     forgotten_devices: ForgottenDevices,
-    /// leyline's own data directory (`dirs.data_dir()`), needed so a
-    /// `/save` with no resolvable OS Downloads folder still has somewhere
-    /// to fall back to -- see `files::downloads_dir`.
+    /// Where received files go -- see `files::files_root`. Seeded into
+    /// `AppState` (`load_files_root`) at startup, which holds it from then
+    /// on: `/folder <path>` replaces it there.
+    files_root: PathBuf,
+    /// leyline's own data directory (`dirs.data_dir()`), where the file
+    /// picker's remembered folder (`picker::remember_folder`) and the files
+    /// root (`files::set_files_root`) are kept.
     data_dir: PathBuf,
 }
 
@@ -520,6 +526,7 @@ async fn run(
         mut direct_registry,
         mut settings,
         mut forgotten_devices,
+        files_root,
         data_dir,
     } = session;
 
@@ -531,6 +538,7 @@ async fn run(
     app.load_dm_registry(dm_registry.all());
     app.load_forgotten_devices(forgotten_devices.all());
     app.load_browse_dir(start_folder(&data_dir));
+    app.load_files_root(files_root);
     for name in &joined_channels {
         // Ensures a brand-new channel ("general" on a first run, or a
         // `--join` ticket's channel) lands in the registry, so it's
@@ -765,9 +773,8 @@ async fn run(
                             Some(InputAction::SendStaged { channel, items, caption }) => {
                                 net.send_staged(channel, items, caption);
                             }
-                            Some(InputAction::SaveFile { hash, filename, providers }) => {
-                                let destination_dir = downloads_dir(&data_dir);
-                                match resolve_destination(&destination_dir, &filename) {
+                            Some(InputAction::SaveFile { hash, filename, providers, dir }) => {
+                                match resolve_destination(&dir, &filename) {
                                     Ok(destination) => {
                                         net.save_file(hash, filename, providers, destination);
                                     }
@@ -776,6 +783,21 @@ async fn run(
                                             "failed to save {filename}: {err}"
                                         ));
                                     }
+                                }
+                            }
+                            // `/folder <path>`: only the filesystem can say
+                            // whether the path will do, so it is made and
+                            // remembered here, and `app` told once it took.
+                            Some(InputAction::SetFilesRoot(path)) => {
+                                match set_files_root(&data_dir, &path) {
+                                    Ok(root) => {
+                                        app.push_system(format!(
+                                            "files will now be saved under {} (files saved before stay where they are)",
+                                            root.display()
+                                        ));
+                                        app.load_files_root(root);
+                                    }
+                                    Err(message) => app.push_system(message),
                                 }
                             }
                             Some(InputAction::Paste(channel)) => {
