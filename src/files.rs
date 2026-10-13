@@ -29,6 +29,11 @@ const SUBDIR: &str = "leyline";
 /// nickname and bell setting saved in it.
 const FILES_ROOT_FILE: &str = "files_root";
 
+/// File in leyline's data directory that remembers what `/maxsize` last set
+/// -- see `size_limit`. A one-line text file of its own, for the same reason
+/// as `FILES_ROOT_FILE`.
+const SIZE_LIMIT_FILE: &str = "size_limit";
+
 /// The longest channel name used as a folder name just as it is, and the
 /// longest readable part of any other -- see `channel_folder`.
 const MAX_FOLDER_NAME_CHARS: usize = 48;
@@ -43,11 +48,12 @@ const FOLDER_HASH_HEX_DIGITS: usize = 16;
 /// valve against a pathological loop, not a realistic limit.
 const MAX_COLLISION_ATTEMPTS: u32 = 1000;
 
-/// Largest file (or pasted image) that can be shared: a simple guardrail
-/// against an accidental huge share (e.g. a mistyped path to a large video
-/// file). `BackfillStore::add_file` copies the file into the local blob
-/// store, so a shared file's bytes are duplicated on disk locally.
-pub const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
+/// Largest file (or pasted image) that can be shared unless `/maxsize` says
+/// otherwise (`SizeLimit`): a guardrail against an accidental huge share
+/// (e.g. a mistyped path to a large video file). `BackfillStore::add_file`
+/// copies the file into the local blob store, so a shared file's bytes are
+/// duplicated on disk locally.
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
 
 /// Where received files go until `set_files_root` says otherwise: the OS
 /// Downloads folder (via `directories::UserDirs`) under a `leyline/`
@@ -480,13 +486,125 @@ pub fn expand_path(path: &str) -> PathBuf {
     std::path::absolute(&expanded).unwrap_or(expanded)
 }
 
+/// How big a file (or pasted image) may be to share: the guardrail against
+/// an accidental huge share, which `/maxsize` moves or lifts for a deliberate
+/// one. The three variants are exactly what is remembered across restarts
+/// (`size_limit`, `set_size_limit`) -- nothing remembered is `Default`, so a
+/// build that changes the default moves everyone who never chose a limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeLimit {
+    /// `DEFAULT_MAX_FILE_SIZE`.
+    Default,
+    /// At most this many bytes -- at least one, since a limit of none would
+    /// refuse everything (`SizeLimit::parse`).
+    Bytes(u64),
+    /// No limit.
+    Off,
+}
+
+impl SizeLimit {
+    /// The most bytes a shared file may have, or `None` for no limit.
+    pub fn max_bytes(self) -> Option<u64> {
+        match self {
+            SizeLimit::Default => Some(DEFAULT_MAX_FILE_SIZE),
+            SizeLimit::Bytes(bytes) => Some(bytes),
+            SizeLimit::Off => None,
+        }
+    }
+
+    /// Reads a limit as typed after `/maxsize` -- and as remembered, which is
+    /// the same text: `default`, `off`, or a size, a number and a unit (`B`,
+    /// `KB`, `MB`, `GB` or `TB`, in any case, with or without a blank between)
+    /// such as `750MB`, `1.5 GB` or `2gb`. The units are the ones
+    /// `human_size` prints, 1024 apart, so what a refusal says is what can be
+    /// typed. The one place a limit is validated, so everything downstream
+    /// can trust it: a size with no unit, an unknown unit or a malformed
+    /// number is refused, and so is one that rounds down to nothing (it would
+    /// refuse every file) or is too big to count (`off` lifts the limit).
+    pub fn parse(text: &str) -> Result<SizeLimit, String> {
+        let text = text.trim();
+        match text.to_ascii_lowercase().as_str() {
+            "default" => return Ok(SizeLimit::Default),
+            "off" => return Ok(SizeLimit::Off),
+            _ => {}
+        }
+        let malformed = || {
+            format!(
+                "can't read '{text}' as a size -- give a number and a unit (B, KB, MB, GB or TB), like 750MB or 2GB, or say off or default"
+            )
+        };
+        let (number, unit) = text.split_at(
+            text.find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .unwrap_or(text.len()),
+        );
+        let unit: u64 = match unit.trim().to_ascii_uppercase().as_str() {
+            "B" => 1,
+            "KB" => 1 << 10,
+            "MB" => 1 << 20,
+            "GB" => 1 << 30,
+            "TB" => 1 << 40,
+            _ => return Err(malformed()),
+        };
+        let number: f64 = number.parse().map_err(|_| malformed())?;
+        let bytes = number * unit as f64;
+        if bytes < 1.0 {
+            return Err(format!(
+                "a limit of '{text}' would refuse every file -- /maxsize <size> sets a real one, /maxsize off lifts the limit"
+            ));
+        }
+        if bytes >= u64::MAX as f64 {
+            return Err(format!(
+                "'{text}' is too big to count -- /maxsize off lifts the limit instead"
+            ));
+        }
+        Ok(SizeLimit::Bytes(bytes as u64))
+    }
+}
+
+/// The size limit `set_size_limit` last recorded in `data_dir`: nothing
+/// recorded is `Default`. Read like `files_root` reads its file -- content
+/// that isn't a limit (hand-edited, or cut short by a crash mid-write) is
+/// logged and ignored, which means the default: a guarded state, never a
+/// looser one -- but a genuine I/O error (permission denied, say) is
+/// returned, rather than quietly applying a limit nobody chose.
+pub fn size_limit(data_dir: &Path) -> anyhow::Result<SizeLimit> {
+    let path = data_dir.join(SIZE_LIMIT_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SizeLimit::Default);
+        }
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    Ok(SizeLimit::parse(&text).unwrap_or_else(|reason| {
+        warn!("ignoring {}: {reason}", path.display());
+        SizeLimit::Default
+    }))
+}
+
+/// Remembers `limit` in `data_dir` for the next start -- `Default` by
+/// forgetting whatever was remembered, so that nothing is. The message is
+/// for the user.
+pub fn set_size_limit(data_dir: &Path, limit: SizeLimit) -> Result<(), String> {
+    let path = data_dir.join(SIZE_LIMIT_FILE);
+    let recorded = match limit {
+        SizeLimit::Default => match std::fs::remove_file(&path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
+        SizeLimit::Bytes(bytes) => std::fs::write(&path, format!("{bytes}B")),
+        SizeLimit::Off => std::fs::write(&path, "off"),
+    };
+    recorded.map_err(|err| format!("can't remember the size limit: {err}"))
+}
+
 /// Checks `path` (already expanded, see `expand_path`) for sharing and
 /// stages it: it must exist, be a file rather than a directory, be
-/// readable, fit within `MAX_FILE_SIZE`, and have a name to share it
-/// under. Refusals read like the ones `/send` has always given, since
-/// `/send` and the clipboard both stage through here -- one boundary, so
-/// what each of them refuses and how it says so cannot drift apart.
-pub fn stage_file(path: &Path) -> Result<StagedAttachment, String> {
+/// readable, fit within `limit`, and have a name to share it under.
+/// Refusals read like the ones `/send` has always given, since `/send` and
+/// the clipboard both stage through here -- one boundary, so what each of
+/// them refuses and how it says so cannot drift apart.
+pub fn stage_file(path: &Path, limit: SizeLimit) -> Result<StagedAttachment, String> {
     let metadata =
         std::fs::metadata(path).map_err(|err| format!("can't send {}: {err}", path.display()))?;
     if !metadata.is_file() {
@@ -496,7 +614,7 @@ pub fn stage_file(path: &Path) -> Result<StagedAttachment, String> {
     // permission), so try opening it: refusing now beats failing at import
     // time, after a caption has been typed.
     std::fs::File::open(path).map_err(|err| format!("can't send {}: {err}", path.display()))?;
-    if let Some(reason) = too_large(metadata.len()) {
+    if let Some(reason) = too_large(metadata.len(), limit) {
         return Err(format!("can't send {}: {reason}", path.display()));
     }
     let filename = path
@@ -512,12 +630,16 @@ pub fn stage_file(path: &Path) -> Result<StagedAttachment, String> {
 }
 
 /// Stages already-in-hand bytes (a clipboard image re-encoded as PNG, see
-/// `net::Net::paste`) under `filename`, subject to the same
-/// `MAX_FILE_SIZE` cap as `stage_file` -- there is no path to inspect, so
-/// the size is the only thing to check.
-pub fn stage_image(filename: String, bytes: Vec<u8>) -> Result<StagedAttachment, String> {
+/// `net::Net::paste`) under `filename`, subject to the same `limit` as
+/// `stage_file` -- there is no path to inspect, so the size is the only
+/// thing to check.
+pub fn stage_image(
+    filename: String,
+    bytes: Vec<u8>,
+    limit: SizeLimit,
+) -> Result<StagedAttachment, String> {
     let size = bytes.len() as u64;
-    if let Some(reason) = too_large(size) {
+    if let Some(reason) = too_large(size, limit) {
         return Err(format!("can't paste image: {reason}"));
     }
     Ok(StagedAttachment {
@@ -527,16 +649,16 @@ pub fn stage_image(filename: String, bytes: Vec<u8>) -> Result<StagedAttachment,
     })
 }
 
-/// Why `size` bytes can't be shared, or `None` if they can -- the wording
-/// shared by `stage_file`'s and `stage_image`'s refusals.
-fn too_large(size: u64) -> Option<String> {
-    (size > MAX_FILE_SIZE).then(|| {
-        format!(
-            "too large ({}, max {})",
-            human_size(size),
-            human_size(MAX_FILE_SIZE)
-        )
-    })
+/// Why `size` bytes can't be shared under `limit`, or `None` if they can --
+/// the wording shared by `stage_file`'s and `stage_image`'s refusals, and the
+/// one place that says how to get past the limit.
+fn too_large(size: u64, limit: SizeLimit) -> Option<String> {
+    let max = limit.max_bytes().filter(|&max| size > max)?;
+    Some(format!(
+        "too large ({}, max {}) -- raise the limit with /maxsize <size> (say /maxsize 2GB) or lift it with /maxsize off",
+        human_size(size),
+        human_size(max)
+    ))
 }
 
 /// The files a bracketed paste consists of, if it is nothing but existing
@@ -1384,7 +1506,7 @@ mod tests {
         let path = dir.path().join("report.pdf");
         std::fs::write(&path, b"twelve bytes").unwrap();
 
-        let staged = stage_file(&path).unwrap();
+        let staged = stage_file(&path, SizeLimit::Default).unwrap();
 
         assert_eq!(
             staged,
@@ -1401,7 +1523,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope.txt");
 
-        let message = stage_file(&missing).unwrap_err();
+        let message = stage_file(&missing, SizeLimit::Default).unwrap_err();
 
         assert!(
             message.starts_with(&format!("can't send {}: ", missing.display())),
@@ -1413,7 +1535,7 @@ mod tests {
     fn stage_file_refuses_a_directory() {
         let dir = tempfile::tempdir().unwrap();
 
-        let message = stage_file(dir.path()).unwrap_err();
+        let message = stage_file(dir.path(), SizeLimit::Default).unwrap_err();
 
         assert_eq!(
             message,
@@ -1435,7 +1557,7 @@ mod tests {
             return;
         }
 
-        let message = stage_file(&path).unwrap_err();
+        let message = stage_file(&path, SizeLimit::Default).unwrap_err();
 
         assert!(
             message.starts_with(&format!("can't send {}: ", path.display())),
@@ -1444,16 +1566,79 @@ mod tests {
     }
 
     #[test]
-    fn too_large_only_flags_sizes_over_the_limit() {
-        assert_eq!(too_large(MAX_FILE_SIZE), None);
-        let reason = too_large(MAX_FILE_SIZE + 1).unwrap();
+    fn the_default_limit_allows_exactly_500_mb_and_refuses_anything_over() {
+        assert_eq!(too_large(DEFAULT_MAX_FILE_SIZE, SizeLimit::Default), None);
+        let reason = too_large(DEFAULT_MAX_FILE_SIZE + 1, SizeLimit::Default).unwrap();
         assert!(reason.starts_with("too large ("), "got: {reason}");
         assert!(reason.contains("max 500.0 MB"), "got: {reason}");
     }
 
     #[test]
+    fn a_refusal_says_how_to_get_past_the_limit() {
+        let reason = too_large(2048, SizeLimit::Bytes(1024)).unwrap();
+
+        assert_eq!(
+            reason,
+            "too large (2.0 KB, max 1.0 KB) -- raise the limit with /maxsize <size> (say /maxsize 2GB) or lift it with /maxsize off"
+        );
+    }
+
+    #[test]
+    fn a_custom_limit_replaces_the_default_in_both_directions() {
+        // Lowered below the default...
+        assert!(too_large(2048, SizeLimit::Bytes(1024)).is_some());
+        assert_eq!(
+            too_large(1024, SizeLimit::Bytes(1024)),
+            None,
+            "a file of exactly the limit is allowed"
+        );
+        // ...and raised above it.
+        let double = SizeLimit::Bytes(2 * DEFAULT_MAX_FILE_SIZE);
+        assert_eq!(too_large(DEFAULT_MAX_FILE_SIZE + 1, double), None);
+        assert!(too_large(2 * DEFAULT_MAX_FILE_SIZE + 1, double).is_some());
+    }
+
+    #[test]
+    fn with_the_limit_off_nothing_is_too_large() {
+        assert_eq!(too_large(u64::MAX, SizeLimit::Off), None);
+    }
+
+    #[test]
+    fn max_bytes_is_the_default_a_chosen_count_or_nothing() {
+        assert_eq!(SizeLimit::Default.max_bytes(), Some(DEFAULT_MAX_FILE_SIZE));
+        assert_eq!(SizeLimit::Bytes(7).max_bytes(), Some(7));
+        assert_eq!(SizeLimit::Off.max_bytes(), None);
+    }
+
+    #[test]
+    fn stage_file_refuses_a_file_over_the_limit_and_stages_it_once_the_limit_allows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("video.mkv");
+        std::fs::write(&path, [0u8; 2048]).unwrap();
+
+        let refused = stage_file(&path, SizeLimit::Bytes(1024)).unwrap_err();
+
+        assert!(
+            refused.starts_with(&format!(
+                "can't send {}: too large (2.0 KB, max 1.0 KB)",
+                path.display()
+            )),
+            "got: {refused}"
+        );
+        assert!(refused.contains("/maxsize"), "got: {refused}");
+        for limit in [SizeLimit::Bytes(2048), SizeLimit::Off] {
+            assert_eq!(stage_file(&path, limit).unwrap().size, 2048, "{limit:?}");
+        }
+    }
+
+    #[test]
     fn stage_image_keeps_the_bytes_and_reports_their_size() {
-        let staged = stage_image("clipboard-1.png".to_string(), vec![1, 2, 3]).unwrap();
+        let staged = stage_image(
+            "clipboard-1.png".to_string(),
+            vec![1, 2, 3],
+            SizeLimit::Default,
+        )
+        .unwrap();
 
         assert_eq!(
             staged,
@@ -1462,6 +1647,167 @@ mod tests {
                 size: 3,
                 source: StagedSource::Bytes(vec![1, 2, 3]),
             }
+        );
+    }
+
+    #[test]
+    fn stage_image_obeys_the_same_limit() {
+        let name = || "clipboard-1.png".to_string();
+
+        let refused = stage_image(name(), vec![0; 2048], SizeLimit::Bytes(1024)).unwrap_err();
+
+        assert!(
+            refused.starts_with("can't paste image: too large (2.0 KB, max 1.0 KB)"),
+            "got: {refused}"
+        );
+        assert!(refused.contains("/maxsize"), "got: {refused}");
+        assert!(stage_image(name(), vec![0; 2048], SizeLimit::Off).is_ok());
+    }
+
+    #[test]
+    fn a_size_is_a_number_and_a_unit_in_any_case_with_or_without_a_blank() {
+        for (typed, bytes) in [
+            ("750MB", 750 << 20),
+            ("750 MB", 750 << 20),
+            ("750mb", 750 << 20),
+            ("  2GB  ", 2 << 30),
+            ("1.5GB", 3 << 29),
+            ("500.5MB", 524_812_288),
+            ("0.5 KB", 512),
+            ("1TB", 1 << 40),
+            ("1024B", 1024),
+            ("1b", 1),
+        ] {
+            assert_eq!(
+                SizeLimit::parse(typed),
+                Ok(SizeLimit::Bytes(bytes)),
+                "{typed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_and_off_are_words_in_any_case() {
+        assert_eq!(SizeLimit::parse("default"), Ok(SizeLimit::Default));
+        assert_eq!(SizeLimit::parse("Default"), Ok(SizeLimit::Default));
+        assert_eq!(SizeLimit::parse("off"), Ok(SizeLimit::Off));
+        assert_eq!(SizeLimit::parse(" OFF "), Ok(SizeLimit::Off));
+    }
+
+    #[test]
+    fn what_is_not_a_size_is_refused_with_what_to_type_instead() {
+        for typed in [
+            "", "banana", "5", "MB", "2XB", "2 G", "-5MB", "+5MB", "1,5GB", "1.2.3GB", "1e3MB",
+            "2GB junk", ".MB", "inf", "NaN",
+        ] {
+            let message = SizeLimit::parse(typed).unwrap_err();
+
+            assert!(
+                message.contains(&format!("'{}'", typed.trim())) && message.contains("750MB"),
+                "{typed:?} -> {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_limit_that_would_refuse_every_file_is_refused() {
+        // The last is 1e-13 TB: about a tenth of a byte.
+        for typed in ["0B", "0GB", "0.4B", "0.0000000000001TB"] {
+            let message = SizeLimit::parse(typed).unwrap_err();
+
+            assert!(
+                message.contains("refuse every file"),
+                "{typed:?} -> {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_size_too_big_to_count_is_refused_and_off_is_offered_instead() {
+        let huge = format!("{}GB", "9".repeat(400));
+        for typed in ["17000000TB", "99999999999999999999999999TB", huge.as_str()] {
+            let message = SizeLimit::parse(typed).unwrap_err();
+
+            assert!(
+                message.contains("too big to count") && message.contains("/maxsize off"),
+                "{message}"
+            );
+        }
+        // The largest that still fits is taken.
+        assert!(SizeLimit::parse("16000000TB").is_ok());
+    }
+
+    #[test]
+    fn the_size_limit_is_the_default_until_one_is_set() {
+        let data = tempfile::tempdir().unwrap();
+
+        assert_eq!(size_limit(data.path()).unwrap(), SizeLimit::Default);
+    }
+
+    #[test]
+    fn a_size_limit_that_was_set_is_what_a_restart_reads_back() {
+        let data = tempfile::tempdir().unwrap();
+        for limit in [
+            SizeLimit::Bytes(1_048_576),
+            SizeLimit::Bytes(3 << 29),
+            SizeLimit::Off,
+            SizeLimit::Default,
+        ] {
+            set_size_limit(data.path(), limit).unwrap();
+
+            assert_eq!(size_limit(data.path()).unwrap(), limit, "{limit:?}");
+        }
+    }
+
+    #[test]
+    fn going_back_to_the_default_remembers_nothing() {
+        let data = tempfile::tempdir().unwrap();
+        set_size_limit(data.path(), SizeLimit::Off).unwrap();
+        assert!(data.path().join(SIZE_LIMIT_FILE).exists());
+
+        set_size_limit(data.path(), SizeLimit::Default).unwrap();
+        assert!(!data.path().join(SIZE_LIMIT_FILE).exists());
+
+        // And again, with nothing there to forget.
+        set_size_limit(data.path(), SizeLimit::Default).unwrap();
+    }
+
+    #[test]
+    fn a_size_limit_setting_that_is_not_a_limit_falls_back_to_the_guarded_default() {
+        let data = tempfile::tempdir().unwrap();
+        for content in ["", "\n", "banana", "0", "-5MB", "unlimited", "5"] {
+            std::fs::write(data.path().join(SIZE_LIMIT_FILE), content).unwrap();
+
+            assert_eq!(
+                size_limit(data.path()).unwrap(),
+                SizeLimit::Default,
+                "{content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_size_limit_setting_that_cannot_be_read_is_an_error_not_a_quiet_default() {
+        let data = tempfile::tempdir().unwrap();
+        // A folder where the file should be: not "missing", so not the default.
+        std::fs::create_dir(data.path().join(SIZE_LIMIT_FILE)).unwrap();
+
+        let err = size_limit(data.path()).unwrap_err();
+
+        assert!(err.to_string().contains(SIZE_LIMIT_FILE), "got: {err}");
+    }
+
+    #[test]
+    fn a_size_limit_that_cannot_be_remembered_says_so() {
+        let data = tempfile::tempdir().unwrap();
+        // A folder where the file should be: writing there fails.
+        std::fs::create_dir(data.path().join(SIZE_LIMIT_FILE)).unwrap();
+
+        let message = set_size_limit(data.path(), SizeLimit::Off).unwrap_err();
+
+        assert!(
+            message.starts_with("can't remember the size limit: "),
+            "got: {message}"
         );
     }
 

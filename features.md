@@ -343,6 +343,41 @@ mechanisms, not one, since they trade off differently:
   and any check of what a file is beyond its extension -- the list is a
   safety net, not a sandbox: a document with macros, an archive or a web
   page still opens as the OS always did. See LEY-25.7's notes.
+- [x] **File size limit override** -- `files::MAX_FILE_SIZE` (500 MB, now
+  `DEFAULT_MAX_FILE_SIZE`) refused any file or pasted image over it with no
+  way around short of editing the constant and rebuilding: a good guardrail
+  against an accidental huge share, and as firm a wall for a deliberate one
+  (a video, a backup archive). The limit is enforced in exactly two
+  functions -- `stage_file`, which every route for a file passes through
+  (`/send <path>` by way of `Net::send_file`, the picker, a drop, a
+  clipboard file list), and `stage_image` for a pasted image -- and nothing
+  re-checks it at send, so it became a parameter of those two
+  (`files::SizeLimit`) and every route is handed the one `AppState` holds
+  (`size_limit`). `/maxsize` shows it and changes it: `/maxsize 2GB` (a
+  number and a unit, `B` to `TB`, 1024 apart as `human_size` prints them,
+  any case, a blank allowed), `/maxsize off` to lift it, `/maxsize default`
+  to restore the 500 MB. A bare `/maxsize` says what the limit is and how to
+  change it, the way a bare `/folder` shows the root, and the refusal says
+  the same: `too large (501.0 MB, max 500.0 MB) -- raise the limit with
+  /maxsize <size> (say /maxsize 2GB) or lift it with /maxsize off`. A
+  persisted setting was chosen over a one-off per-file confirmation:
+  staging has four entry points (command, picker, drop, clipboard), a
+  confirmation would need modal state in each and a way to say "this file",
+  and a setting is one value they all read.
+  `SizeLimit::parse` is the one place a limit is validated: no unit, an
+  unknown unit, a malformed number, a size that rounds down to nothing (it
+  would refuse every file) and one too big to count are refused, saying
+  what to type, and leave the limit as it was. The limit is
+  `Default | Bytes(n) | Off`, exactly what is remembered: a one-line
+  `size_limit` file in the data directory, like `files_root` (not a field of
+  the postcard `settings` file, which would fail to decode an existing
+  one), with nothing there meaning the default -- so a build that changes
+  the default moves everyone who never chose a limit. Text that is not a
+  limit falls back to the default, the guarded state and never a looser
+  one, while a genuine I/O error fails startup, as for `files_root`. A write
+  that fails is reported and the limit still holds for the session. Pairing
+  leaves it alone, being a preference of this device. Only files you share
+  are limited, never ones you receive.
 
 ## Networking & sharing
 

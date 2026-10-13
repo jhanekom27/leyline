@@ -391,6 +391,14 @@ extension says it runs something when opened, a program, script, installer or
 shortcut (`files::runs_when_opened`): that is saved like any file and never
 opened from here, since a peer chose its name and the OS would go by it.
 
+How big a file may be to share is `files::SizeLimit`: 500 MB unless `/maxsize`
+says otherwise, remembered in a one-line `size_limit` file in the data
+directory. It is enforced in exactly two places -- `files::stage_file`, which
+every route for a file passes through (`/send <path>`, the picker, a drop, a
+clipboard file list), and `files::stage_image` for a pasted image -- and
+nothing re-checks it at send, so main.rs hands both the one limit `AppState`
+holds. Only what you share is limited, never what you receive.
+
 ## Point-to-point messaging
 
 `/dm <alias|hex-prefix|endpoint-id> [text]` (`direct.rs`) is a second,
@@ -456,7 +464,7 @@ src/
   search.rs           // shared match predicate + on-disk scan for /search
   thread.rs           // reply-chain (ancestors + descendants) builder for /thread
   backfill.rs         // iroh-blobs history manifests for offline backfill
-  files.rs            // /save destination resolution (a folder per channel under the files root), filename safety, sizes, outgoing-file checks + staged attachments, drag-and-drop paste detection, opening a saved file with the OS (and which kinds -- programs, scripts -- never to)
+  files.rs            // /save destination resolution (a folder per channel under the files root), filename safety, sizes, outgoing-file checks + the size limit on them (/maxsize) + staged attachments, drag-and-drop paste detection, opening a saved file with the OS (and which kinds -- programs, scripts -- never to)
   saved_files.rs      // persisted record of which channel's copy of which file /save put where, for the /files overlay's check mark and open key
   term_events.rs      // crossterm EventStream wrapper: a drop a terminal types out (Warp) becomes one paste
   picker.rs           // in-TUI file picker behind a bare /send: pure state, folder reads, remembered start folder

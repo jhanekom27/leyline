@@ -13,7 +13,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use iroh_blobs::Hash;
 use iroh_tickets::Ticket;
 
-use crate::files::{StagedAttachment, channel_dir, runs_when_opened};
+use crate::files::{
+    DEFAULT_MAX_FILE_SIZE, SizeLimit, StagedAttachment, channel_dir, human_size, runs_when_opened,
+};
 use crate::message::{ChatMessage, FileAttachment, now_unix_ms};
 use crate::net::{DEVICE_SYNC_CHANNEL, NetEvent};
 use crate::picker::{FilePicker, FolderListing, Step};
@@ -622,6 +624,11 @@ pub enum InputAction {
     /// then reports back through `AppState::load_files_root`: app.rs never
     /// touches the filesystem, so it can't tell whether the path will do.
     SetFilesRoot(String),
+    /// Remember a new size limit across restarts, from `/maxsize` (see
+    /// `run_maxsize`). Already applied to `AppState`, and already validated:
+    /// the caller only needs to persist it (`files::set_size_limit`), as it
+    /// does for `Bell`.
+    SetSizeLimit(SizeLimit),
     /// Tell the files overlay which of `channel`'s files are saved. The
     /// overlay has just opened on it (`run_files`), and that is a fact about
     /// the disk, which app.rs never touches: the caller looks (see
@@ -789,6 +796,13 @@ pub struct AppState {
     /// `/folder <path>` takes effect. The filesystem root until seeded, like
     /// `browse_dir`, so a save can never land in the working directory.
     files_root: PathBuf,
+    /// How big a file may be to share -- seeded at startup from what was
+    /// remembered across restarts (`load_size_limit`) and replaced when
+    /// `/maxsize` takes effect (`run_maxsize`). The default until seeded.
+    /// main.rs reads it (`size_limit`) wherever a file is checked for
+    /// sharing, so every route a file takes -- `/send <path>`, the picker, a
+    /// drop, the clipboard -- answers to the same one.
+    size_limit: SizeLimit,
     /// Counts the folder reads the picker has asked for (`ReadFolder`), so
     /// every one has an id of its own -- across pickers too, which is what
     /// keeps a slow answer to a closed picker's read from landing in the
@@ -865,6 +879,7 @@ impl AppState {
             viewing_files: None,
             browse_dir: PathBuf::from(std::path::MAIN_SEPARATOR_STR),
             files_root: PathBuf::from(std::path::MAIN_SEPARATOR_STR),
+            size_limit: SizeLimit::Default,
             browse_requests: 0,
         }
     }
@@ -941,6 +956,19 @@ impl AppState {
     /// starts -- mirrors `load_browse_dir`.
     pub fn load_files_root(&mut self, root: PathBuf) {
         self.files_root = root;
+    }
+
+    /// Seeds the size limit (see `files::size_limit`, which resolves what
+    /// was remembered across restarts). Intended to be called once, right
+    /// after `AppState::new`, before the event loop starts -- mirrors
+    /// `load_files_root`.
+    pub fn load_size_limit(&mut self, limit: SizeLimit) {
+        self.size_limit = limit;
+    }
+
+    /// How big a file may be to share right now (`/maxsize`).
+    pub fn size_limit(&self) -> SizeLimit {
+        self.size_limit
     }
 
     /// Merges a batch of possibly-historical messages fetched via backfill
@@ -2378,6 +2406,7 @@ impl AppState {
             "send" => self.run_send(arg.trim()),
             "save" => self.run_save(arg.trim()),
             "folder" => self.run_folder(arg.trim()),
+            "maxsize" => self.run_maxsize(arg.trim()),
             "files" => self.run_files(),
             "paste" => self.run_paste(),
             "search" | "s" => self.run_search(arg.trim()),
@@ -2419,7 +2448,7 @@ impl AppState {
             "commands: /join <name|ticket>, /invite, /pair [ticket], /forget-device <hex-prefix>, \
              /msg <alias|hex-prefix> [text], /dm <alias|hex-prefix|endpoint-id> [text], \
              /leave [channel], /rename [name], /who, /send [path], \
-             /save [hash-prefix], /folder [path], /files, /paste, \
+             /save [hash-prefix], /folder [path], /maxsize [size|off|default], /files, /paste, \
              /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
              ticket for a new device to redeem, /pair <ticket> redeems one (after an \
@@ -2427,6 +2456,7 @@ impl AppState {
              /dm connects directly to a peer's endpoint id with no ticket or gossip channel, \
              unlike /msg -- /save keeps each channel's files in a folder of its own, \
              /folder shows where and, with a path, moves them all -- \
+             /maxsize shows the biggest file you can share (500 MB to begin with) and, with a size like 2GB, changes it (off lifts it, default restores it) -- \
              /files lists the files shared in this channel (type to filter, \u{2191}/\u{2193} pick, \
              Enter save, Ctrl+O open one already saved (never a program or script), Esc close) -- \
              keys: Tab/Shift+Tab switch channels, \
@@ -3141,6 +3171,51 @@ impl AppState {
             return None;
         }
         Some(InputAction::SetFilesRoot(strip_quotes(arg).to_string()))
+    }
+
+    /// Handles `/maxsize [<size>|off|default]`: `arg` is everything after
+    /// `/maxsize ` (already trimmed). With nothing, says what the limit on
+    /// the size of a shared file is and how to change it, as a bare `/folder`
+    /// says where files go. With something, reads it
+    /// (`SizeLimit::parse`, the one place it is validated: what it refuses
+    /// leaves the limit as it was), applies it at once, and asks the caller
+    /// to remember it (`InputAction::SetSizeLimit`), as `/bell` does. There
+    /// is nothing else to tell: every route a file takes to being shared
+    /// checks `size_limit` in main.rs.
+    fn run_maxsize(&mut self, arg: &str) -> Option<InputAction> {
+        if arg.is_empty() {
+            self.push_system(self.size_limit_notice());
+            return None;
+        }
+        match SizeLimit::parse(arg) {
+            Ok(limit) => {
+                self.size_limit = limit;
+                self.push_system(self.size_limit_notice());
+                Some(InputAction::SetSizeLimit(limit))
+            }
+            Err(message) => {
+                self.push_system(message);
+                None
+            }
+        }
+    }
+
+    /// What `/maxsize` says about the limit as it stands, and how to change
+    /// it -- the same words for asking and for having just changed it.
+    fn size_limit_notice(&self) -> String {
+        let default = human_size(DEFAULT_MAX_FILE_SIZE);
+        match self.size_limit {
+            SizeLimit::Default => format!(
+                "files over {default} are refused (the default) -- /maxsize <size> raises or lowers it, /maxsize off lifts it"
+            ),
+            SizeLimit::Bytes(bytes) => format!(
+                "files over {} are refused (set with /maxsize) -- /maxsize <size> changes it, /maxsize off lifts it, /maxsize default restores the {default} default",
+                human_size(bytes)
+            ),
+            SizeLimit::Off => format!(
+                "there is no limit on the size of a file you share (set with /maxsize) -- /maxsize <size> sets one, /maxsize default restores the {default} default"
+            ),
+        }
     }
 
     /// Handles `/paste` (and the `Ctrl+V`/`Cmd+V` keybinding in
@@ -6823,6 +6898,129 @@ mod tests {
             save_dir(submit(&mut app, "/save")),
             PathBuf::from("/new/general")
         );
+    }
+
+    #[test]
+    fn a_bare_maxsize_says_what_the_limit_is_and_how_to_change_it() {
+        let mut app = app();
+
+        let action = submit(&mut app, "/maxsize");
+
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(
+            last.contains("files over 500.0 MB are refused (the default)"),
+            "got: {last}"
+        );
+        assert!(
+            last.contains("/maxsize <size>") && last.contains("/maxsize off"),
+            "got: {last}"
+        );
+    }
+
+    #[test]
+    fn a_bare_maxsize_reports_a_chosen_limit_and_no_limit_too_without_changing_either() {
+        let mut app = app();
+
+        app.load_size_limit(SizeLimit::Bytes(1 << 20));
+        assert!(submit(&mut app, "/maxsize").is_none());
+        let chosen = as_system(app.active().messages.back().unwrap()).to_string();
+        assert_eq!(app.size_limit(), SizeLimit::Bytes(1 << 20));
+
+        app.load_size_limit(SizeLimit::Off);
+        assert!(submit(&mut app, "/maxsize").is_none());
+        let off = as_system(app.active().messages.back().unwrap()).to_string();
+        assert_eq!(app.size_limit(), SizeLimit::Off);
+
+        assert!(
+            chosen.contains("files over 1.0 MB are refused (set with /maxsize)"),
+            "got: {chosen}"
+        );
+        assert!(
+            chosen.contains("/maxsize default restores the 500.0 MB default"),
+            "got: {chosen}"
+        );
+        assert!(
+            off.contains("there is no limit on the size of a file you share"),
+            "got: {off}"
+        );
+    }
+
+    #[test]
+    fn maxsize_with_a_size_applies_it_at_once_and_asks_for_it_to_be_remembered() {
+        let mut app = app();
+
+        match submit(&mut app, "/maxsize 2GB").expect("a limit that took effect is remembered") {
+            InputAction::SetSizeLimit(limit) => assert_eq!(limit, SizeLimit::Bytes(2 << 30)),
+            _ => panic!("expected InputAction::SetSizeLimit"),
+        }
+
+        assert_eq!(app.size_limit(), SizeLimit::Bytes(2 << 30));
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(
+            last.contains("files over 2.0 GB are refused (set with /maxsize)"),
+            "got: {last}"
+        );
+    }
+
+    #[test]
+    fn maxsize_off_lifts_the_limit_and_default_restores_it() {
+        let mut app = app();
+
+        match submit(&mut app, "/maxsize off") {
+            Some(InputAction::SetSizeLimit(limit)) => assert_eq!(limit, SizeLimit::Off),
+            _ => panic!("expected InputAction::SetSizeLimit"),
+        }
+        assert_eq!(app.size_limit(), SizeLimit::Off);
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("there is no limit"), "got: {last}");
+
+        match submit(&mut app, "/maxsize default") {
+            Some(InputAction::SetSizeLimit(limit)) => assert_eq!(limit, SizeLimit::Default),
+            _ => panic!("expected InputAction::SetSizeLimit"),
+        }
+        assert_eq!(app.size_limit(), SizeLimit::Default);
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("(the default)"), "got: {last}");
+    }
+
+    #[test]
+    fn a_maxsize_that_is_not_a_size_is_refused_and_changes_nothing() {
+        let mut app = app();
+        app.load_size_limit(SizeLimit::Bytes(1 << 20));
+
+        for typed in ["banana", "5", "0MB", "2XB"] {
+            let action = submit(&mut app, &format!("/maxsize {typed}"));
+
+            assert!(action.is_none(), "{typed}: nothing to remember");
+            assert_eq!(
+                app.size_limit(),
+                SizeLimit::Bytes(1 << 20),
+                "{typed}: unchanged"
+            );
+            let last = as_system(app.active().messages.back().unwrap());
+            assert!(last.contains(&format!("'{typed}'")), "{typed}: got {last}");
+        }
+    }
+
+    #[test]
+    fn the_size_limit_is_the_default_until_one_is_loaded() {
+        let mut app = app();
+        assert_eq!(app.size_limit(), SizeLimit::Default);
+
+        app.load_size_limit(SizeLimit::Off);
+
+        assert_eq!(app.size_limit(), SizeLimit::Off);
+    }
+
+    #[test]
+    fn help_lists_maxsize() {
+        let mut app = app();
+
+        submit(&mut app, "/help");
+
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("/maxsize"), "got: {last}");
     }
 
     #[test]

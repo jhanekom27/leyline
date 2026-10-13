@@ -1181,14 +1181,19 @@ impl Net {
 
     /// Shares the file at `path` with `channel` right away -- the `/send`
     /// counterpart to `send`. Checks it synchronously (`files::stage_file`:
-    /// existence, that it's a file rather than a directory, a simple size
-    /// cap, and that a filename can be derived) so an obviously bad path is
-    /// reported immediately instead of after spawning work, then hands it
-    /// to `send_staged`, the same import-and-announce path a staged
-    /// attachment takes -- just with no staging step in between, since
-    /// `/send` is an explicit command.
-    pub fn send_file(&self, channel: String, path: String) -> Option<String> {
-        match files::stage_file(&files::expand_path(&path)) {
+    /// existence, that it's a file rather than a directory, that it fits
+    /// `limit` -- the user's `/maxsize` -- and that a filename can be
+    /// derived) so an obviously bad path is reported immediately instead of
+    /// after spawning work, then hands it to `send_staged`, the same
+    /// import-and-announce path a staged attachment takes -- just with no
+    /// staging step in between, since `/send` is an explicit command.
+    pub fn send_file(
+        &self,
+        channel: String,
+        path: String,
+        limit: files::SizeLimit,
+    ) -> Option<String> {
+        match files::stage_file(&files::expand_path(&path), limit) {
             Ok(item) => {
                 self.send_staged(channel, vec![item], String::new());
                 None
@@ -1758,8 +1763,8 @@ mod tests {
         std::fs::write(&first, b"alpha").unwrap();
         std::fs::write(&second, b"bravo!").unwrap();
         let items = vec![
-            files::stage_file(&first).unwrap(),
-            files::stage_file(&second).unwrap(),
+            files::stage_file(&first, files::SizeLimit::Default).unwrap(),
+            files::stage_file(&second, files::SizeLimit::Default).unwrap(),
         ];
 
         let events = import_all(items, "look at these").await;
@@ -1797,7 +1802,10 @@ mod tests {
             size: 4,
             source: StagedSource::Path(dir.path().join("gone.txt")),
         };
-        let items = vec![gone, files::stage_file(&good).unwrap()];
+        let items = vec![
+            gone,
+            files::stage_file(&good, files::SizeLimit::Default).unwrap(),
+        ];
 
         let events = import_all(items, "still here").await;
 
@@ -1815,7 +1823,12 @@ mod tests {
 
     #[tokio::test]
     async fn import_staged_imports_a_clipboard_image_from_its_bytes() {
-        let image = files::stage_image("clipboard-1.png".to_string(), vec![1, 2, 3]).unwrap();
+        let image = files::stage_image(
+            "clipboard-1.png".to_string(),
+            vec![1, 2, 3],
+            files::SizeLimit::Default,
+        )
+        .unwrap();
 
         let events = import_all(vec![image], "").await;
 

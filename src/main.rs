@@ -50,8 +50,8 @@ use contacts::Contacts;
 use direct_registry::DirectRegistry;
 use dm_registry::DmRegistry;
 use files::{
-    dropped_files, open_in_default_app, resolve_destination, set_files_root, stage_file,
-    stage_image,
+    dropped_files, open_in_default_app, resolve_destination, set_files_root, set_size_limit,
+    stage_file, stage_image,
 };
 use forgotten_devices::ForgottenDevices;
 use message::ChatMessage;
@@ -97,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
     let forgotten_devices = ForgottenDevices::load(dirs.data_dir().join("forgotten_devices"))
         .context("failed to initialize forgotten devices")?;
     let files_root = files::files_root(&data_dir)?;
+    let size_limit = files::size_limit(&data_dir)?;
     let saved_files = SavedFiles::load(dirs.data_dir().join("saved_files"))
         .context("failed to initialize saved files")?;
 
@@ -152,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         forgotten_devices,
         saved_files,
         files_root,
+        size_limit,
         data_dir,
     };
 
@@ -393,9 +395,14 @@ struct Session {
     /// `AppState` (`load_files_root`) at startup, which holds it from then
     /// on: `/folder <path>` replaces it there.
     files_root: PathBuf,
+    /// How big a file may be to share -- see `files::size_limit`. Seeded
+    /// into `AppState` (`load_size_limit`) at startup, which holds it from
+    /// then on: `/maxsize` replaces it there.
+    size_limit: files::SizeLimit,
     /// leyline's own data directory (`dirs.data_dir()`), where the file
-    /// picker's remembered folder (`picker::remember_folder`) and the files
-    /// root (`files::set_files_root`) are kept.
+    /// picker's remembered folder (`picker::remember_folder`), the files
+    /// root (`files::set_files_root`) and the size limit
+    /// (`files::set_size_limit`) are kept.
     data_dir: PathBuf,
 }
 
@@ -454,14 +461,14 @@ fn route_send(net: &Net, app: &AppState, channel: &str, message: ChatMessage) {
 /// Finder/Explorer copy) -- on the channel the paste was for, which may no
 /// longer be the active one by the time the clipboard read comes back --
 /// and the ones a drag-and-drop pasted as paths (`handle_paste`). Each path
-/// is checked exactly like a `/send`ed one (`files::stage_file`); one that
-/// is refused (unreadable, too large) is reported as a system notice
-/// without affecting the rest, so a multi-file copy or drop stages whatever
-/// it can. Nothing is shared yet: that waits for `Enter`
-/// (`app::AppState::send_staged`).
+/// is checked exactly like a `/send`ed one (`files::stage_file`, against the
+/// size limit `/maxsize` set); one that is refused (unreadable, too large)
+/// is reported as a system notice without affecting the rest, so a
+/// multi-file copy or drop stages whatever it can. Nothing is shared yet:
+/// that waits for `Enter` (`app::AppState::send_staged`).
 fn stage_files(app: &mut AppState, channel: &str, paths: &[PathBuf]) {
     for path in paths {
-        match stage_file(path) {
+        match stage_file(path, app.size_limit()) {
             Ok(item) => app.stage_attachment(channel, item),
             Err(message) => app.push_system(message),
         }
@@ -470,10 +477,10 @@ fn stage_files(app: &mut AppState, channel: &str, paths: &[PathBuf]) {
 
 /// Stages a clipboard image (`NetEvent::ClipboardImage`, already
 /// re-encoded as PNG) the same way `stage_files` stages files; the one
-/// thing to check -- the size cap -- is reported immediately, like a
+/// thing to check -- the size limit -- is reported immediately, like a
 /// refused `/send`.
 fn stage_clipboard_image(app: &mut AppState, channel: &str, filename: String, bytes: Vec<u8>) {
-    match stage_image(filename, bytes) {
+    match stage_image(filename, bytes, app.size_limit()) {
         Ok(item) => app.stage_attachment(channel, item),
         Err(message) => app.push_system(message),
     }
@@ -540,6 +547,7 @@ async fn run(
         mut forgotten_devices,
         mut saved_files,
         files_root,
+        size_limit,
         data_dir,
     } = session;
 
@@ -552,6 +560,7 @@ async fn run(
     app.load_forgotten_devices(forgotten_devices.all());
     app.load_browse_dir(start_folder(&data_dir));
     app.load_files_root(files_root);
+    app.load_size_limit(size_limit);
     for name in &joined_channels {
         // Ensures a brand-new channel ("general" on a first run, or a
         // `--join` ticket's channel) lands in the registry, so it's
@@ -774,7 +783,9 @@ async fn run(
                                 });
                             }
                             Some(InputAction::SendFile { channel, path }) => {
-                                if let Some(message) = net.send_file(channel, path) {
+                                if let Some(message) =
+                                    net.send_file(channel, path, app.size_limit())
+                                {
                                     app.push_system(message);
                                 }
                             }
@@ -811,6 +822,15 @@ async fn run(
                                         app.load_files_root(root);
                                     }
                                     Err(message) => app.push_system(message),
+                                }
+                            }
+                            // `/maxsize <size>`: already applied to `app`,
+                            // so only remembering it is left. A write that
+                            // fails still leaves the limit in force for this
+                            // session -- and says so.
+                            Some(InputAction::SetSizeLimit(limit)) => {
+                                if let Err(message) = set_size_limit(&data_dir, limit) {
+                                    app.push_system(message);
                                 }
                             }
                             // The files overlay just opened. What it marks
@@ -1322,6 +1342,97 @@ mod tests {
             (staged[0].filename.as_str(), staged[0].size),
             ("clipboard-1.png", 3)
         );
+    }
+
+    /// A file of `size` zero bytes called `name` in `dir`.
+    fn file_of(dir: &Path, name: &str, size: usize) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![0u8; size]).unwrap();
+        path
+    }
+
+    /// The text of the newest system notice in `app`'s active channel.
+    fn last_notice(app: &AppState) -> String {
+        match app.active().messages.back() {
+            Some(app::TranscriptLine::System(text)) => text.clone(),
+            _ => panic!("expected a system notice"),
+        }
+    }
+
+    #[test]
+    fn a_file_over_the_size_limit_is_refused_when_staged_and_staged_once_the_limit_allows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_of(dir.path(), "big.bin", 2048);
+        let mut app = AppState::new([1; 32], vec!["general".to_string()], "general");
+        app.load_size_limit(files::SizeLimit::Bytes(1024));
+
+        stage_files(&mut app, "general", std::slice::from_ref(&path));
+
+        assert!(app.active().staged.is_empty());
+        let notice = last_notice(&app);
+        assert!(
+            notice.contains("too large") && notice.contains("/maxsize"),
+            "got: {notice}"
+        );
+
+        app.load_size_limit(files::SizeLimit::Off);
+        stage_files(&mut app, "general", &[path]);
+        assert_eq!(app.active().staged.len(), 1);
+    }
+
+    #[test]
+    fn a_dropped_file_answers_to_the_size_limit_like_any_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_of(dir.path(), "big.bin", 2048);
+        let pasted = path.to_str().unwrap().to_string();
+        let mut app = AppState::new([1; 32], vec!["general".to_string()], "general");
+        app.load_size_limit(files::SizeLimit::Bytes(1024));
+
+        handle_paste(&mut app, &pasted);
+
+        assert!(app.active().staged.is_empty());
+        assert_eq!(
+            app.active().input,
+            "",
+            "it was still a drop, so nothing is typed"
+        );
+        assert!(last_notice(&app).contains("too large"));
+
+        app.load_size_limit(files::SizeLimit::Bytes(4096));
+        handle_paste(&mut app, &pasted);
+        assert_eq!(app.active().staged.len(), 1);
+    }
+
+    #[test]
+    fn a_clipboard_image_answers_to_the_size_limit_too() {
+        let name = || "clipboard-1.png".to_string();
+        let mut app = AppState::new([1; 32], vec!["general".to_string()], "general");
+        app.load_size_limit(files::SizeLimit::Bytes(2));
+
+        stage_clipboard_image(&mut app, "general", name(), vec![1, 2, 3]);
+
+        assert!(app.active().staged.is_empty());
+        let notice = last_notice(&app);
+        assert!(
+            notice.starts_with("can't paste image: too large (3 B, max 2 B)"),
+            "got: {notice}"
+        );
+        assert!(notice.contains("/maxsize"), "got: {notice}");
+
+        app.load_size_limit(files::SizeLimit::Off);
+        stage_clipboard_image(&mut app, "general", name(), vec![1, 2, 3]);
+        assert_eq!(app.active().staged.len(), 1);
+    }
+
+    #[test]
+    fn pairing_leaves_the_size_limit_alone() {
+        // A preference of this device, like the files root: a redeem
+        // replaces the channels and history, not how this device is set up.
+        let data_dir = Path::new("/data");
+
+        let paths = paths_to_wipe_for_pairing(data_dir, Path::new("/config"));
+
+        assert!(!paths.contains(&data_dir.join("size_limit")));
     }
 
     /// Writes a small file called `name` into `dir`; returns its path and
