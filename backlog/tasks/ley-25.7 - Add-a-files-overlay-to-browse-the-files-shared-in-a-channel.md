@@ -1,11 +1,11 @@
 ---
 id: LEY-25.7
 title: Add a /files overlay to browse the files shared in a channel
-status: In Progress
+status: Done
 assignee:
   - '@Jurgen'
 created_date: '2026-10-12 08:28'
-updated_date: '2026-10-13 04:05'
+updated_date: '2026-10-13 05:55'
 labels:
   - files
   - ux
@@ -82,4 +82,12 @@ Follow-up after review (guard on Ctrl+O, resolving interpretation (7)): a file w
 Not covered (a list is not a sandbox): documents that can carry macros, archives, web pages, and any type not on the list. The list is wider than one system needs (a script that merely opens in an editor on macOS is refused too), because a peer's file name says nothing about where it will be opened. Saving such a file is unaffected, and opening one by hand from the file manager is left to the user.
 
 Validation, superseding the figures above: cargo test 858 passed (14 new), cargo clippy --all-targets clean, cargo fmt --check flags only the old src/dm_registry.rs hunk. The PTY run (/tmp/ley-25-7/run.py, now also sharing a text file named setup.exe): B saves it with Enter like any file; then Ctrl+O is refused with the notice, no key is offered for the row, the stand-in `open` is never run, and Enter says it is already saved and saves nothing more. 105 of 105 checks pass.
+
+Reviewed and accepted: every interpretation above, as amended by the follow-ups (4: `Enter` on a saved file says so; 7: `Ctrl+O` refuses programs and scripts; 1 and 9: the 500-line window is tracked as LEY-27.1). `Ctrl+O` was confirmed to open the saved file in Warp itself, by hand -- the one thing the scripted runs, which send the raw key, could not cover. The scripted run was repeated on the 0.6.0 build (after LEY-25.8): 105 of 105 checks pass.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Added a `/files` overlay: a keyboard-first modal over a channel's shared files, newest first, with name, size, sender, date and a saved marker that survives restarts (`saved_files.rs`). Typing filters by name or sender; `Enter` saves like `/save`; `Ctrl+O` opens a saved copy with the OS default application unless its extension says it runs something (a deny-list on programs, scripts, installers and shortcuts); a key that cannot act says why in the bottom border. It works in group channels, `/msg` DMs and `/dm` chats. Verified with the unit tests (836 when built, 858 after the review follow-ups, 887 now), clippy, a scripted run of the real binary -- two instances under PTYs, 105 of 105 checks, repeated on the 0.6.0 build -- and a manual check in Warp that `Ctrl+O` opens the file. Known limit, tracked as LEY-27.1: only a channel's last 500 transcript lines are listed.
+<!-- SECTION:FINAL_SUMMARY:END -->

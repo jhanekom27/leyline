@@ -1,10 +1,10 @@
 ---
 id: LEY-25
 title: Effortless file sharing
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-10-12 08:28'
-updated_date: '2026-10-13 04:45'
+updated_date: '2026-10-13 05:56'
 labels:
   - files
   - ux
@@ -34,3 +34,9 @@ Subtasks: LEY-25.1 to 25.6 are Done with every criterion checked; LEY-25.7 and L
 
 Not exercised on the real binary: `Ctrl+V` and `/paste` of the real clipboard and a `/msg` DM (both would use the real clipboard); they are covered by unit tests. The one limit still open is that a file shared further back than a channel's last 500 lines cannot be listed or saved; it is tracked as LEY-27.1.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Sending and receiving files no longer takes the manual steps the description lists, and nothing about the wire format changed. All eight subtasks are done: staged attachments (LEY-25.1), dropped paths (25.2), the in-TUI picker (25.3), a bare `/save` (25.4), fetching from any channel peer (25.5), a folder per channel (25.6), the `/files` overlay (25.7) and the size-limit override `/maxsize` (25.8). Verified against the description with a three-instance run of the real binary under PTYs (35 of 35 checks: a picker and a drop instead of a typed path, a bare `/save` and `/files` instead of a hash, staging with undo and a caption, one folder per channel, and a fetch with the sender offline), the LEY-25.7 and LEY-25.8 scripts repeated on the final build (105 of 105 and 37 of 37), 887 unit tests and clippy, and the git history: no commit of the epic touches `message.rs`, `ticket.rs`, `direct.rs` or `pairing.rs`. One limit is tracked outside the epic as LEY-27.1: only a channel's last 500 transcript lines can be listed and saved.
+<!-- SECTION:FINAL_SUMMARY:END -->

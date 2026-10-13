@@ -1,11 +1,11 @@
 ---
 id: LEY-25.8
 title: Allow overriding the file size limit when sending deliberately
-status: In Progress
+status: Done
 assignee:
   - '@Jurgen'
 created_date: '2026-10-13 02:53'
-updated_date: '2026-10-13 04:39'
+updated_date: '2026-10-13 05:55'
 labels:
   - files
   - ux
@@ -63,4 +63,12 @@ Interpretations to confirm:
 (4) The limit is `Default | Bytes | Off` and is remembered as a one-line `size_limit` file in the data directory (not in the postcard `settings` file, which cannot grow a field without failing to decode an old file). `default` forgets the file, so a build that moves the default moves everyone who never chose a limit. A file that is not a limit is logged and means the default, never a looser limit; a genuine I/O error fails startup, as for `files_root`; a failed write is reported and the limit still holds for the session. Pairing leaves it alone, as a preference of this device.
 (5) Only what you share is limited: a file someone sends you is not checked against it when you `/save` it.
 (6) The limit also governs a pasted clipboard image (checked after it is encoded as PNG, in memory), as the old cap did; under `off` that check is gone too.
+
+Reviewed and accepted: the persisted-setting approach, `/maxsize` and its persistence. The limits it leaves -- only files you share are limited, a pasted image answers to the same limit and `off` drops that check, the limit is not re-checked at send, there is no one-off confirmation, a unit is required -- are accepted for now and written down in features.md (the "File size limit override" entry) so they can be revisited.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Added `/maxsize [<size>|off|default]`: a persisted limit on the size of a file or pasted image you share. It is enforced in `files::stage_file` and `files::stage_image`, so every route (`/send <path>`, the picker, a drop, the clipboard) answers to it; it is remembered in a one-line `size_limit` file in the data directory; and the refusal now says how to get past it. The default 500 MB guardrail is unchanged. Verified with 887 unit tests (29 new), clippy, and 37 of 37 scripted checks of the real binary under PTYs: a sparse 501 MB file refused by `/send` and by a drop, a 2 KB file refused under 1KB and delivered under 1MB, `off` staging the 501 MB drop, settings surviving restarts, and a garbage settings file meaning the default. Version 0.6.0.
+<!-- SECTION:FINAL_SUMMARY:END -->
