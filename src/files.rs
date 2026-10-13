@@ -5,11 +5,13 @@
 //! disk -- in a folder of its own channel's (`channel_dir`) under the one
 //! files root (`files_root`) -- where "where did it go" gets answered with
 //! zero configuration, and -- on the way out -- where a file someone wants
-//! to share is checked before it is staged (`stage_file`/`stage_image`) and
-//! where a pasted path is recognized as a drag-and-drop (`dropped_files`).
+//! to share is checked before it is staged (`stage_file`/`stage_image`),
+//! where a pasted path is recognized as a drag-and-drop (`dropped_files`),
+//! and where a saved file is handed to the OS to open (`open_in_default_app`).
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::Context;
 use tracing::warn;
@@ -289,6 +291,48 @@ fn try_claim(dir: &Path, name: &str) -> std::io::Result<Option<PathBuf>> {
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
         Err(err) => Err(err),
     }
+}
+
+/// The program that hands a file to whatever the OS has registered to open
+/// it -- what double-clicking it would run: `open` on macOS, `explorer` on
+/// Windows (which, given a file, opens it with its default application) and
+/// `xdg-open` anywhere else.
+#[cfg(target_os = "macos")]
+const OPENER: &str = "open";
+#[cfg(target_os = "windows")]
+const OPENER: &str = "explorer";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const OPENER: &str = "xdg-open";
+
+/// Opens `path` -- the absolute path of an existing file, so the launcher
+/// can't take it for an option -- with the OS's default application for it,
+/// as double-clicking it in a file manager would. Returns once the launcher
+/// has been *started*: whether it then finds an application is the OS's
+/// business and not something to wait for, so the only error is a launcher
+/// that can't be run at all (no `xdg-open` on a bare server, say). The
+/// launcher is reaped on a thread of its own, so one that outlives this
+/// call is never left a zombie.
+pub fn open_in_default_app(path: &Path) -> std::io::Result<()> {
+    let mut launcher = open_command(path).spawn()?;
+    std::thread::spawn(move || {
+        let _ = launcher.wait();
+    });
+    Ok(())
+}
+
+/// The command `open_in_default_app` runs: the launcher with `path` as its
+/// one argument -- an argument, never text for a shell, so nothing in a
+/// file's name (which came from a peer) is ever interpreted -- and with
+/// stdin, stdout and stderr closed off, so a launcher that prints can't draw
+/// over the TUI.
+fn open_command(path: &Path) -> Command {
+    let mut command = Command::new(OPENER);
+    command
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
 }
 
 /// A file, or a pasted image, waiting in a channel's staging area to be
@@ -1050,6 +1094,31 @@ mod tests {
             "names the file in the way, got: {message}"
         );
         assert!(!data.path().join(FILES_ROOT_FILE).exists());
+    }
+
+    #[test]
+    fn the_launcher_gets_the_path_as_its_one_argument_whatever_the_name_says() {
+        // A name is a peer's to choose: shell syntax, a percent variable and
+        // quotes in it must reach the launcher as plain characters.
+        let path = Path::new("/files/general/a & b; $(echo hi) %PATH% \"q\".pdf");
+
+        let command = open_command(path);
+
+        assert_eq!(command.get_program(), OPENER);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [path.as_os_str()],
+            "one argument, the path as it is"
+        );
+    }
+
+    #[test]
+    fn a_launcher_that_cannot_be_run_is_an_error_not_a_panic() {
+        // `Command::spawn` on a program that is not there, as on a server
+        // with no `xdg-open`: reported to the caller, which tells the user.
+        let mut missing = Command::new("leyline-no-such-launcher");
+
+        assert!(missing.arg("/x").spawn().is_err());
     }
 
     #[test]

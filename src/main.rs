@@ -15,6 +15,7 @@ mod message;
 mod net;
 mod pairing;
 mod picker;
+mod saved_files;
 mod search;
 mod settings;
 mod storage;
@@ -48,11 +49,15 @@ use channel_renames::ChannelRenames;
 use contacts::Contacts;
 use direct_registry::DirectRegistry;
 use dm_registry::DmRegistry;
-use files::{dropped_files, resolve_destination, set_files_root, stage_file, stage_image};
+use files::{
+    dropped_files, open_in_default_app, resolve_destination, set_files_root, stage_file,
+    stage_image,
+};
 use forgotten_devices::ForgottenDevices;
 use message::ChatMessage;
 use net::{DEVICE_SYNC_CHANNEL, Net, NetEvent};
 use picker::{FolderListing, read_folder, remember_folder, start_folder};
+use saved_files::SavedFiles;
 use search::{SearchOutcome, run_on_disk_scan};
 use settings::Settings;
 use storage::MessageStore;
@@ -92,6 +97,8 @@ async fn main() -> anyhow::Result<()> {
     let forgotten_devices = ForgottenDevices::load(dirs.data_dir().join("forgotten_devices"))
         .context("failed to initialize forgotten devices")?;
     let files_root = files::files_root(&data_dir)?;
+    let saved_files = SavedFiles::load(dirs.data_dir().join("saved_files"))
+        .context("failed to initialize saved files")?;
 
     let secret_key = identity::load_or_generate(&dirs.config_dir().join("identity"))
         .context("failed to load or generate identity")?;
@@ -143,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         direct_registry,
         settings,
         forgotten_devices,
+        saved_files,
         files_root,
         data_dir,
     };
@@ -377,6 +385,10 @@ struct Session {
     direct_registry: DirectRegistry,
     settings: Settings,
     forgotten_devices: ForgottenDevices,
+    /// Where `/save` put each channel's files -- see `saved_files`. Written
+    /// when a save finishes (`NetEvent::FileSaved`), read when the files
+    /// overlay opens (`InputAction::CheckSavedFiles`).
+    saved_files: SavedFiles,
     /// Where received files go -- see `files::files_root`. Seeded into
     /// `AppState` (`load_files_root`) at startup, which holds it from then
     /// on: `/folder <path>` replaces it there.
@@ -526,6 +538,7 @@ async fn run(
         mut direct_registry,
         mut settings,
         mut forgotten_devices,
+        mut saved_files,
         files_root,
         data_dir,
     } = session;
@@ -773,10 +786,10 @@ async fn run(
                             Some(InputAction::SendStaged { channel, items, caption }) => {
                                 net.send_staged(channel, items, caption);
                             }
-                            Some(InputAction::SaveFile { hash, filename, providers, dir }) => {
+                            Some(InputAction::SaveFile { channel, hash, filename, providers, dir }) => {
                                 match resolve_destination(&dir, &filename) {
                                     Ok(destination) => {
-                                        net.save_file(hash, filename, providers, destination);
+                                        net.save_file(channel, hash, filename, providers, destination);
                                     }
                                     Err(err) => {
                                         app.push_system(format!(
@@ -798,6 +811,33 @@ async fn run(
                                         app.load_files_root(root);
                                     }
                                     Err(message) => app.push_system(message),
+                                }
+                            }
+                            // The files overlay just opened. What it marks
+                            // as saved is a fact about the disk, answered
+                            // here, before the next frame is drawn: a stat
+                            // per file saved for this one channel, the same
+                            // kind of inline filesystem work as a save's
+                            // destination.
+                            Some(InputAction::CheckSavedFiles(channel)) => {
+                                app.apply_saved_files(&channel, saved_files.present_in(&channel));
+                            }
+                            // `Ctrl+O` in the files overlay. The copy may have
+                            // been deleted since the overlay looked, which
+                            // the launcher would only report by failing out
+                            // of sight, so look first. The launcher is
+                            // started, not waited for.
+                            Some(InputAction::OpenFile(path)) => {
+                                if !path.is_file() {
+                                    app.push_system(format!(
+                                        "can't open {}: it has been moved or deleted",
+                                        path.display()
+                                    ));
+                                } else if let Err(err) = open_in_default_app(&path) {
+                                    app.push_system(format!(
+                                        "can't open {}: {err}",
+                                        path.display()
+                                    ));
                                 }
                             }
                             Some(InputAction::Paste(channel)) => {
@@ -924,6 +964,17 @@ async fn run(
                         warn!(channel = %name, "failed to persist DM registry entry: {err}");
                     }
                     app.record_dm_channel(pending.peer, name.clone());
+                }
+
+                // Peek for a finished `/save`, to remember where the copy
+                // went -- what the files overlay marks as saved, even
+                // after a restart (see `saved_files`). `app.handle_net_event`
+                // below still separately posts the notice, and marks the
+                // file in an open overlay.
+                if let NetEvent::FileSaved { channel, hash, path, .. } = &net_event
+                    && let Err(err) = saved_files.record(channel, *hash, path)
+                {
+                    warn!(%channel, "failed to record a saved file: {err}");
                 }
 
                 match net_event {
@@ -1390,5 +1441,40 @@ mod tests {
         );
         let switcher = app.switching.as_ref().expect("the switcher is still open");
         assert_eq!(switcher.query, path.to_str().unwrap());
+    }
+
+    #[test]
+    fn a_drop_while_the_files_overlay_is_open_is_a_plain_paste() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, pasted) = dropped(dir.path(), "report.pdf");
+        let mut app = AppState::new([1; 32], vec!["general".to_string()], "general");
+        for c in "/files".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        handle_paste(&mut app, &pasted);
+
+        assert!(
+            app.active().staged.is_empty(),
+            "files must not be staged behind an open overlay"
+        );
+        let overlay = app
+            .viewing_files
+            .as_ref()
+            .expect("the files overlay is still open");
+        assert_eq!(overlay.query, path.to_str().unwrap());
+    }
+
+    #[test]
+    fn pairing_leaves_the_record_of_saved_files_alone() {
+        // Where files were saved is a fact about this device's disk, which a
+        // redeem doesn't touch -- like the files root, and unlike the
+        // channels, history and names it replaces.
+        let data_dir = Path::new("/data");
+
+        let paths = paths_to_wipe_for_pairing(data_dir, Path::new("/config"));
+
+        assert!(!paths.contains(&data_dir.join("saved_files")));
     }
 }

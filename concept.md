@@ -375,6 +375,19 @@ integrity -- it is verified against its hash as it streams in -- and, as
 with [Room privacy](#room-privacy), the hash is the capability: anyone who
 can reach a peer and knows it can fetch the blob.
 
+The `/files` overlay (`AppState::viewing_files`) is `Ctrl+P`'s overlay again,
+over a channel's shared files: they are read off the same loaded transcript
+`/save` resolves against on every draw, so nothing is stored of it but a
+query, a highlight, the channel it opened on and what the disk said about
+that channel's files. What the disk said is the one thing app.rs can't know,
+so it is asked for (`InputAction::CheckSavedFiles`) and answered by main.rs
+from `saved_files.rs`: a record, written when a save finishes
+(`NetEvent::FileSaved`, which names the channel and the hash), of which
+channel's copy of which file is at which path, checked against the
+filesystem each time the overlay opens -- a copy that has been deleted counts
+as unsaved again. `Enter` saves exactly as `/save` does, and `Ctrl+O` hands a
+saved copy to the OS to open (`files::open_in_default_app`).
+
 ## Point-to-point messaging
 
 `/dm <alias|hex-prefix|endpoint-id> [text]` (`direct.rs`) is a second,
@@ -440,7 +453,8 @@ src/
   search.rs           // shared match predicate + on-disk scan for /search
   thread.rs           // reply-chain (ancestors + descendants) builder for /thread
   backfill.rs         // iroh-blobs history manifests for offline backfill
-  files.rs            // /save destination resolution (a folder per channel under the files root), filename safety, sizes, outgoing-file checks + staged attachments, drag-and-drop paste detection
+  files.rs            // /save destination resolution (a folder per channel under the files root), filename safety, sizes, outgoing-file checks + staged attachments, drag-and-drop paste detection, opening a saved file with the OS
+  saved_files.rs      // persisted record of which channel's copy of which file /save put where, for the /files overlay's check mark and open key
   term_events.rs      // crossterm EventStream wrapper: a drop a terminal types out (Warp) becomes one paste
   picker.rs           // in-TUI file picker behind a bare /send: pure state, folder reads, remembered start folder
   version.rs          // build version/git-hash constants, newer-than-ours comparison

@@ -14,7 +14,7 @@ use iroh_blobs::Hash;
 use iroh_tickets::Ticket;
 
 use crate::files::{StagedAttachment, channel_dir};
-use crate::message::{ChatMessage, now_unix_ms};
+use crate::message::{ChatMessage, FileAttachment, now_unix_ms};
 use crate::net::{DEVICE_SYNC_CHANNEL, NetEvent};
 use crate::picker::{FilePicker, FolderListing, Step};
 use crate::search::{self, SearchOutcome, SearchResults};
@@ -95,6 +95,50 @@ pub struct Switcher {
     /// (`AppState::switcher_highlight`), since the matches can change under
     /// an open overlay -- a peer gets renamed, a channel joins.
     selected: usize,
+}
+
+/// The files overlay opened with `/files` -- see `AppState::viewing_files`.
+/// Like `Switcher` it stores no list: the files are always derived from the
+/// channel's live transcript (`AppState::files_matches`), so the list can't
+/// go stale, and the highlight is a position clamped on every read
+/// (`AppState::files_highlight`). It keeps two things more, both because it
+/// acts on one channel's files: which channel, and what the disk said about
+/// them.
+#[derive(Debug)]
+pub struct FilesOverlay {
+    /// The channel whose files it lists, by stored name, fixed when the
+    /// overlay opened. Focus can move under an open overlay (a join that
+    /// finishes switches to its channel, `activate_or_create_channel`), and
+    /// `Enter` must save into the folder of the channel whose list the user
+    /// was looking at.
+    pub channel: String,
+    /// What's been typed so far, matched case-insensitively against each
+    /// file's name and its sender as shown (`AppState::display_name`).
+    pub query: String,
+    /// Position of the highlighted file among the current matches. Reset to
+    /// the first match whenever the query changes
+    /// (`AppState::edit_files_query`) and clamped on every read
+    /// (`AppState::files_highlight`), since the matches can change under an
+    /// open overlay -- a file arrives, a peer gets renamed.
+    selected: usize,
+    /// Where this channel's saved copy of each file is, for the files whose
+    /// copy was on disk when the overlay opened (`InputAction::
+    /// CheckSavedFiles`, answered through `AppState::apply_saved_files`) or
+    /// has landed since (`NetEvent::FileSaved`). What the overlay marks as
+    /// saved, and what `Ctrl+O` opens. It is the disk's word as of that
+    /// moment -- app.rs can't look for itself -- and nothing outside an open
+    /// overlay needs it, so it lives and dies with it.
+    saved: HashMap<Hash, PathBuf>,
+}
+
+/// One file shared in a channel, as the files overlay lists it: the
+/// attachment of a chat message, with who sent it and when. One per share --
+/// a file sent twice is listed twice, each with its own sender and date.
+#[derive(Debug, Clone, Copy)]
+pub struct SharedFile<'a> {
+    pub file: &'a FileAttachment,
+    pub sender: [u8; 32],
+    pub ts_unix_ms: u64,
 }
 
 /// One joined channel's transcript, presence, per-channel scroll state,
@@ -514,17 +558,22 @@ pub enum InputAction {
         items: Vec<StagedAttachment>,
         caption: String,
     },
-    /// Fetch a previously shared file and save it locally -- `hash`,
-    /// `filename`, `providers` and `dir` already resolved by `run_save`, from
-    /// a typed hash-prefix (see `resolve_attachment`) or, with none, as the
-    /// newest file in the active channel (see `newest_shared_file`).
-    /// `providers` are who to ask for it, best bet first: the file's sender,
-    /// then the other peers known in its channel (see `providers_for`). `dir`
-    /// is the folder it is saved into: its channel's, under the files root
-    /// (see `channel_of_file`). The caller picks the file's name inside it
+    /// Fetch a previously shared file and save it locally -- `channel`,
+    /// `hash`, `filename`, `providers` and `dir` already resolved by
+    /// `save_request`, for `run_save` (from a typed hash-prefix -- see
+    /// `resolve_attachment` -- or, with none, as the newest file in the
+    /// active channel -- see `newest_shared_file`) and for `Enter` in the
+    /// files overlay. `providers` are who to ask for it, best bet first: the
+    /// file's sender, then the other peers known in its channel (see
+    /// `providers_for`). `dir` is the folder it is saved into: `channel`'s,
+    /// under the files root (see `channel_of_file`). `channel` itself, its
+    /// stored name, only rides along, so that once the file has landed it
+    /// can be recorded as saved *for that channel* (`saved_files`). The
+    /// caller picks the file's name inside `dir`
     /// (`files::resolve_destination`) and performs the download
     /// (`net::Net::save_file`); app.rs never touches the filesystem.
     SaveFile {
+        channel: String,
         hash: Hash,
         filename: String,
         providers: Vec<[u8; 32]>,
@@ -536,6 +585,17 @@ pub enum InputAction {
     /// then reports back through `AppState::load_files_root`: app.rs never
     /// touches the filesystem, so it can't tell whether the path will do.
     SetFilesRoot(String),
+    /// Tell the files overlay which of `channel`'s files are saved. The
+    /// overlay has just opened on it (`run_files`), and that is a fact about
+    /// the disk, which app.rs never touches: the caller looks (see
+    /// `saved_files::SavedFiles::present_in`) and answers through
+    /// `AppState::apply_saved_files`, before the next frame is drawn.
+    CheckSavedFiles(String),
+    /// Open the saved file at `path` with the OS's default application --
+    /// `Ctrl+O` in the files overlay (`open_highlighted_file`). The caller
+    /// checks it is still there and hands it over
+    /// (`files::open_in_default_app`).
+    OpenFile(PathBuf),
     /// Share whatever's on the OS clipboard with `channel` -- from `/paste`
     /// or the `Ctrl+V`/`Cmd+V` keybinding (see `run_paste`). The caller
     /// (`net::Net::paste`) reads the clipboard and decides what it found;
@@ -675,6 +735,10 @@ pub struct AppState {
     /// mode like `switching`: `handle_key` hands it every key, a paste
     /// filters it, and `is_composing` is false while it's open.
     pub picking_file: Option<FilePicker>,
+    /// The open files overlay (`/files`, see `run_files`), if any. A modal
+    /// mode like `switching`: `handle_key` hands it every key, a paste
+    /// filters it, and `is_composing` is false while it's open.
+    pub viewing_files: Option<FilesOverlay>,
     /// The folder the file picker opens in: where files were last chosen
     /// from -- seeded at startup from what was remembered across restarts
     /// (`load_browse_dir`) and updated whenever files are chosen. The
@@ -759,6 +823,7 @@ impl AppState {
             pending_redeem: None,
             restart_with_ticket: None,
             picking_file: None,
+            viewing_files: None,
             browse_dir: PathBuf::from(std::path::MAIN_SEPARATOR_STR),
             files_root: PathBuf::from(std::path::MAIN_SEPARATOR_STR),
             browse_requests: 0,
@@ -1177,6 +1242,9 @@ impl AppState {
         if self.picking_file.is_some() {
             return self.handle_picker_key(key);
         }
+        if self.viewing_files.is_some() {
+            return self.handle_files_key(key);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             // Backs out one level at a time: cancel an armed reply first
@@ -1492,6 +1560,200 @@ impl AppState {
         }
     }
 
+    /// Handles `/files`: opens the files overlay on the active channel with
+    /// an empty query, listing every file shared there -- type to filter,
+    /// move with `Up`/`Down`, `Enter` saves, `Ctrl+O` opens one already
+    /// saved, `Esc` closes (see `handle_files_key`). Which of them are saved
+    /// is a fact about the disk, so the caller is asked
+    /// (`InputAction::CheckSavedFiles`) and answers at once
+    /// (`apply_saved_files`).
+    fn run_files(&mut self) -> Option<InputAction> {
+        let channel = self.active().name.clone();
+        self.viewing_files = Some(FilesOverlay {
+            channel: channel.clone(),
+            query: String::new(),
+            selected: 0,
+            saved: HashMap::new(),
+        });
+        Some(InputAction::CheckSavedFiles(channel))
+    }
+
+    /// Handles a keypress while the files overlay is open: typing and
+    /// `Backspace` edit the query, `Up`/`Down` move the highlight, `Enter`
+    /// saves the highlighted file (`save_highlighted_file`), `Ctrl+O` opens
+    /// it if it is already saved (`open_highlighted_file`), `Esc` closes
+    /// the overlay. `Ctrl+C` still force-quits, since `Esc` no longer does
+    /// while it's open. Every other key is ignored -- like the switcher this
+    /// is a dedicated mode, so a stray keystroke can't leak into the input
+    /// box.
+    fn handle_files_key(&mut self, key: KeyEvent) -> Option<InputAction> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('c') if ctrl => self.should_quit = true,
+            KeyCode::Char('o') if ctrl => return self.open_highlighted_file(),
+            KeyCode::Esc => self.viewing_files = None,
+            KeyCode::Enter => return self.save_highlighted_file(),
+            KeyCode::Up => self.move_files_highlight(-1),
+            KeyCode::Down => self.move_files_highlight(1),
+            KeyCode::Backspace => self.edit_files_query(|query| {
+                query.pop();
+            }),
+            KeyCode::Char(c) if !ctrl => self.edit_files_query(|query| query.push(c)),
+            _ => {}
+        }
+        None
+    }
+
+    /// Applies `edit` to the open overlay's query and puts the highlight back
+    /// on the first match. The one place the query changes, so a typed
+    /// character, a `Backspace` and a paste can't disagree about where the
+    /// highlight lands. A no-op if the overlay isn't open.
+    fn edit_files_query(&mut self, edit: impl FnOnce(&mut String)) {
+        if let Some(overlay) = &mut self.viewing_files {
+            edit(&mut overlay.query);
+            overlay.selected = 0;
+        }
+    }
+
+    /// Every file shared in the overlay's channel, newest first, one per
+    /// share: what its loaded transcript carries -- history loaded at
+    /// startup, backfilled and live alike, the same window `/save` resolves
+    /// against (`known_attachments`). Empty while the overlay is closed.
+    pub fn channel_files(&self) -> Vec<SharedFile<'_>> {
+        let Some(overlay) = &self.viewing_files else {
+            return Vec::new();
+        };
+        let Some(channel) = self.channels.iter().find(|c| c.name == overlay.channel) else {
+            return Vec::new();
+        };
+        channel
+            .messages
+            .iter()
+            .rev()
+            .filter_map(|line| match line {
+                TranscriptLine::Chat(message) => {
+                    message.attachment.as_ref().map(|file| SharedFile {
+                        file,
+                        sender: message.sender,
+                        ts_unix_ms: message.ts_unix_ms,
+                    })
+                }
+                TranscriptLine::System(_) => None,
+            })
+            .collect()
+    }
+
+    /// The files the open overlay lists, newest first: those of its channel
+    /// whose name -- or whose sender as shown (`display_name`: what's on
+    /// screen, never the raw id) -- contains the typed text, ignoring case.
+    /// An empty query lists every file; nothing is listed while the overlay
+    /// is closed.
+    pub fn files_matches(&self) -> Vec<SharedFile<'_>> {
+        let Some(overlay) = &self.viewing_files else {
+            return Vec::new();
+        };
+        let query = overlay.query.to_lowercase();
+        self.channel_files()
+            .into_iter()
+            .filter(|shared| {
+                shared.file.filename.to_lowercase().contains(&query)
+                    || self
+                        .display_name(&shared.sender)
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .collect()
+    }
+
+    /// The position among `files_matches` that `Enter` would act on: the
+    /// highlighted match, or `None` while nothing matches or the overlay is
+    /// closed. The stored position is clamped here, and only here -- the
+    /// matches can change under an open overlay (a file arrives, a peer gets
+    /// renamed), and a position left over from before must never point past
+    /// the end.
+    pub fn files_highlight(&self) -> Option<usize> {
+        let overlay = self.viewing_files.as_ref()?;
+        let last = self.files_matches().len().checked_sub(1)?;
+        Some(overlay.selected.min(last))
+    }
+
+    /// Moves the highlight by `delta` among the current matches, clamping at
+    /// both ends rather than wrapping, like `move_switcher`. A no-op while
+    /// nothing matches.
+    fn move_files_highlight(&mut self, delta: isize) {
+        let Some(last) = self.files_matches().len().checked_sub(1) else {
+            return;
+        };
+        if let Some(overlay) = &mut self.viewing_files {
+            let current = overlay.selected.min(last) as isize;
+            overlay.selected = (current + delta).clamp(0, last as isize) as usize;
+        }
+    }
+
+    /// The highlighted match -- what `Enter` and `Ctrl+O` act on.
+    fn highlighted_file(&self) -> Option<SharedFile<'_>> {
+        let position = self.files_highlight()?;
+        self.files_matches().into_iter().nth(position)
+    }
+
+    /// Where the overlay's channel's saved copy of the file `hash` is, if it
+    /// has one that was on disk when last checked -- what the overlay marks
+    /// as saved, and what `Ctrl+O` opens.
+    pub fn saved_copy(&self, hash: Hash) -> Option<&Path> {
+        self.viewing_files
+            .as_ref()?
+            .saved
+            .get(&hash)
+            .map(PathBuf::as_path)
+    }
+
+    /// `Enter` in the files overlay: saves the highlighted file exactly as
+    /// `/save` would -- the same providers, folder and notices
+    /// (`save_request`) -- and closes the overlay, so those notices, and a
+    /// failure's, show in the transcript instead of behind the overlay. Does
+    /// nothing, leaving the overlay open, while nothing is highlighted -- and
+    /// when the file is already saved, which `Ctrl+O` opens instead: saving
+    /// it again would only leave a second copy (`name (1).ext`) beside the
+    /// first.
+    fn save_highlighted_file(&mut self) -> Option<InputAction> {
+        let shared = self.highlighted_file()?;
+        if self.saved_copy(shared.file.hash).is_some() {
+            return None;
+        }
+        let (hash, filename, sender) = (
+            shared.file.hash,
+            shared.file.filename.clone(),
+            shared.sender,
+        );
+        let channel = self.viewing_files.take()?.channel;
+        Some(self.save_request(channel, hash, filename, sender))
+    }
+
+    /// `Ctrl+O` in the files overlay: opens the highlighted file's saved copy
+    /// with the OS's default application, and closes the overlay. Does
+    /// nothing, leaving it open, while the file isn't saved -- there is
+    /// nothing to open, `Enter` saves it -- or nothing is highlighted.
+    fn open_highlighted_file(&mut self) -> Option<InputAction> {
+        let shared = self.highlighted_file()?;
+        let path = self.saved_copy(shared.file.hash)?.to_path_buf();
+        let filename = shared.file.filename.clone();
+        self.viewing_files = None;
+        self.push_system(format!("opening {filename}..."));
+        Some(InputAction::OpenFile(path))
+    }
+
+    /// Hands the files overlay what the disk says about `channel`'s saved
+    /// files (`saved_files::SavedFiles::present_in`) -- the answer to
+    /// `InputAction::CheckSavedFiles`. A no-op if the overlay has since
+    /// closed, or is open on another channel.
+    pub fn apply_saved_files(&mut self, channel: &str, saved: HashMap<Hash, PathBuf>) {
+        if let Some(overlay) = &mut self.viewing_files
+            && overlay.channel == channel
+        {
+            overlay.saved = saved;
+        }
+    }
+
     /// Applies a network event: updates presence, pushes a deduped incoming
     /// message, records a peer's broadcast nickname, or reports a channel
     /// join's outcome. Returns the channel name and message when `event`
@@ -1628,8 +1890,22 @@ impl AppState {
                 None
             }
             // A `/save`d file finished downloading -- see
-            // `net::Net::save_file`.
-            NetEvent::FileSaved { filename, path } => {
+            // `net::Net::save_file`. main.rs has already recorded where it
+            // went (`saved_files`); what is left is the notice, and, if the
+            // files overlay is open on the channel it was saved for, the
+            // check mark -- put there now rather than at the overlay's next
+            // opening.
+            NetEvent::FileSaved {
+                channel,
+                hash,
+                filename,
+                path,
+            } => {
+                if let Some(overlay) = &mut self.viewing_files
+                    && overlay.channel == channel
+                {
+                    overlay.saved.insert(hash, path.clone());
+                }
                 self.push_system(format!("saved {filename} to {}", path.display()));
                 None
             }
@@ -2011,6 +2287,7 @@ impl AppState {
             "send" => self.run_send(arg.trim()),
             "save" => self.run_save(arg.trim()),
             "folder" => self.run_folder(arg.trim()),
+            "files" => self.run_files(),
             "paste" => self.run_paste(),
             "search" | "s" => self.run_search(arg.trim()),
             "reply" => self.run_reply(arg.trim()),
@@ -2051,14 +2328,16 @@ impl AppState {
             "commands: /join <name|ticket>, /invite, /pair [ticket], /forget-device <hex-prefix>, \
              /msg <alias|hex-prefix> [text], /dm <alias|hex-prefix|endpoint-id> [text], \
              /leave [channel], /rename [name], /who, /send [path], \
-             /save [hash-prefix], /folder [path], /paste, /alias <hex-prefix> <name>, \
-             /nick <name>, /search <term> (or /s), /reply [text], \
+             /save [hash-prefix], /folder [path], /files, /paste, \
+             /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
              ticket for a new device to redeem, /pair <ticket> redeems one (after an \
              Enter/Esc confirmation -- this replaces this device's identity and data) -- \
              /dm connects directly to a peer's endpoint id with no ticket or gossip channel, \
              unlike /msg -- /save keeps each channel's files in a folder of its own, \
              /folder shows where and, with a path, moves them all -- \
+             /files lists the files shared in this channel (type to filter, \u{2191}/\u{2193} pick, \
+             Enter save, Ctrl+O open one already saved, Esc close) -- \
              keys: Tab/Shift+Tab switch channels, \
              Ctrl+P jump to a channel (type to filter, \u{2191}/\u{2193} pick, Enter confirm), \
              a bare /send opens a file picker (type to filter, \u{2191}/\u{2193} pick, Space mark, \
@@ -2715,20 +2994,39 @@ impl AppState {
         };
         match file {
             Ok((hash, filename, sender)) => {
-                let providers = self.providers_for(hash, sender);
-                let dir = channel_dir(&self.files_root, self.channel_of_file(hash));
-                self.push_system(format!("saving {filename}..."));
-                Some(InputAction::SaveFile {
-                    hash,
-                    filename,
-                    providers,
-                    dir,
-                })
+                let channel = self.channel_of_file(hash).to_string();
+                Some(self.save_request(channel, hash, filename, sender))
             }
             Err(err) => {
                 self.push_system(err);
                 None
             }
+        }
+    }
+
+    /// Builds the `InputAction::SaveFile` that fetches the file `hash` into
+    /// `channel`'s folder, and leaves the `saving ...` notice -- the one
+    /// place that is done, so `/save` and `Enter` in the files overlay can't
+    /// differ. `filename` and `sender` are as `resolve_attachment` gives
+    /// them. The file is asked of its sender first and then of every other
+    /// peer known where it was shared (`providers_for`), and goes into the
+    /// folder (`files::channel_dir`) of `channel`, a stored name.
+    fn save_request(
+        &mut self,
+        channel: String,
+        hash: Hash,
+        filename: String,
+        sender: [u8; 32],
+    ) -> InputAction {
+        let providers = self.providers_for(hash, sender);
+        let dir = channel_dir(&self.files_root, &channel);
+        self.push_system(format!("saving {filename}..."));
+        InputAction::SaveFile {
+            channel,
+            hash,
+            filename,
+            providers,
+            dir,
         }
     }
 
@@ -3125,18 +3423,19 @@ impl AppState {
 
     /// Whether keys -- and pastes -- currently go to the message box. False
     /// while a live pairing redeem is awaiting confirmation, a reply or
-    /// thread pick is in progress, or the `Ctrl+P` switcher or the file
-    /// picker is open: each takes over input ahead of normal typing (see
-    /// `handle_key`). main.rs only treats a pasted file path as a dropped
-    /// file while this is true, since staging files while the user is in
-    /// the middle of something else would put them somewhere they are not
-    /// looking.
+    /// thread pick is in progress, or the `Ctrl+P` switcher, the file picker
+    /// or the files overlay is open: each takes over input ahead of normal
+    /// typing (see `handle_key`). main.rs only treats a pasted file path as
+    /// a dropped file while this is true, since staging files while the user
+    /// is in the middle of something else would put them somewhere they are
+    /// not looking.
     pub fn is_composing(&self) -> bool {
         self.pending_redeem.is_none()
             && self.picking_reply.is_none()
             && self.picking_thread.is_none()
             && self.switching.is_none()
             && self.picking_file.is_none()
+            && self.viewing_files.is_none()
     }
 
     /// Inserts a terminal bracketed-paste's full text at the cursor as one
@@ -3162,6 +3461,13 @@ impl AppState {
         // So does an open file picker, whose filter is one line too.
         if let Some(picker) = &mut self.picking_file {
             picker.edit_query(|query| {
+                query.extend(text.chars().filter(|c| !c.is_control()));
+            });
+            return;
+        }
+        // And an open files overlay, with the same one-line filter.
+        if self.viewing_files.is_some() {
+            self.edit_files_query(|query| {
                 query.extend(text.chars().filter(|c| !c.is_control()));
             });
             return;
@@ -4433,6 +4739,15 @@ mod tests {
         assert!(action.is_none());
         let last = as_system(app.active().messages.back().unwrap());
         assert!(last.starts_with("commands:"), "got: {last}");
+    }
+
+    #[test]
+    fn help_lists_the_files_overlay_and_its_keys() {
+        let mut app = app();
+        submit(&mut app, "/help");
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("/files"), "got: {last}");
+        assert!(last.contains("Ctrl+O"), "got: {last}");
     }
 
     #[test]
@@ -6181,6 +6496,33 @@ mod tests {
     }
 
     #[test]
+    fn save_names_the_channel_it_saves_for_so_the_copy_can_be_recorded_for_it() {
+        let mut app = multi_channel_app(); // "random" is active
+        let elsewhere = file_message(1, PEER_ID, "elsewhere.pdf", b"elsewhere");
+        let prefix = elsewhere.attachment.as_ref().unwrap().hash.to_hex()[..8].to_string();
+        receive(&mut app, "general", elsewhere);
+        receive(
+            &mut app,
+            "random",
+            file_message(2, PEER_ID, "here.pdf", b"here"),
+        );
+
+        let bare = submit(&mut app, "/save");
+        let by_prefix = submit(&mut app, &format!("/save {prefix}"));
+
+        let channel_of = |action: Option<InputAction>| match action.expect("saves a file") {
+            InputAction::SaveFile { channel, .. } => channel,
+            _ => panic!("expected InputAction::SaveFile"),
+        };
+        assert_eq!(channel_of(bare), "random");
+        assert_eq!(
+            channel_of(by_prefix),
+            "general",
+            "the channel the file was shared in, as its folder is"
+        );
+    }
+
+    #[test]
     fn save_goes_into_the_folder_of_the_channel_the_file_was_shared_in() {
         let mut app = multi_channel_app(); // "random" is active
         app.load_files_root(PathBuf::from("/files"));
@@ -6443,6 +6785,8 @@ mod tests {
     fn file_saved_pushes_a_system_notice_with_the_final_path() {
         let mut app = app();
         app.handle_net_event(NetEvent::FileSaved {
+            channel: "general".to_string(),
+            hash: iroh_blobs::Hash::new(b"report"),
             filename: "report.pdf".to_string(),
             path: std::path::PathBuf::from("/home/alice/Downloads/leyline/report.pdf"),
         });
@@ -8204,6 +8548,865 @@ mod tests {
         app.pending_redeem = Some("ticket".to_string());
         ctrl_p(&mut app);
         assert!(app.switching.is_none());
+    }
+
+    // -- the files overlay ----------------------------------------------------
+    // These reuse the switcher fixture (`app_for_the_switcher`) where they
+    // need every kind of conversation: `general` (active), a `/msg` DM shown
+    // as `Alice`, `project-x`, and a `/dm` chat shown as `Bob`.
+
+    /// Opens the files overlay with `/files`, returning what that asked of
+    /// the caller.
+    fn open_files(app: &mut AppState) -> Option<InputAction> {
+        submit(app, "/files")
+    }
+
+    fn ctrl_o(app: &mut AppState) -> Option<InputAction> {
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+    }
+
+    fn files_query(app: &AppState) -> &str {
+        &app.viewing_files
+            .as_ref()
+            .expect("the files overlay is open")
+            .query
+    }
+
+    /// The names of the files the open overlay lists, top to bottom.
+    fn listed(app: &AppState) -> Vec<String> {
+        app.files_matches()
+            .iter()
+            .map(|shared| shared.file.filename.clone())
+            .collect()
+    }
+
+    /// The hash `file_message` gives an attachment with `content`.
+    fn hash_of(content: &[u8]) -> Hash {
+        Hash::new(content)
+    }
+
+    /// Every field of a `SaveFile` action -- channel, hash, filename,
+    /// providers, folder -- panicking on anything else, to compare what the
+    /// overlay asks for with what `/save` asks for.
+    fn save_fields(action: Option<InputAction>) -> (String, Hash, String, Vec<[u8; 32]>, PathBuf) {
+        match action.expect("a save returns an action") {
+            InputAction::SaveFile {
+                channel,
+                hash,
+                filename,
+                providers,
+                dir,
+            } => (channel, hash, filename, providers, dir),
+            _ => panic!("expected InputAction::SaveFile"),
+        }
+    }
+
+    /// Tells the open overlay that `channel`'s copy of `hash` is at `path`,
+    /// as the caller does when it answers `InputAction::CheckSavedFiles`.
+    fn mark_saved(app: &mut AppState, channel: &str, hash: Hash, path: &str) {
+        app.apply_saved_files(channel, HashMap::from([(hash, PathBuf::from(path))]));
+    }
+
+    /// `general` with four files -- two from Alice, one from Bob, one of our
+    /// own -- listed newest first as `mine.zip`, `notes.txt`, `holiday.png`,
+    /// `Quarterly-Report.PDF`.
+    fn app_with_a_few_files() -> AppState {
+        let mut app = app();
+        app.load_contacts(HashMap::from([
+            (PEER_ID, "Alice".to_string()),
+            (PEER_ID_2, "Bob".to_string()),
+        ]));
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "Quarterly-Report.PDF", b"q"),
+        );
+        receive(
+            &mut app,
+            "general",
+            file_message(2, PEER_ID_2, "holiday.png", b"h"),
+        );
+        receive(
+            &mut app,
+            "general",
+            file_message(3, PEER_ID, "notes.txt", b"n"),
+        );
+        app.record_sent_message("general", file_message(4, SELF_ID, "mine.zip", b"m"));
+        app
+    }
+
+    #[test]
+    fn slash_files_opens_the_overlay_on_the_active_channel_and_asks_what_is_saved() {
+        let mut app = multi_channel_app(); // "random" is active
+
+        let action = open_files(&mut app);
+
+        match action.expect("/files returns an action") {
+            InputAction::CheckSavedFiles(channel) => assert_eq!(channel, "random"),
+            _ => panic!("expected InputAction::CheckSavedFiles"),
+        }
+        let overlay = app.viewing_files.as_ref().expect("the overlay is open");
+        assert_eq!(overlay.channel, "random");
+        assert_eq!(overlay.query, "");
+    }
+
+    #[test]
+    fn the_overlay_lists_the_files_of_the_channel_newest_first_and_nothing_else() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "old.pdf", b"old"),
+        );
+        receive(
+            &mut app,
+            "general",
+            compose_message(PEER_ID, "chatter", None),
+        );
+        receive(
+            &mut app,
+            "general",
+            file_message(2, PEER_ID_2, "mid.pdf", b"mid"),
+        );
+        app.push_system("a notice");
+        receive(
+            &mut app,
+            "general",
+            file_message(3, PEER_ID, "new.pdf", b"new"),
+        );
+
+        open_files(&mut app);
+
+        assert_eq!(listed(&app), ["new.pdf", "mid.pdf", "old.pdf"]);
+    }
+
+    #[test]
+    fn a_row_carries_the_name_size_sender_and_date_of_its_share() {
+        let mut app = app();
+        let sent = ChatMessage {
+            ts_unix_ms: 1_760_000_000_000,
+            ..file_message(1, PEER_ID, "report.pdf", b"six by")
+        };
+        receive(&mut app, "general", sent);
+        open_files(&mut app);
+
+        let files = app.files_matches();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file.filename, "report.pdf");
+        assert_eq!(files[0].file.size, 6);
+        assert_eq!(files[0].file.hash, hash_of(b"six by"));
+        assert_eq!(files[0].sender, PEER_ID);
+        assert_eq!(files[0].ts_unix_ms, 1_760_000_000_000);
+    }
+
+    #[test]
+    fn loaded_backfilled_and_live_files_are_all_listed() {
+        let mut app = app();
+        app.load_history(
+            "general",
+            vec![file_message(10, PEER_ID, "loaded.pdf", b"loaded")],
+        );
+        app.merge_history(
+            "general",
+            vec![file_message(5, PEER_ID_2, "backfilled.pdf", b"backfilled")],
+        );
+        receive(
+            &mut app,
+            "general",
+            file_message(20, PEER_ID, "live.pdf", b"live"),
+        );
+
+        open_files(&mut app);
+
+        assert_eq!(listed(&app), ["live.pdf", "loaded.pdf", "backfilled.pdf"]);
+    }
+
+    #[test]
+    fn a_file_shared_twice_is_listed_once_per_share_with_its_own_sender() {
+        let mut app = app();
+        let content = b"same bytes";
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", content),
+        );
+        receive(
+            &mut app,
+            "general",
+            file_message(2, PEER_ID_2, "report-final.pdf", content),
+        );
+        open_files(&mut app);
+
+        let files = app.files_matches();
+
+        let rows: Vec<(&str, [u8; 32])> = files
+            .iter()
+            .map(|shared| (shared.file.filename.as_str(), shared.sender))
+            .collect();
+        assert_eq!(
+            rows,
+            [("report-final.pdf", PEER_ID_2), ("report.pdf", PEER_ID)]
+        );
+    }
+
+    #[test]
+    fn our_own_files_are_listed_too() {
+        let mut app = app();
+        app.record_sent_message("general", file_message(1, SELF_ID, "mine.pdf", b"mine"));
+
+        open_files(&mut app);
+
+        assert_eq!(listed(&app), ["mine.pdf"]);
+        assert_eq!(app.files_matches()[0].sender, SELF_ID);
+    }
+
+    #[test]
+    fn only_the_files_of_the_channel_it_was_opened_on_are_listed() {
+        let mut app = multi_channel_app(); // "random" is active
+        receive(
+            &mut app,
+            "random",
+            file_message(1, PEER_ID, "here.pdf", b"here"),
+        );
+        receive(
+            &mut app,
+            "general",
+            file_message(2, PEER_ID, "elsewhere.pdf", b"elsewhere"),
+        );
+
+        open_files(&mut app);
+
+        assert_eq!(listed(&app), ["here.pdf"]);
+    }
+
+    #[test]
+    fn the_overlay_works_in_group_channels_dms_and_dm_chats() {
+        let mut app = app_for_the_switcher();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "group.pdf", b"group"),
+        );
+        receive(
+            &mut app,
+            "dm-Alice",
+            file_message(2, PEER_ID, "dm.pdf", b"dm"),
+        );
+        receive(
+            &mut app,
+            "p2p-08080808",
+            file_message(3, PEER_ID_2, "chat.pdf", b"chat"),
+        );
+
+        for (index, name, expected) in [
+            (0, "general", "group.pdf"),
+            (1, "dm-Alice", "dm.pdf"),
+            (3, "p2p-08080808", "chat.pdf"),
+        ] {
+            app.active = index;
+            match open_files(&mut app).expect("/files returns an action") {
+                InputAction::CheckSavedFiles(channel) => assert_eq!(channel, name),
+                _ => panic!("expected InputAction::CheckSavedFiles"),
+            }
+            assert_eq!(listed(&app), [expected], "{name}");
+            app.handle_key(key(KeyCode::Esc));
+        }
+    }
+
+    #[test]
+    fn an_empty_channel_opens_an_overlay_with_nothing_in_it() {
+        let mut app = app();
+
+        open_files(&mut app);
+
+        assert!(app.viewing_files.is_some());
+        assert!(app.files_matches().is_empty());
+        assert_eq!(app.files_highlight(), None);
+        // Nothing to save or open, so those keys leave it as it is.
+        assert!(app.handle_key(key(KeyCode::Enter)).is_none());
+        assert!(ctrl_o(&mut app).is_none());
+        assert!(app.viewing_files.is_some());
+    }
+
+    #[test]
+    fn typing_narrows_the_list_to_names_containing_the_text_ignoring_case() {
+        let mut app = app_with_a_few_files();
+        open_files(&mut app);
+        assert_eq!(
+            listed(&app),
+            [
+                "mine.zip",
+                "notes.txt",
+                "holiday.png",
+                "Quarterly-Report.PDF"
+            ]
+        );
+
+        type_text(&mut app, "REPORT");
+        assert_eq!(listed(&app), ["Quarterly-Report.PDF"]);
+
+        type_text(&mut app, "x");
+        assert!(listed(&app).is_empty());
+    }
+
+    #[test]
+    fn typing_also_narrows_by_the_sender_as_shown() {
+        let mut app = app_with_a_few_files();
+        open_files(&mut app);
+
+        type_text(&mut app, "ALI");
+        assert_eq!(
+            listed(&app),
+            ["notes.txt", "Quarterly-Report.PDF"],
+            "Alice's files"
+        );
+
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        type_text(&mut app, "bob");
+        assert_eq!(listed(&app), ["holiday.png"]);
+
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        type_text(&mut app, "you");
+        assert_eq!(listed(&app), ["mine.zip"], "our own are from you");
+    }
+
+    #[test]
+    fn a_sender_is_matched_by_what_is_shown_not_by_the_raw_id() {
+        let mut app = app();
+        receive(&mut app, "general", file_message(1, PEER_ID, "a.pdf", b"a"));
+        open_files(&mut app);
+
+        // Unnamed, a peer is shown by the first bytes of its id.
+        type_text(&mut app, "0707");
+        assert_eq!(listed(&app), ["a.pdf"]);
+
+        // Named, it is shown by its name -- which the hex no longer matches.
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+        assert!(listed(&app).is_empty());
+    }
+
+    #[test]
+    fn up_and_down_move_the_highlight_and_clamp_at_both_ends() {
+        let mut app = app_with_a_few_files();
+        open_files(&mut app);
+        assert_eq!(app.files_highlight(), Some(0));
+
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Down));
+            seen.push(app.files_highlight());
+        }
+        assert_eq!(seen, [Some(1), Some(2), Some(3), Some(3), Some(3)]);
+
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Up));
+            seen.push(app.files_highlight());
+        }
+        assert_eq!(seen, [Some(2), Some(1), Some(0), Some(0), Some(0)]);
+    }
+
+    #[test]
+    fn editing_the_query_puts_the_highlight_back_on_the_first_match() {
+        let mut app = app_with_a_few_files();
+        open_files(&mut app);
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.files_highlight(), Some(2));
+
+        // From the name `holiday.png` and `Quarterly-Report.PDF`, and from
+        // the sender of `mine.zip`, `you`.
+        type_text(&mut app, "y");
+        assert_eq!(
+            listed(&app),
+            ["mine.zip", "holiday.png", "Quarterly-Report.PDF"]
+        );
+        assert_eq!(app.files_highlight(), Some(0));
+
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.files_highlight(), Some(2));
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.files_highlight(), Some(0));
+    }
+
+    #[test]
+    fn the_highlight_stays_in_range_when_the_matches_shrink_underneath() {
+        let mut app = app();
+        receive(&mut app, "general", file_message(1, PEER_ID, "a.pdf", b"a"));
+        receive(
+            &mut app,
+            "general",
+            file_message(2, PEER_ID_2, "b.pdf", b"b"),
+        );
+        receive(
+            &mut app,
+            "general",
+            file_message(3, PEER_ID_2, "c.pdf", b"c"),
+        );
+        open_files(&mut app);
+        type_text(&mut app, "0"); // in the hex of both unnamed peers
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(listed(&app), ["c.pdf", "b.pdf", "a.pdf"]);
+        assert_eq!(app.files_highlight(), Some(2));
+
+        // Alice is no longer shown as hex, so `a.pdf` stops matching.
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+
+        assert_eq!(listed(&app), ["c.pdf", "b.pdf"]);
+        assert_eq!(
+            app.files_highlight(),
+            Some(1),
+            "clamped to the new last match"
+        );
+    }
+
+    #[test]
+    fn esc_closes_the_overlay_without_quitting_or_acting() {
+        let mut app = app_with_a_few_files();
+        open_files(&mut app);
+        let before = app.active().messages.len();
+
+        let action = app.handle_key(key(KeyCode::Esc));
+
+        assert!(action.is_none());
+        assert!(app.viewing_files.is_none());
+        assert!(!app.should_quit);
+        assert_eq!(app.active().messages.len(), before);
+    }
+
+    #[test]
+    fn ctrl_c_in_the_overlay_still_quits() {
+        let mut app = app_with_a_few_files();
+        open_files(&mut app);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn keys_typed_into_the_overlay_never_reach_the_input_draft() {
+        let mut app = multi_channel_app();
+        open_files(&mut app);
+
+        type_text(&mut app, "report");
+        app.handle_key(key(KeyCode::Backspace));
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Tab));
+
+        assert_eq!(app.active().input, "");
+        assert_eq!(app.active().cursor, 0);
+        assert_eq!(app.active, 1, "Tab did not switch channels either");
+        assert_eq!(files_query(&app), "repor");
+    }
+
+    #[test]
+    fn control_chords_do_not_type_into_the_query_or_open_other_overlays() {
+        let mut app = app_with_a_few_files();
+        open_files(&mut app);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        ctrl_p(&mut app);
+
+        assert_eq!(files_query(&app), "");
+        assert!(app.viewing_files.is_some());
+        assert!(app.switching.is_none());
+    }
+
+    #[test]
+    fn a_paste_filters_the_overlay_instead_of_the_draft() {
+        let mut app = app_with_a_few_files();
+        open_files(&mut app);
+
+        app.paste_text("rep\nort\r\n");
+
+        assert_eq!(files_query(&app), "report");
+        assert_eq!(app.active().input, "");
+        assert_eq!(listed(&app), ["Quarterly-Report.PDF"]);
+    }
+
+    #[test]
+    fn nothing_is_composing_while_the_overlay_is_open() {
+        let mut app = app();
+        assert!(app.is_composing());
+
+        open_files(&mut app);
+        assert!(!app.is_composing());
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.is_composing());
+    }
+
+    #[test]
+    fn enter_saves_the_highlighted_file_exactly_as_slash_save_would() {
+        let mut app = app();
+        app.load_files_root(PathBuf::from("/files"));
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "old.pdf", b"old"),
+        );
+        receive(
+            &mut app,
+            "general",
+            file_message(2, PEER_ID_2, "new.pdf", b"new"),
+        );
+        peers_join(&mut app, "general", &[PEER_ID_3]);
+        // A bare `/save` asks for the newest file, which is the one the
+        // overlay starts on.
+        let by_command = save_fields(submit(&mut app, "/save"));
+        open_files(&mut app);
+
+        let by_overlay = save_fields(app.handle_key(key(KeyCode::Enter)));
+
+        assert_eq!(by_overlay, by_command);
+        assert_eq!(by_overlay.0, "general");
+        assert_eq!(by_overlay.2, "new.pdf");
+        assert_eq!(by_overlay.3, vec![PEER_ID_2, PEER_ID_3, PEER_ID]);
+        assert_eq!(by_overlay.4, PathBuf::from("/files/general"));
+    }
+
+    #[test]
+    fn enter_closes_the_overlay_and_leaves_the_saving_notice_in_the_transcript() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        open_files(&mut app);
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.viewing_files.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "saving report.pdf...");
+    }
+
+    #[test]
+    fn enter_saves_the_file_that_is_highlighted_not_just_the_newest() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "old.pdf", b"old"),
+        );
+        receive(
+            &mut app,
+            "general",
+            file_message(2, PEER_ID, "new.pdf", b"new"),
+        );
+        open_files(&mut app);
+        app.handle_key(key(KeyCode::Down));
+
+        let (_, hash, filename, ..) = save_fields(app.handle_key(key(KeyCode::Enter)));
+
+        assert_eq!((hash, filename.as_str()), (hash_of(b"old"), "old.pdf"));
+    }
+
+    #[test]
+    fn enter_saves_one_of_our_own_files_from_our_own_store() {
+        let mut app = app();
+        app.record_sent_message("general", file_message(1, SELF_ID, "mine.pdf", b"mine"));
+        peers_join(&mut app, "general", &[PEER_ID]);
+        open_files(&mut app);
+
+        let (_, _, filename, providers, _) = save_fields(app.handle_key(key(KeyCode::Enter)));
+
+        assert_eq!(filename, "mine.pdf");
+        assert_eq!(
+            providers,
+            vec![SELF_ID, PEER_ID],
+            "this device is the sender, and holds the file"
+        );
+    }
+
+    #[test]
+    fn enter_saves_into_the_folder_of_each_kind_of_conversation() {
+        let mut app = app_for_the_switcher();
+        app.load_files_root(PathBuf::from("/files"));
+        receive(
+            &mut app,
+            "dm-Alice",
+            file_message(1, PEER_ID, "dm.pdf", b"dm"),
+        );
+        receive(
+            &mut app,
+            "p2p-08080808",
+            file_message(2, PEER_ID_2, "chat.pdf", b"chat"),
+        );
+
+        let mut dirs = Vec::new();
+        for index in [1, 3] {
+            app.active = index;
+            open_files(&mut app);
+            dirs.push(save_fields(app.handle_key(key(KeyCode::Enter))).4);
+        }
+
+        assert_eq!(
+            dirs,
+            [
+                channel_dir(Path::new("/files"), "dm-Alice"),
+                PathBuf::from("/files/p2p-08080808")
+            ]
+        );
+    }
+
+    #[test]
+    fn the_overlay_stays_on_the_channel_it_was_opened_on_when_focus_moves() {
+        let mut app = multi_channel_app(); // "random" is active
+        app.load_files_root(PathBuf::from("/files"));
+        receive(
+            &mut app,
+            "random",
+            file_message(1, PEER_ID, "here.pdf", b"here"),
+        );
+        receive(
+            &mut app,
+            "general",
+            file_message(2, PEER_ID, "there.pdf", b"there"),
+        );
+        open_files(&mut app);
+
+        // A join finishing elsewhere takes focus.
+        app.handle_net_event(NetEvent::Joined("general".to_string()));
+        assert_eq!(app.active().name, "general");
+
+        assert_eq!(listed(&app), ["here.pdf"], "still #random's list");
+        let (channel, _, filename, _, dir) = save_fields(app.handle_key(key(KeyCode::Enter)));
+        assert_eq!(
+            (channel.as_str(), filename.as_str()),
+            ("random", "here.pdf")
+        );
+        assert_eq!(dir, PathBuf::from("/files/random"));
+    }
+
+    #[test]
+    fn enter_on_a_file_already_saved_does_nothing_so_it_is_never_saved_twice() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        open_files(&mut app);
+        mark_saved(
+            &mut app,
+            "general",
+            hash_of(b"report"),
+            "/files/general/report.pdf",
+        );
+        let before = app.active().messages.len();
+
+        let action = app.handle_key(key(KeyCode::Enter));
+
+        assert!(action.is_none());
+        assert!(app.viewing_files.is_some(), "still open");
+        assert_eq!(
+            app.active().messages.len(),
+            before,
+            "no `saving` notice either"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_opens_the_saved_copy_of_the_highlighted_file_and_closes_the_overlay() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        open_files(&mut app);
+        mark_saved(
+            &mut app,
+            "general",
+            hash_of(b"report"),
+            "/files/general/report (1).pdf",
+        );
+
+        let action = ctrl_o(&mut app);
+
+        match action.expect("Ctrl+O on a saved file returns an action") {
+            InputAction::OpenFile(path) => {
+                assert_eq!(path, PathBuf::from("/files/general/report (1).pdf"));
+            }
+            _ => panic!("expected InputAction::OpenFile"),
+        }
+        assert!(app.viewing_files.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "opening report.pdf...");
+    }
+
+    #[test]
+    fn ctrl_o_on_a_file_that_is_not_saved_does_nothing() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        open_files(&mut app);
+        let before = app.active().messages.len();
+
+        let action = ctrl_o(&mut app);
+
+        assert!(action.is_none());
+        assert!(app.viewing_files.is_some(), "still open");
+        assert_eq!(app.active().messages.len(), before);
+    }
+
+    #[test]
+    fn ctrl_o_opens_whichever_file_is_highlighted() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "old.pdf", b"old"),
+        );
+        receive(
+            &mut app,
+            "general",
+            file_message(2, PEER_ID, "new.pdf", b"new"),
+        );
+        open_files(&mut app);
+        // Only the older one is saved.
+        mark_saved(
+            &mut app,
+            "general",
+            hash_of(b"old"),
+            "/files/general/old.pdf",
+        );
+
+        assert!(
+            ctrl_o(&mut app).is_none(),
+            "new.pdf is highlighted, unsaved"
+        );
+        app.handle_key(key(KeyCode::Down));
+
+        match ctrl_o(&mut app).expect("old.pdf is saved") {
+            InputAction::OpenFile(path) => {
+                assert_eq!(path, PathBuf::from("/files/general/old.pdf"));
+            }
+            _ => panic!("expected InputAction::OpenFile"),
+        }
+    }
+
+    #[test]
+    fn what_the_disk_says_only_reaches_the_overlay_it_is_about() {
+        let mut app = multi_channel_app(); // "random" is active
+        receive(
+            &mut app,
+            "random",
+            file_message(1, PEER_ID, "here.pdf", b"here"),
+        );
+        open_files(&mut app);
+
+        // An answer about #general, which the overlay isn't on.
+        mark_saved(
+            &mut app,
+            "general",
+            hash_of(b"here"),
+            "/files/general/here.pdf",
+        );
+        assert_eq!(app.saved_copy(hash_of(b"here")), None);
+
+        mark_saved(
+            &mut app,
+            "random",
+            hash_of(b"here"),
+            "/files/random/here.pdf",
+        );
+        assert_eq!(
+            app.saved_copy(hash_of(b"here")),
+            Some(Path::new("/files/random/here.pdf"))
+        );
+    }
+
+    #[test]
+    fn an_answer_after_the_overlay_closed_is_ignored_and_each_opening_starts_afresh() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        open_files(&mut app);
+        mark_saved(
+            &mut app,
+            "general",
+            hash_of(b"report"),
+            "/files/general/report.pdf",
+        );
+        app.handle_key(key(KeyCode::Esc));
+
+        // A late answer, with no overlay to give it to.
+        mark_saved(
+            &mut app,
+            "general",
+            hash_of(b"report"),
+            "/files/general/report.pdf",
+        );
+        assert!(app.viewing_files.is_none());
+
+        // Nothing is known about the disk until the caller has looked again.
+        open_files(&mut app);
+        assert_eq!(app.saved_copy(hash_of(b"report")), None);
+    }
+
+    #[test]
+    fn a_save_that_finishes_while_the_overlay_is_open_marks_the_file_saved_at_once() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        open_files(&mut app);
+        assert_eq!(app.saved_copy(hash_of(b"report")), None);
+
+        app.handle_net_event(NetEvent::FileSaved {
+            channel: "general".to_string(),
+            hash: hash_of(b"report"),
+            filename: "report.pdf".to_string(),
+            path: PathBuf::from("/files/general/report.pdf"),
+        });
+
+        assert_eq!(
+            app.saved_copy(hash_of(b"report")),
+            Some(Path::new("/files/general/report.pdf"))
+        );
+    }
+
+    #[test]
+    fn a_save_for_another_channel_does_not_mark_this_overlays_files() {
+        let mut app = multi_channel_app(); // "random" is active
+        receive(
+            &mut app,
+            "random",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        open_files(&mut app);
+
+        app.handle_net_event(NetEvent::FileSaved {
+            channel: "general".to_string(),
+            hash: hash_of(b"report"),
+            filename: "report.pdf".to_string(),
+            path: PathBuf::from("/files/general/report.pdf"),
+        });
+
+        assert_eq!(
+            app.saved_copy(hash_of(b"report")),
+            None,
+            "a copy in #general's folder is not one in #random's"
+        );
     }
 
     // The `/rename` tests below reuse the switcher fixture

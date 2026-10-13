@@ -159,8 +159,16 @@ pub enum NetEvent {
     /// A `/send`ed file failed to import -- see `Net::send_file`.
     FileSendFailed { path: String, error: String },
     /// A `/save`d file finished downloading and was written to disk --
-    /// see `Net::save_file`.
-    FileSaved { filename: String, path: PathBuf },
+    /// see `Net::save_file`. Says which channel's copy it is and which file
+    /// (`hash`, as in `message::FileAttachment`), so the caller can record
+    /// where it went (`saved_files::SavedFiles`) without having to remember
+    /// what each in-flight save was for.
+    FileSaved {
+        channel: String,
+        hash: Hash,
+        filename: String,
+        path: PathBuf,
+    },
     /// A `/save`d file failed to download or write to disk -- see
     /// `Net::save_file`.
     FileSaveFailed { filename: String, error: String },
@@ -1295,15 +1303,17 @@ impl Net {
     /// it to `destination` -- the `/save` counterpart to `send_file`.
     /// `destination` is already fully resolved by the caller (see
     /// `files::resolve_destination`), so this is purely a network/blob-store
-    /// concern. `providers` are who to ask for it, in order -- the file's
-    /// sender, then the other peers known in its channel (see
-    /// `app::AppState::providers_for`), so it can still be had while its
-    /// sender is offline. Spawned like `send_file`, reporting the outcome
-    /// back as `NetEvent::FileSaved`/`FileSaveFailed` since the download can
-    /// take a while and must not block the caller's event loop.
-    /// Fire-and-forget, like `send` and `announce`.
+    /// concern. `channel` is whose folder `destination` is in: it only rides
+    /// along, to come back on `NetEvent::FileSaved`. `providers` are who to
+    /// ask for it, in order -- the file's sender, then the other peers known
+    /// in its channel (see `app::AppState::providers_for`), so it can still
+    /// be had while its sender is offline. Spawned like `send_file`,
+    /// reporting the outcome back as `NetEvent::FileSaved`/`FileSaveFailed`
+    /// since the download can take a while and must not block the caller's
+    /// event loop. Fire-and-forget, like `send` and `announce`.
     pub fn save_file(
         &self,
+        channel: String,
         hash: Hash,
         filename: String,
         providers: Vec<[u8; 32]>,
@@ -1320,6 +1330,8 @@ impl Net {
                 Ok(()) => {
                     let _ = events_tx
                         .send(NetEvent::FileSaved {
+                            channel,
+                            hash,
                             filename,
                             path: destination,
                         })

@@ -275,6 +275,52 @@ mechanisms, not one, since they trade off differently:
   groundwork for the `/files` overlay, auto-save, the outbox and synced
   folders (LEY-25.7, LEY-26), which each need one stable place per
   channel.
+- [x] **Files overlay** -- `/files` opens a keyboard-first browser over the
+  active channel's shared files, so a file that has scrolled out of view is
+  found again without scrolling the transcript or remembering its hash. It
+  is `Ctrl+P`'s overlay once more (`AppState::viewing_files`: modal, it owns
+  every key and a paste, and `is_composing` is false while it is open) and,
+  like it, stores no list: `files_matches` re-derives the rows from the
+  channel's loaded transcript on every read -- the very window `/save`
+  resolves against (`known_attachments`), so it lists exactly what `/save`
+  can fetch, history loaded at startup, backfilled and live alike, and
+  shares its `MAX_SCROLLBACK` limit -- newest first, one row per share (a
+  file sent twice is two rows), narrowed by a case-insensitive contains on
+  the file name or on the sender as shown (`display_name`: a pet name
+  matches, the raw id of a named peer doesn't). Besides the query and the
+  highlight it keeps the channel it was opened on -- a join finishing
+  elsewhere can move focus under it, and `Enter` must save into the folder
+  of the list the user was looking at -- and `saved`, what the disk said
+  when it opened. `Enter` saves the highlighted file through the same
+  `save_request` as `/save`, so providers, folder, notices and failures are
+  `/save`'s, and closes the overlay, which would otherwise hide that
+  feedback behind it. `Ctrl+O` opens an already saved file with the OS's
+  default application. `Enter` on a saved file does nothing, so a file is
+  never saved twice by accident, and the bottom border offers whichever of
+  the two the highlighted row can do.
+  "Saved" is a fact about the disk, which app.rs never touches, and nothing
+  recorded it. `NetEvent::FileSaved` now carries the channel and the content
+  hash, and main.rs writes each finished save into `saved_files.rs` -- a
+  postcard file in the data directory, like the DM registry, with one
+  record per (channel, hash) -> absolute path. It is keyed by channel
+  because every channel has a folder of its own: a file saved from
+  `#general` is not saved in `#random`. When the overlay opens, `/files`
+  asks (`InputAction::CheckSavedFiles`) and main.rs answers before the next
+  frame from what is still on disk (`SavedFiles::present_in`, a stat per
+  file saved for that one channel), so a deleted copy shows as unsaved
+  again -- and as saved again if it comes back: nothing is forgotten for
+  being absent, since a drive that is unmounted right now must not erase
+  what is known about what it holds. A save that finishes while the overlay
+  is open marks its row at once. Pairing leaves the record alone, like the
+  files root. `files::open_in_default_app` runs `open` (macOS), `explorer`
+  (Windows) or `xdg-open` with the path as its one argument -- never through
+  a shell, since a file's name is a peer's to choose -- with the standard
+  streams closed so it can't draw over the TUI, and reaps the launcher on a
+  thread; main.rs checks the file is still there first.
+  Not covered: files shared further back than the channel's loaded history,
+  files saved before this existed (they show as unsaved until saved again),
+  and any check of what kind of file is being opened -- see LEY-25.7's
+  notes.
 
 ## Networking & sharing
 

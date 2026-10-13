@@ -15,7 +15,7 @@ use ratatui::widgets::{
 };
 use textwrap::wrap;
 
-use crate::app::{AppState, Channel, TranscriptLine, hex_id};
+use crate::app::{AppState, Channel, SharedFile, TranscriptLine, hex_id};
 use crate::files::{StagedAttachment, human_size};
 use crate::hyperlink;
 use crate::markdown;
@@ -74,6 +74,13 @@ const PICKER_SIZE_WIDTH: usize = 9;
 /// Width of a picker row's modified column: `12 Oct 14:03`, `03 Mar  2025`.
 const PICKER_TIME_WIDTH: usize = 12;
 
+/// Width of the files overlay (`render_files`), borders included -- wider
+/// than the picker's, since its rows carry a sender as well. Its rows are
+/// the picker's besides: the same gutter, size and date columns.
+const FILES_WIDTH: u16 = 92;
+/// Rows of files the overlay lists at once before it scrolls.
+const FILES_ROWS: usize = 14;
+
 /// Short usage reminders for every slash command, shown in the sidebar's
 /// commands panel (`render_hints`) when `AppState::show_hints` is on.
 /// Kept in sync with the Commands table in README.md and `run_help`'s
@@ -88,6 +95,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/send [path]",
     "/save [hash]",
     "/folder [path]",
+    "/files",
     "/paste (or Ctrl+V)",
     "/alias <hex> <name>",
     "/nick <name>",
@@ -131,6 +139,7 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     // key while it is.
     render_switcher(frame, app);
     render_picker(frame, app);
+    render_files(frame, app);
 }
 
 /// Height (in terminal rows, including the 2 border rows) the input box
@@ -612,16 +621,216 @@ fn picker_row(
     item
 }
 
-/// When a file was last modified, in `PICKER_TIME_WIDTH` cells: the day and
+/// When a file was last modified, in `PICKER_TIME_WIDTH` cells -- see
+/// `day_label`.
+fn modified_label(modified: SystemTime, now: DateTime<Local>) -> String {
+    day_label(DateTime::<Local>::from(modified), now)
+}
+
+/// A moment as `PICKER_TIME_WIDTH` cells say it, against `now`: the day and
 /// time for the last half year (`12 Oct 14:03`), the day and year before
 /// that (`03 Mar  2025`) -- as `ls -l` does, since a time says little about
-/// a file from long ago.
-fn modified_label(modified: SystemTime, now: DateTime<Local>) -> String {
-    let modified = DateTime::<Local>::from(modified);
-    let recent = now.signed_duration_since(modified) < chrono::Duration::days(180);
-    modified
-        .format(if recent { "%d %b %H:%M" } else { "%d %b  %Y" })
+/// something long ago. What the picker shows for a file's modification and
+/// the files overlay for its share (`sent_label`).
+fn day_label(when: DateTime<Local>, now: DateTime<Local>) -> String {
+    let recent = now.signed_duration_since(when) < chrono::Duration::days(180);
+    when.format(if recent { "%d %b %H:%M" } else { "%d %b  %Y" })
         .to_string()
+}
+
+/// The files overlay opened by `/files` (`AppState::viewing_files`), drawn
+/// over everything else like the picker: a cleared, bordered box titled with
+/// the channel whose files it lists, holding the typed filter and, under it,
+/// every file that matches (`AppState::files_matches`) -- newest first, a
+/// row per share (`files_row`) -- with the highlighted row in the switcher's
+/// style. Its size is fixed, so the box doesn't jump around as typing
+/// narrows the list; it scrolls to keep the highlight in view
+/// (`nav_scroll_offset`).
+fn render_files(frame: &mut Frame, app: &AppState) {
+    let Some(overlay) = &app.viewing_files else {
+        return;
+    };
+    let files = app.files_matches();
+    let highlighted = app.files_highlight();
+
+    let area = files_area(frame.area());
+    let block = Block::bordered()
+        .title(files_title(
+            &app.channel_heading(&overlay.channel),
+            files.len(),
+            app.channel_files().len(),
+            area.width as usize,
+        ))
+        .title_bottom(files_footer(
+            app,
+            highlighted.map(|position| &files[position]),
+        ))
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+    // Cleared first, so nothing from the panes underneath shows through
+    // the blank cells of the box.
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let [query_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    render_filter_row(frame, query_area, &overlay.query);
+
+    if files.is_empty() {
+        // With nothing typed, nothing matching means nothing shared.
+        let text = if overlay.query.is_empty() {
+            " no files have been shared in this channel yet"
+        } else {
+            " no matches"
+        };
+        let placeholder = Span::styled(
+            text,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        );
+        frame.render_widget(Paragraph::new(Line::from(placeholder)), list_area);
+        return;
+    }
+    let visible_rows = (list_area.height as usize).max(1);
+    let start = nav_scroll_offset(files.len(), visible_rows, highlighted.unwrap_or(0));
+    let now = Local::now();
+    let items: Vec<ListItem> = files
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible_rows)
+        .map(|(row, shared)| {
+            files_row(
+                app,
+                shared,
+                app.saved_copy(shared.file.hash).is_some(),
+                Some(row) == highlighted,
+                list_area.width as usize,
+                now,
+            )
+        })
+        .collect();
+    frame.render_widget(List::new(items), list_area);
+    // As for the switcher, a track a row taller than the list at each end.
+    let track = Rect::new(
+        area.x,
+        list_area.y.saturating_sub(1),
+        area.width,
+        list_area.height + 2,
+    );
+    render_scroll_indicator(frame, track, start, files.len(), visible_rows);
+}
+
+/// Where the files overlay box goes on a `screen`-sized frame: `FILES_WIDTH`
+/// wide, with room for `FILES_ROWS` files whatever the channel holds -- see
+/// `overlay_area`.
+fn files_area(screen: Rect) -> Rect {
+    overlay_area(screen, FILES_WIDTH, FILES_ROWS)
+}
+
+/// The files overlay's title: the channel whose files it lists, by its
+/// heading (`#general`, `@Alice`) -- cut short if it won't all fit -- and how
+/// many files there are, `3 of 12` once the filter has narrowed them.
+/// `width` is the box's, borders included.
+fn files_title(heading: &str, shown: usize, total: usize, width: usize) -> String {
+    let lead = " files in ";
+    let counts = if shown == total {
+        format!(" · {total}")
+    } else {
+        format!(" · {shown} of {total}")
+    };
+    // Two cells of border, and a blank at the end (the lead has its own).
+    let room = width.saturating_sub(2 + lead.chars().count() + counts.chars().count() + 1);
+    format!("{lead}{}{counts} ", truncate_chars(heading, room))
+}
+
+/// What the files overlay's bottom border says: the keys that do something
+/// for the highlighted file -- `Enter` saves one that isn't saved, `Ctrl+O`
+/// opens one that is -- and nothing for the other, so no key on offer is a
+/// dead one.
+fn files_footer(app: &AppState, highlighted: Option<&SharedFile<'_>>) -> Line<'static> {
+    Line::from(match highlighted {
+        None => " Esc close ",
+        Some(shared) if app.saved_copy(shared.file.hash).is_some() => {
+            " ↑/↓ move · Ctrl+O open · Esc close "
+        }
+        Some(_) => " ↑/↓ move · Enter save · Esc close ",
+    })
+}
+
+/// One row of the files overlay, `width` cells wide: a gutter holding a check
+/// mark if the file is `saved`, the name -- cut short with an ellipsis where
+/// it would run into the columns on the right -- its size, who shared it
+/// (`fit_name`, in their color) and when (`sent_label`, against `now`). A
+/// `highlighted` row is shown black on cyan across its whole width, like the
+/// picker's, so it carries no colors of its own.
+fn files_row(
+    app: &AppState,
+    shared: &SharedFile<'_>,
+    saved: bool,
+    highlighted: bool,
+    width: usize,
+    now: DateTime<Local>,
+) -> ListItem<'static> {
+    // The size, sender and date columns, two blanks between each, and a
+    // blank at the right edge.
+    let columns_width = PICKER_SIZE_WIDTH + 2 + NAME_WIDTH + 2 + PICKER_TIME_WIDTH + 1;
+    let name_width = width.saturating_sub(PICKER_GUTTER + columns_width).max(1);
+    let styled = |text: String, style: Style| {
+        if highlighted {
+            Span::raw(text)
+        } else {
+            Span::styled(text, style)
+        }
+    };
+    let muted = Style::default().fg(Color::DarkGray);
+
+    let gutter = if saved { " ✓ " } else { "   " };
+    let spans = vec![
+        styled(
+            gutter.to_string(),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        styled(
+            format!(
+                "{:<name_width$}",
+                truncate_chars(&shared.file.filename, name_width)
+            ),
+            Style::default(),
+        ),
+        styled(
+            format!("{:>PICKER_SIZE_WIDTH$}  ", human_size(shared.file.size)),
+            muted,
+        ),
+        styled(
+            fit_name(&app.display_name(&shared.sender), NAME_WIDTH),
+            Style::default().fg(user_color(&shared.sender)),
+        ),
+        styled(format!("  {}", sent_label(shared.ts_unix_ms, now)), muted),
+    ];
+    let item = ListItem::new(Line::from(spans));
+    if highlighted {
+        return item.style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    item
+}
+
+/// When a file was shared, in `PICKER_TIME_WIDTH` cells: `day_label` of its
+/// message's timestamp, which (message.rs) is Unix milliseconds in UTC. A
+/// timestamp chrono can't represent -- practically unreachable -- shows as
+/// dashes rather than panicking, as `format_time` does.
+fn sent_label(ts_unix_ms: u64, now: DateTime<Local>) -> String {
+    match DateTime::from_timestamp_millis(ts_unix_ms as i64) {
+        Some(sent) => day_label(sent.with_timezone(&Local), now),
+        None => format!("{:<PICKER_TIME_WIDTH$}", "--"),
+    }
 }
 
 /// Splits the RHS column into the peers list and, when `show_hints` is
@@ -3158,6 +3367,470 @@ mod tests {
         assert_eq!(truncate_start("/short", 10), "/short");
         assert_eq!(truncate_start("/Users/jurgen/Downloads", 10), "…Downloads");
         assert_eq!(truncate_start("/anything", 0), "");
+    }
+
+    // -- the files overlay ----------------------------------------------------
+
+    /// A shared file's chat message: `file_message` with an id of its own (a
+    /// channel dedupes by id) and a timestamp.
+    fn shared_file(
+        id: u64,
+        ts_unix_ms: u64,
+        sender: [u8; 32],
+        name: &str,
+        size: u64,
+    ) -> ChatMessage {
+        ChatMessage {
+            id,
+            ts_unix_ms,
+            ..file_message(sender, name, size)
+        }
+    }
+
+    /// Opens the files overlay on `app`'s active channel with `/files`.
+    fn open_files(app: &mut AppState) {
+        type_text(app, "/files");
+        press(app, KeyCode::Enter);
+    }
+
+    /// The files overlay's box on a 110x24 screen, one string per row,
+    /// borders included.
+    fn files_box(app: &AppState) -> Vec<String> {
+        let screen = Rect::new(0, 0, 110, 24);
+        box_rows(&render_to_buffer(app, 110, 24), files_area(screen))
+    }
+
+    /// The row of `rows` with `needle` in it -- panicking, with them all, if
+    /// there is none.
+    fn row_with<'a>(rows: &'a [String], needle: &str) -> &'a String {
+        rows.iter()
+            .find(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no row has {needle:?}:\n{}", rows.join("\n")))
+    }
+
+    /// `general` with three files, the newest -- `notes.txt` -- from
+    /// ourselves, then `map.png` from Bob and, oldest, `report.pdf` from
+    /// Alice. The peer behind the DM and the `/dm` chat is Alice.
+    fn app_with_shared_files() -> AppState {
+        let mut app = app_with_every_kind();
+        app.load_contacts(HashMap::from([
+            ([7; 32], "Alice".to_string()),
+            ([8; 32], "Bob".to_string()),
+        ]));
+        let now = crate::message::now_unix_ms();
+        app.load_history(
+            "general",
+            vec![
+                shared_file(1, now - 3_000, [7; 32], "report.pdf", 2_150_000),
+                shared_file(2, now - 2_000, [8; 32], "map.png", 480),
+                shared_file(3, now - 1_000, [9; 32], "notes.txt", 12),
+            ],
+        );
+        app
+    }
+
+    /// Tells the open overlay that the file named `name` is saved.
+    fn mark_saved(app: &mut AppState, name: &str) {
+        app.apply_saved_files(
+            "general",
+            HashMap::from([(
+                iroh_blobs::Hash::new(name.as_bytes()),
+                PathBuf::from(format!("/files/general/{name}")),
+            )]),
+        );
+    }
+
+    #[test]
+    fn the_files_overlay_is_not_drawn_until_it_is_opened() {
+        let mut app = app_with_shared_files();
+        let closed = render_to_rows(&app);
+        assert!(!closed.iter().any(|row| row.contains("files in")));
+
+        open_files(&mut app);
+
+        let open = render_to_rows(&app);
+        assert!(
+            open.iter().any(|row| row.contains("files in #general")),
+            "{open:#?}"
+        );
+    }
+
+    #[test]
+    fn each_file_is_a_row_with_its_name_size_sender_and_date_newest_first() {
+        let mut app = app_with_shared_files();
+        open_files(&mut app);
+        let when = |name: &str| {
+            let shared = app.files_matches();
+            let shared = shared.iter().find(|s| s.file.filename == name).unwrap();
+            sent_label(shared.ts_unix_ms, Local::now())
+        };
+
+        let rows = files_box(&app);
+
+        let report = row_with(&rows, "report.pdf");
+        for part in ["2.1 MB", "Alice", &when("report.pdf")] {
+            assert!(report.contains(part), "{part:?} missing from: {report}");
+        }
+        let map = row_with(&rows, "map.png");
+        for part in ["480 B", "Bob", &when("map.png")] {
+            assert!(map.contains(part), "{part:?} missing from: {map}");
+        }
+        let notes = row_with(&rows, "notes.txt");
+        for part in ["12 B", "you", &when("notes.txt")] {
+            assert!(notes.contains(part), "{part:?} missing from: {notes}");
+        }
+        let position = |needle: &str| rows.iter().position(|row| row.contains(needle)).unwrap();
+        assert!(
+            position("notes.txt") < position("map.png")
+                && position("map.png") < position("report.pdf"),
+            "newest first:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_columns_line_up_from_row_to_row() {
+        let mut app = app_with_shared_files();
+        open_files(&mut app);
+
+        let rows = files_box(&app);
+
+        // The sender column starts where the size column ends, however long
+        // the name before it is.
+        let column = |name: &str, sender: &str| {
+            let row = row_with(&rows, name);
+            let at = row.find(sender).unwrap();
+            row[..at].chars().count()
+        };
+        assert_eq!(column("report.pdf", "Alice"), column("map.png", "Bob"));
+        assert_eq!(column("map.png", "Bob"), column("notes.txt", "you"));
+    }
+
+    #[test]
+    fn a_saved_file_carries_a_check_mark_and_the_others_do_not() {
+        let mut app = app_with_shared_files();
+        open_files(&mut app);
+        mark_saved(&mut app, "map.png");
+
+        let rows = files_box(&app);
+
+        assert!(row_with(&rows, "map.png").contains('✓'));
+        assert!(!row_with(&rows, "notes.txt").contains('✓'));
+        assert!(!row_with(&rows, "report.pdf").contains('✓'));
+    }
+
+    #[test]
+    fn the_highlight_follows_down_and_is_styled_like_the_pickers() {
+        let mut app = app_with_shared_files();
+        open_files(&mut app);
+        let area = files_area(screen());
+        let first_entry = area.y + 2; // past the top border and the filter row
+        let highlighted = |app: &AppState| -> Vec<bool> {
+            let buffer = render_to_buffer(app, 100, 20);
+            (0..2)
+                .map(|i| row_is_highlighted(&buffer, area, first_entry + i))
+                .collect()
+        };
+
+        assert_eq!(highlighted(&app), [true, false]);
+
+        press(&mut app, KeyCode::Down);
+
+        assert_eq!(highlighted(&app), [false, true]);
+    }
+
+    #[test]
+    fn a_saved_row_that_is_highlighted_keeps_the_highlight_colors() {
+        let mut app = app_with_shared_files();
+        open_files(&mut app);
+        mark_saved(&mut app, "notes.txt"); // the first row
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        let area = files_area(screen());
+        let mark = &buffer[(area.x + 1 + 1, area.y + 2)];
+        assert_eq!(mark.symbol(), "✓");
+        assert_eq!((mark.fg, mark.bg), (Color::Black, Color::Cyan));
+    }
+
+    #[test]
+    fn typing_narrows_the_files_and_the_cursor_sits_after_the_filter() {
+        let mut app = app_with_shared_files();
+        open_files(&mut app);
+        type_text(&mut app, "ALI");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 24))
+            .expect("a test backend never fails");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("drawing to a test backend never fails");
+
+        let area = files_area(Rect::new(0, 0, 110, 24));
+        let text = box_rows(terminal.backend().buffer(), area).join("\n");
+        let cursor = terminal
+            .get_cursor_position()
+            .expect("a test backend never fails");
+
+        assert!(text.contains("report.pdf"), "Alice's file:\n{text}");
+        assert!(
+            !text.contains("map.png") && !text.contains("notes.txt"),
+            "got:\n{text}"
+        );
+        // Past the border, the 2-cell prompt and the 3 typed characters, on
+        // the row under the top border -- not down in the input box.
+        assert_eq!((cursor.x, cursor.y), (area.x + 1 + 2 + 3, area.y + 1));
+    }
+
+    #[test]
+    fn a_channel_with_no_files_says_nothing_has_been_shared() {
+        let mut app = app_with_every_kind();
+        open_files(&mut app);
+
+        let rows = files_box(&app);
+
+        assert!(
+            rows[2].contains("no files have been shared in this channel yet"),
+            "got:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_files_filter_that_matches_nothing_says_so() {
+        let mut app = app_with_shared_files();
+        open_files(&mut app);
+        type_text(&mut app, "zzz");
+
+        let rows = files_box(&app);
+
+        assert!(rows[2].contains("no matches"), "got:\n{}", rows.join("\n"));
+    }
+
+    #[test]
+    fn the_bottom_border_offers_save_for_an_unsaved_file_and_open_for_a_saved_one() {
+        let mut app = app_with_shared_files();
+        open_files(&mut app);
+        mark_saved(&mut app, "map.png");
+
+        // `notes.txt` is highlighted first, and isn't saved.
+        let unsaved = files_box(&app);
+        let bottom = unsaved.last().unwrap();
+        assert!(bottom.contains("Enter save"), "got: {bottom}");
+        assert!(!bottom.contains("Ctrl+O"), "nothing to open yet: {bottom}");
+
+        press(&mut app, KeyCode::Down); // `map.png`, saved
+        let saved = files_box(&app);
+        let bottom = saved.last().unwrap();
+        assert!(bottom.contains("Ctrl+O open"), "got: {bottom}");
+        assert!(
+            !bottom.contains("Enter"),
+            "saving it again is no offer: {bottom}"
+        );
+        assert!(bottom.contains("Esc close"), "got: {bottom}");
+    }
+
+    #[test]
+    fn with_nothing_to_act_on_the_bottom_border_only_offers_to_close() {
+        let mut app = app_with_shared_files();
+        open_files(&mut app);
+        type_text(&mut app, "zzz");
+
+        let rows = files_box(&app);
+
+        let bottom = rows.last().unwrap();
+        assert!(bottom.contains("Esc close"), "got: {bottom}");
+        assert!(
+            !bottom.contains("Enter") && !bottom.contains("Ctrl+O"),
+            "{bottom}"
+        );
+    }
+
+    #[test]
+    fn the_title_names_the_channel_by_its_heading_and_counts_the_files() {
+        let mut app = app_with_shared_files();
+        open_files(&mut app);
+        assert!(files_box(&app)[0].contains("files in #general · 3"));
+
+        type_text(&mut app, "report");
+        assert!(
+            files_box(&app)[0].contains("files in #general · 1 of 3"),
+            "got: {}",
+            files_box(&app)[0]
+        );
+    }
+
+    #[test]
+    fn a_dm_and_a_dm_chat_are_titled_by_who_they_are_with() {
+        let mut app = app_with_shared_files();
+        app.load_history(
+            "dm-07070707",
+            vec![shared_file(10, 1, [7; 32], "dm.pdf", 5)],
+        );
+        app.load_history(
+            "p2p-07070707",
+            vec![shared_file(11, 1, [7; 32], "chat.pdf", 5)],
+        );
+
+        app.active = 1; // the /msg DM
+        open_files(&mut app);
+        let dm = files_box(&app);
+        press(&mut app, KeyCode::Esc);
+        app.active = 3; // the /dm chat
+        open_files(&mut app);
+        let direct = files_box(&app);
+
+        assert!(dm[0].contains("files in @Alice"), "got: {}", dm[0]);
+        row_with(&dm, "dm.pdf");
+        assert!(direct[0].contains("files in ⚡Alice"), "got: {}", direct[0]);
+        row_with(&direct, "chat.pdf");
+    }
+
+    #[test]
+    fn the_files_overlay_scrolls_to_keep_the_highlight_in_view() {
+        let mut app = app_with_every_kind();
+        let files = (0..40)
+            .map(|i| shared_file(i + 1, i + 1, [7; 32], &format!("file-{i:02}.txt"), 1))
+            .collect();
+        app.load_history("general", files);
+        open_files(&mut app);
+        for _ in 0..30 {
+            press(&mut app, KeyCode::Down);
+        }
+
+        let buffer = render_to_buffer(&app, 100, 20);
+
+        // Newest first, so the thirty-first row is `file-09.txt`.
+        let area = files_area(screen());
+        let rows = box_rows(&buffer, area);
+        let row = (area.y..area.bottom())
+            .find(|&y| rows[(y - area.y) as usize].contains("file-09.txt"))
+            .expect("the highlighted file is in view");
+        assert!(row_is_highlighted(&buffer, area, row));
+        assert!(!rows.join("\n").contains("file-39.txt"));
+        assert!(
+            (area.y..area.bottom()).any(|y| buffer[(area.right() - 1, y)].symbol() == "▐"),
+            "a scroll thumb on the box's right border"
+        );
+    }
+
+    #[test]
+    fn a_long_name_is_cut_short_of_the_columns_which_all_stay() {
+        let mut app = app_with_every_kind();
+        let long = "a-file-name-that-is-far-too-long-to-fit-in-the-overlay-next-to-its-size-sender-and-date.txt";
+        app.load_history(
+            "general",
+            vec![shared_file(
+                1,
+                crate::message::now_unix_ms(),
+                [9; 32],
+                long,
+                480,
+            )],
+        );
+        open_files(&mut app);
+
+        let rows = files_box(&app);
+
+        let row = row_with(&rows, "a-file-name");
+        assert!(row.contains('…'), "got: {row}");
+        assert!(!row.contains("date.txt"), "got: {row}");
+        assert!(row.contains("480 B") && row.contains("you"), "got: {row}");
+    }
+
+    #[test]
+    fn the_files_overlay_covers_what_is_underneath() {
+        let mut app = app_with_shared_files();
+        // Long enough to run right through the box's columns.
+        app.load_history("general", vec![text_message(9, [1; 32], &"X".repeat(80))]);
+        open_files(&mut app);
+
+        let text = files_box(&app).join("\n");
+
+        assert!(
+            !text.contains('X'),
+            "the message pane showed through:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_files_overlay_survives_a_tiny_terminal() {
+        let mut app = app_with_shared_files();
+        open_files(&mut app);
+        mark_saved(&mut app, "map.png");
+        type_text(&mut app, "a");
+
+        for width in 1..=30 {
+            for height in 1..=8 {
+                render_to_buffer(&app, width, height);
+            }
+        }
+    }
+
+    #[test]
+    fn the_files_box_is_centered_top_anchored_and_never_outgrows_the_screen() {
+        let screen = Rect::new(0, 0, 120, 40);
+        let area = files_area(screen);
+        assert_eq!(area.width, FILES_WIDTH);
+        assert_eq!(area.height, FILES_ROWS as u16 + 3);
+        assert_eq!(area.x * 2 + area.width, screen.width, "centered");
+        assert_eq!(area.y, 2, "anchored, so it never jumps while typing");
+
+        for width in 1..=120 {
+            for height in 1..=40 {
+                let screen = Rect::new(0, 0, width, height);
+                let area = files_area(screen);
+                assert!(
+                    area.right() <= screen.right() && area.bottom() <= screen.bottom(),
+                    "{area:?} overflows {screen:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_heading_is_cut_short_of_the_counts_in_the_title() {
+        let heading = format!("#{}", "channel-".repeat(20));
+
+        let title = files_title(&heading, 2, 5, 60);
+
+        assert!(title.chars().count() <= 60 - 2, "got: {title}");
+        assert!(title.contains('…'), "got: {title}");
+        assert!(title.ends_with(" · 2 of 5 "), "got: {title}");
+    }
+
+    #[test]
+    fn the_files_command_is_among_the_hints() {
+        assert!(COMMAND_HINTS.contains(&"/files"));
+    }
+
+    #[test]
+    fn a_share_is_dated_the_way_a_file_is_in_the_picker() {
+        let now = Local.with_ymd_and_hms(2026, 10, 12, 15, 0, 0).unwrap();
+        let at = |year, month, day, hour, minute| {
+            Local
+                .with_ymd_and_hms(year, month, day, hour, minute, 0)
+                .unwrap()
+                .timestamp_millis() as u64
+        };
+
+        let today = sent_label(at(2026, 10, 12, 14, 3), now);
+        let last_year = sent_label(at(2025, 3, 3, 11, 20), now);
+
+        assert_eq!(today, "12 Oct 14:03");
+        assert_eq!(last_year, "03 Mar  2025");
+        for label in [today, last_year] {
+            assert_eq!(label.chars().count(), PICKER_TIME_WIDTH, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_timestamp_that_cannot_be_dated_is_dashes_as_wide_as_a_date() {
+        let now = Local.with_ymd_and_hms(2026, 10, 12, 15, 0, 0).unwrap();
+
+        // `i64::MIN` milliseconds, as a peer's message could claim.
+        let label = sent_label(1 << 63, now);
+
+        assert_eq!(label.trim_end(), "--");
+        assert_eq!(label.chars().count(), PICKER_TIME_WIDTH);
     }
 
     #[test]
