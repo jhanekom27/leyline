@@ -4,6 +4,7 @@ title: 'Sync folder: status, conflicts, and controls'
 status: To Do
 assignee: []
 created_date: '2026-10-12 08:29'
+updated_date: '2026-10-13 08:27'
 labels:
   - files
   - ux
@@ -29,3 +30,9 @@ Provisional until the spike lands. Sync that fails silently is worse than no syn
 - [ ] #4 Errors such as a full disk, a permission problem, or unreachable members are reported with the file name, and one failing file never stops the others from syncing
 - [ ] #5 Conflict copies are listed with both file names so they are easy to find and resolve
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+LEY-26.3 substrate decision: expose iroh-docs sync and index-application state separately from filesystem-operation status. Surface namespace sync peers/errors and per-file apply/conflict outcomes without blocking the event loop.
+<!-- SECTION:NOTES:END -->

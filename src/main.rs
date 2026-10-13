@@ -22,6 +22,8 @@ mod saved_files;
 mod search;
 mod settings;
 mod storage;
+#[cfg(test)]
+mod sync_docs;
 mod term_events;
 mod thread;
 mod ticket;

@@ -4,6 +4,7 @@ title: 'Sync folder: publish local changes to the channel'
 status: To Do
 assignee: []
 created_date: '2026-10-12 08:29'
+updated_date: '2026-10-13 08:27'
 labels:
   - files
   - networking
@@ -29,3 +30,9 @@ Provisional until the spike lands. The send half of two-way sync: files created 
 - [ ] #5 Files written by sync itself are never published back as local changes
 - [ ] #6 Publishing never blocks the interface
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+LEY-26.3 substrate decision: publish stable local filesystem changes as writes to the channel iroh-docs namespace using this device docs author. Use the resolved index to suppress sync-originated echoes; do not publish through the chat HashSeq manifest.
+<!-- SECTION:NOTES:END -->

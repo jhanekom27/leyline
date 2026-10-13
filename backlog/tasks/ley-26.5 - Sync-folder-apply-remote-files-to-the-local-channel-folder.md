@@ -4,6 +4,7 @@ title: 'Sync folder: apply remote files to the local channel folder'
 status: To Do
 assignee: []
 created_date: '2026-10-12 08:29'
+updated_date: '2026-10-13 08:27'
 labels:
   - files
   - networking
@@ -32,3 +33,9 @@ Provisional until the spike lands. The receive half of two-way sync and its firs
 - [ ] #6 Files over the size limit are skipped with a notice
 - [ ] #7 Verified manually between a macOS and a Linux machine
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+LEY-26.3 substrate decision: consume the resolved iroh-docs per-channel index from LEY-26.4 as the remote source of truth. Apply only live docs events or reconciled entries through the runtime; do not reimplement history manifests or file transfer, because iroh-docs uses the shared blob store.
+<!-- SECTION:NOTES:END -->

@@ -4,6 +4,7 @@ title: Replicate a channel file index between members
 status: To Do
 assignee: []
 created_date: '2026-10-12 08:29'
+updated_date: '2026-10-13 08:27'
 labels:
   - files
   - networking
@@ -27,3 +28,9 @@ Provisional until the spike lands. Every member of a channel needs to converge o
 - [ ] #3 Index state persists across restarts and is removed when the channel is left
 - [ ] #4 Existing channels, DMs, and history backfill behave exactly as before
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+LEY-26.3 substrate decision: implement the replicated index as one persisted iroh-docs namespace per channel. Store path-keyed entries with content hash, size, modified time, and author metadata; use per-device docs authors and Query::single_latest_per_key for the resolved index. Persist the docs namespace/write capability with channel state, distribute it only via channel ticket/pairing flows, and route docs live events into the runtime event loop.
+<!-- SECTION:NOTES:END -->

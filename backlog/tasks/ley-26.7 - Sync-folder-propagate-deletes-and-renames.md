@@ -4,6 +4,7 @@ title: 'Sync folder: propagate deletes and renames'
 status: To Do
 assignee: []
 created_date: '2026-10-12 08:29'
+updated_date: '2026-10-13 08:27'
 labels:
   - files
   - networking
@@ -29,3 +30,9 @@ Provisional until the spike lands. Without deletes, stale files pile up, and wit
 - [ ] #4 A peer that was offline during a delete converges on reconnect without bringing the file back
 - [ ] #5 Conflicting concurrent changes (edit versus delete, rename versus rename) never lose data
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+LEY-26.3 substrate decision: represent deletes with iroh-docs tombstones. Model a rename as an add at the new path plus a delete at the old path, retaining conflict and trash policy in this task rather than in the substrate layer.
+<!-- SECTION:NOTES:END -->
