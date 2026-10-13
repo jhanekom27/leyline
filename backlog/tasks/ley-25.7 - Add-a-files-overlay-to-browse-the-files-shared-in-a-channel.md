@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@Jurgen'
 created_date: '2026-10-12 08:28'
-updated_date: '2026-10-13 03:06'
+updated_date: '2026-10-13 04:05'
 labels:
   - files
   - ux
@@ -70,4 +70,16 @@ Interpretations to confirm:
 (8) `NetEvent::FileSaved` now names the channel and the hash, and main.rs records every finished save in a new postcard file `saved_files` in the data directory (rewritten whole per save like the other registries). Nothing is ever pruned for being absent, so an unmounted drive doesn't erase what is known about it. Pairing and /leave leave it alone.
 (9) The empty-list message is `no files have been shared in this channel yet`, which for a channel whose files are all older than (1)'s window is not quite true, as with bare `/save`'s `no file from another peer to save in this channel`.
 (10) Version bumped 0.4.0 -> 0.5.0 (a feature: minor).
+
+Follow-up after review: Enter on a file that is already saved still saves nothing, but the overlay now says so instead of looking dead -- this revises interpretation (4). The bottom border shows `already saved · Ctrl+O opens it` (yellow, bold, in place of the key hints) until the next key or paste. For symmetry Ctrl+O on an unsaved file shows `not saved yet · Enter saves it`. The overlay stays open either way, so the filter and highlight are kept. State is `FilesOverlay::notice: Option<FilesNotice>`, dropped by `handle_files_key` on any key and by `edit_files_query` (so a paste too); `ui::files_footer` draws it. Changed: src/app.rs, src/ui.rs, README (the /files row), features.md. No version change: same task, still 0.5.0.
+
+Validation, superseding the figures above: cargo test 844 passed (8 new), cargo clippy --all-targets clean, cargo fmt --check flags only the old src/dm_registry.rs hunk. The PTY run (/tmp/ley-25-7/run.py, extended to check both notices, that the next key brings the key hints back, and the notice colour): 93 of 93 checks pass.
+
+Measured for interpretation (7), on macOS: a file leyline saves is mode 0600 (no execute bit, so `open` cannot run a script or binary directly) and carries only `com.apple.provenance`, not `com.apple.quarantine`, so the usual downloaded-from-the-internet prompt has no flag to act on. Types with a registered interpreter or installer (.jar under an installed Java, .pkg, .dmg, .html in a browser) still launch. The decision on a guard is still open.
+
+Follow-up after review (guard on Ctrl+O, resolving interpretation (7)): a file whose extension means it runs, installs or applies something when opened -- programs and installers, scripts, shortcuts and launchers (`files::RUNS_WHEN_OPENED`, 49 extensions: .exe .msi .jar .pkg .dmg .bat .cmd .ps1 .vbs .js .py .sh .command .lnk .url .desktop .terminal .reg .mobileconfig and the like) -- is saved like any other (Enter still saves it) but is never handed to the OS from the overlay. `files::runs_when_opened(path)` is a pure check on the saved copy's own name, which is what the OS goes by, read as written and as Windows reads it (trailing dots and blanks dropped; a `:` and what follows dropped), so `setup.exe.` and `setup.exe::$DATA` are caught like `setup.exe`; only the last extension counts (`report.pdf.exe` is refused, `setup.exe.txt` is not). `AppState::file_offer` works out once what Enter and Ctrl+O can do for a row (`FileOffer::{Save, Open(path), SavedOnly}`) and the bottom border and both keys go by it: a saved program row offers neither key, and either key says `already saved · won't open programs or scripts from here` (`FilesNotice::SavedNotOpened`). Changed: src/files.rs, src/app.rs, src/ui.rs, README (the /files row), features.md, concept.md. No version change: same task, still 0.5.0.
+
+Not covered (a list is not a sandbox): documents that can carry macros, archives, web pages, and any type not on the list. The list is wider than one system needs (a script that merely opens in an editor on macOS is refused too), because a peer's file name says nothing about where it will be opened. Saving such a file is unaffected, and opening one by hand from the file manager is left to the user.
+
+Validation, superseding the figures above: cargo test 858 passed (14 new), cargo clippy --all-targets clean, cargo fmt --check flags only the old src/dm_registry.rs hunk. The PTY run (/tmp/ley-25-7/run.py, now also sharing a text file named setup.exe): B saves it with Enter like any file; then Ctrl+O is refused with the notice, no key is offered for the row, the stand-in `open` is never run, and Enter says it is already saved and saves nothing more. 105 of 105 checks pass.
 <!-- SECTION:NOTES:END -->
