@@ -1,20 +1,27 @@
-# AGENTS.md
-leyline is a peer-to-peer terminal chat app (Rust, iroh + iroh-gossip + ratatui). See README.md for features/usage and concept.md for architecture notes.
+# leyline agent guide
+leyline is a peer-to-peer terminal chat app built with Rust, iroh, iroh-gossip, and ratatui. Read `README.md` for user-facing behavior and `concept.md` before changing architectural boundaries.
+## Architecture invariants
+- The `main` event loop is the only owner of `AppState`; communicate with it through actions and events rather than sharing it behind a mutex.
+- `app` contains pure UI-state transitions. It must not perform network or filesystem I/O.
+- `ui` only reads `AppState` and renders. It must not mutate state or perform I/O.
+- Network and slow filesystem work stay asynchronous so input and rendering remain responsive.
+## Topic routing
+Read only the skill relevant to the requested change:
+- `.agents/skills/architecture/SKILL.md` — boundaries, dependency direction, and cross-cutting changes.
+- `.agents/skills/app-state/SKILL.md` — `AppState`, commands, input, overlays, replies, and threads.
+- `.agents/skills/ui-rendering/SKILL.md` — ratatui rendering, layout, and overlays.
+- `.agents/skills/networking/SKILL.md` — iroh, gossip, direct messaging, tickets, and backfill.
+- `.agents/skills/files-and-storage/SKILL.md` — attachments, destinations, persistence, and file safety.
+- `.agents/skills/runtime-event-loop/SKILL.md` — startup, `tokio::select!`, and side-effect routing.
+- `.agents/skills/testing/SKILL.md` — inline tests and validation selection.
 ## Commands
-- Build: `cargo build --release`
-- Run: `cargo run`
-- Test: `cargo test`
 - Format: `cargo fmt`
+- Test: `cargo test`
 - Lint: `cargo clippy`
-Tests live inline per-module (`#[cfg(test)]`), not in a separate `tests/` directory. No custom rustfmt/clippy config; defaults apply.
+- Release build: `cargo build --release`
+Tests live inline beside the module they cover. Do not add feature behavior while performing a structural refactor.
 ## Versioning
-Every completed Backlog task bumps `version` in `Cargo.toml`, in the same commit as the work, following semver (`MAJOR.MINOR.PATCH`) and mirroring the conventional commit type:
-- `feat` (a new feature or enhancement): minor
-- `fix`, `perf`: patch
-- breaking (`!` or `BREAKING CHANGE:` -- anything older peers or existing on-disk data can no longer handle): major. While we are on 0.x, bump the minor instead, and ask before going to 1.0.0
-- `docs`, `test`, `refactor`, `style`, `build`, `ci`, `chore`: no bump, nothing user-visible changed
-Bumping a component resets the ones below it (0.3.1 -> 0.4.0). Building updates `Cargo.lock` to match, so commit it with `Cargo.toml`.
-Peers broadcast this version and compare it as a plain `X.Y.Z` triple (`src/version.rs`) to tell each other an update is available, so never use a pre-release suffix such as `-beta`: it reads as "not newer" and the update goes unnoticed.
+Completed Backlog tasks use semver in `Cargo.toml`: `feat` bumps minor; `fix` and `perf` bump patch; breaking changes bump major (or minor while on `0.x`, after asking). `docs`, `test`, `refactor`, `style`, `build`, `ci`, and `chore` do not bump the version. Never add a pre-release suffix because peers compare versions as plain `X.Y.Z` triples in `src/version.rs`.
 <!-- BACKLOG.MD GUIDELINES START -->
 <!-- backlog.md-instructions-version: 1.53.0 -->
 <CRITICAL_INSTRUCTION>

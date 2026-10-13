@@ -1,0 +1,23 @@
+{
+  "skill_name": "leyline-topic-routing",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "The /files dialog should show a clearer status for a saved attachment. Where should I work?",
+      "expected_output": "Routes to ui-rendering and app-state, naming src/ui/files_overlay.rs and src/app/files_overlay.rs.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "A peer can no longer rejoin from an invite ticket after restarting. What code should I inspect?",
+      "expected_output": "Routes to networking, naming src/net.rs, src/net/protocol.rs, and ticket/channel persistence boundaries.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Dropped paths with spaces are being inserted as chat text rather than staged. Which area owns this?",
+      "expected_output": "Routes to files-and-storage and runtime-event-loop, naming src/files/drops.rs and src/runtime.rs.",
+      "files": []
+    }
+  ]
+}

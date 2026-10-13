@@ -181,10 +181,7 @@ mod tests {
         registry.record(BOB, "dm-bob".to_string()).unwrap();
         assert_eq!(
             registry.all(),
-            HashMap::from([
-                (ALICE, "dm-alice".to_string()),
-                (BOB, "dm-bob".to_string())
-            ])
+            HashMap::from([(ALICE, "dm-alice".to_string()), (BOB, "dm-bob".to_string())])
         );
     }
 
