@@ -397,7 +397,8 @@ directory. It is enforced in exactly two places -- `files::stage_file`, which
 every route for a file passes through (`/send <path>`, the picker, a drop, a
 clipboard file list), and `files::stage_image` for a pasted image -- and
 nothing re-checks it at send, so main.rs hands both the one limit `AppState`
-holds. Only what you share is limited, never what you receive.
+holds. Only what you share is limited, never what you receive, and a pasted
+clipboard image counts as a file (features.md lists what the limit leaves out).
 
 ## Point-to-point messaging
 

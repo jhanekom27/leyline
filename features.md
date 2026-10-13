@@ -376,8 +376,21 @@ mechanisms, not one, since they trade off differently:
   limit falls back to the default, the guarded state and never a looser
   one, while a genuine I/O error fails startup, as for `files_root`. A write
   that fails is reported and the limit still holds for the session. Pairing
-  leaves it alone, being a preference of this device. Only files you share
-  are limited, never ones you receive.
+  leaves it alone, being a preference of this device.
+  Not covered, each left out on purpose for now and worth revisiting if it
+  starts to matter: only files you share are limited, never ones you
+  receive -- `/save` fetches whatever a peer announced, whatever its size,
+  and a receive-side guard (refuse, or confirm, above some size) is not
+  built. A pasted clipboard image answers to the same limit, checked once it
+  is encoded as PNG in memory, and under `off` that check goes too. The
+  limit is checked when a file is staged (or `/send`ed), not again when it
+  goes out -- `import_staged` trusts staging, so a file that grows between
+  the two is not re-checked, as it never was. It is one limit for the whole
+  device, not one per channel, and there is no one-off confirmation for a
+  single file (a `/send --force`, say, or a confirm on `Enter`): a limit
+  raised for one deliberate send stays raised until `/maxsize default`. A
+  size needs its unit (a bare `5` is refused) and only `B` to `TB` are read,
+  1024 apart -- no `G`, `MiB` or the like. See LEY-25.8's notes.
 
 ## Networking & sharing
 
