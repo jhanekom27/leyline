@@ -21,6 +21,7 @@ use crate::message::{ChatMessage, FileAttachment, now_unix_ms};
 use crate::net::{DEVICE_SYNC_CHANNEL, NetEvent};
 use crate::picker::{FilePicker, FolderListing, Step};
 use crate::search::{self, SearchOutcome, SearchResults};
+use crate::sync_state::SyncMode;
 use crate::thread::{self, ThreadView};
 use crate::ticket::PairingTicket;
 use crate::version;
@@ -41,6 +42,56 @@ const MAX_SCROLLBACK: usize = 500;
 pub enum TranscriptLine {
     Chat(ChatMessage),
     System(String),
+}
+
+/// Runtime observations for one channel's sync, kept in app state so the UI
+/// and `/sync` report one pure snapshot.
+#[derive(Debug, Default)]
+pub struct SyncStatus {
+    pending: HashSet<String>,
+    last_success_unix_ms: Option<u64>,
+    errors: Vec<(String, String)>,
+    conflicts: Vec<(String, String)>,
+}
+
+impl SyncStatus {
+    fn pending(&mut self, path: String) {
+        self.pending.insert(path);
+    }
+
+    fn succeeded(&mut self, path: &str, completed_unix_ms: u64) {
+        self.pending.remove(path);
+        self.errors.retain(|(failed, _)| failed != path);
+        self.last_success_unix_ms = Some(completed_unix_ms);
+    }
+
+    fn failed(&mut self, path: String, error: String) {
+        self.pending.remove(&path);
+        self.errors.retain(|(failed, _)| failed != &path);
+        self.errors.push((path, error));
+    }
+
+    fn conflict(&mut self, remote: String, local: String) {
+        if !self
+            .conflicts
+            .iter()
+            .any(|(known_remote, known_local)| known_remote == &remote && known_local == &local)
+        {
+            self.conflicts.push((remote, local));
+        }
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.errors.len()
+    }
+
+    pub fn conflict_count(&self) -> usize {
+        self.conflicts.len()
+    }
 }
 
 /// What kind of conversation a channel is -- see `AppState::channel_kind`.
@@ -644,7 +695,7 @@ pub enum InputAction {
     SetOutbox { channel: String, on: bool },
     /// Persist folder sync for one channel. Application of remote entries
     /// and publication of stable local files remain runtime-owned.
-    SetSync { channel: String, on: bool },
+    SetSync { channel: String, mode: SyncMode },
     /// Move the files root -- the folder every channel's folder lives in --
     /// to the path exactly as typed after `/folder ` (see `run_folder`). The
     /// caller (`files::set_files_root`) expands, creates and remembers it,
@@ -846,7 +897,10 @@ pub struct AppState {
     /// Channels whose remote iroh-docs entries may be mirrored into their
     /// local channel folder.  This is receive-only; app state never watches
     /// or publishes local paths.
-    sync: HashSet<String>,
+    sync: HashMap<String, SyncMode>,
+    /// Runtime-owned sync observations supplied through explicit events.
+    /// This state never reads the filesystem or network itself.
+    sync_status: HashMap<String, SyncStatus>,
     /// The files an auto-save is fetching right now, by channel (stored
     /// name) and content. A repeat of one of them -- a file sent twice, or a
     /// share replayed by someone who can't be told from its sender -- is
@@ -934,7 +988,8 @@ impl AppState {
             size_limit: SizeLimit::Default,
             autosave: HashSet::new(),
             outbox: HashSet::new(),
-            sync: HashSet::new(),
+            sync: HashMap::new(),
+            sync_status: HashMap::new(),
             auto_saving: HashSet::new(),
             browse_requests: 0,
         }
@@ -1035,12 +1090,85 @@ impl AppState {
         self.outbox = channels;
     }
 
-    pub fn load_sync(&mut self, channels: HashSet<String>) {
-        self.sync = channels;
+    pub fn load_sync(&mut self, modes: HashMap<String, SyncMode>) {
+        self.sync = modes;
     }
 
-    pub fn sync_enabled(&self, channel: &str) -> bool {
-        self.sync.contains(channel)
+    pub fn sync_active(&self, channel: &str) -> bool {
+        self.sync_mode(channel).is_active()
+    }
+    pub fn sync_paused(&self, channel: &str) -> bool {
+        self.sync_mode(channel) == SyncMode::Paused
+    }
+
+    pub fn sync_mode(&self, channel: &str) -> SyncMode {
+        self.sync.get(channel).copied().unwrap_or_default()
+    }
+
+    pub fn sync_status(&self, channel: &str) -> Option<&SyncStatus> {
+        self.sync_status.get(channel)
+    }
+    pub fn sync_is_pending(&self, channel: &str, path: &str) -> bool {
+        self.sync_status
+            .get(channel)
+            .is_some_and(|status| status.pending.contains(path))
+    }
+
+    pub fn sync_pending(&mut self, channel: &str, path: String) {
+        self.sync_status
+            .entry(channel.to_string())
+            .or_default()
+            .pending(path);
+    }
+
+    pub fn sync_succeeded(&mut self, channel: &str, path: &str, completed_unix_ms: u64) {
+        self.sync_status
+            .entry(channel.to_string())
+            .or_default()
+            .succeeded(path, completed_unix_ms);
+    }
+
+    pub fn sync_failed(&mut self, channel: &str, path: String, error: String) {
+        self.sync_status
+            .entry(channel.to_string())
+            .or_default()
+            .failed(path, error);
+    }
+
+    pub fn sync_conflict(&mut self, channel: &str, remote: String, local: String) {
+        self.sync_status
+            .entry(channel.to_string())
+            .or_default()
+            .conflict(remote, local);
+    }
+
+    pub fn sync_marker(&self, channel: &str) -> Option<char> {
+        match self.sync_mode(channel) {
+            SyncMode::Off => None,
+            SyncMode::Paused => Some('P'),
+            SyncMode::Active
+                if self
+                    .sync_status(channel)
+                    .is_some_and(|status| status.error_count() > 0) =>
+            {
+                Some('!')
+            }
+            SyncMode::Active
+                if self
+                    .sync_status(channel)
+                    .is_some_and(|status| status.conflict_count() > 0) =>
+            {
+                Some('C')
+            }
+            SyncMode::Active
+                if self
+                    .sync_status(channel)
+                    .is_some_and(|status| status.pending_count() > 0) =>
+            {
+                Some('~')
+            }
+            SyncMode::Active => Some('S'),
+        }
     }
 
     /// Applies a successfully persisted outbox change from the runtime.
@@ -2170,7 +2298,7 @@ impl AppState {
              /leave [channel], /rename [name], /who, /send [path], \
              /save [hash-prefix], /folder [path], /maxsize [size|off|default], \
              /autosave [on|off], /outbox [on|off], /files, /paste, \
-             /sync [on|off], \
+             /sync [on|off|pause|resume], \
              /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
              ticket for a new device to redeem, /pair <ticket> redeems one (after an \
@@ -2907,45 +3035,53 @@ impl AppState {
         Some(InputAction::SetOutbox { channel, on })
     }
 
-    /// Handles `/sync [on|off]`. This enables channel-folder mirroring and
-    /// stable local publication for the active channel.
+    /// Handles `/sync [on|off|pause|resume]` for the active channel.
     fn run_sync(&mut self, arg: &str) -> Option<InputAction> {
         let channel = self.active().name.clone();
-        let on = match arg {
+        let mode = match arg {
             "" => {
                 self.push_system(self.sync_notice(&channel));
                 return None;
             }
-            "on" => true,
-            "off" => false,
+            "on" | "resume" => SyncMode::Active,
+            "off" => SyncMode::Off,
+            "pause" => SyncMode::Paused,
             _ => {
-                self.push_system("usage: /sync [on|off]");
+                self.push_system("usage: /sync [on|off|pause|resume]");
                 return None;
             }
         };
-        let changed = if on {
-            self.sync.insert(channel.clone())
-        } else {
-            self.sync.remove(&channel)
-        };
+        let changed = self.sync_mode(&channel) != mode;
+        self.sync.insert(channel.clone(), mode);
         self.push_system(self.sync_notice(&channel));
-        changed.then_some(InputAction::SetSync { channel, on })
+        changed.then_some(InputAction::SetSync { channel, mode })
     }
 
     fn sync_notice(&self, channel: &str) -> String {
         let heading = self.channel_heading(channel);
         let folder = channel_dir(&self.files_root, channel);
-        if self.sync.contains(channel) {
-            format!(
-                "sync is on for {heading} -- safe remote files are mirrored into {} and stable local files are published; deletes and renames are ignored; /sync off turns it off",
-                folder.display()
-            )
-        } else {
-            format!(
-                "sync is off for {heading} -- /sync on mirrors safe remote files into {} and publishes stable local files (deletes and renames are ignored)",
-                folder.display()
-            )
+        let status = self.sync_status(channel);
+        let pending = status.map_or(0, SyncStatus::pending_count);
+        let errors = status.map_or(0, SyncStatus::error_count);
+        let conflicts = status.map_or(0, SyncStatus::conflict_count);
+        let last_success = status
+            .and_then(|status| status.last_success_unix_ms)
+            .map(|timestamp| format!("last success: {timestamp}"))
+            .unwrap_or_else(|| "last success: never".to_string());
+        let mut report = format!(
+            "sync is {} for {heading} -- folder: {}; {pending} pending; {conflicts} conflict(s); {errors} error(s); {last_success}",
+            self.sync_mode(channel).label(),
+            folder.display(),
+        );
+        if let Some(status) = status {
+            for (remote, local) in &status.conflicts {
+                report.push_str(&format!("; conflict: {remote} -> {local}"));
+            }
+            for (path, error) in &status.errors {
+                report.push_str(&format!("; error: {path}: {error}"));
+            }
         }
+        report
     }
 
     /// What `/outbox` says about the active channel's local one-way folder.

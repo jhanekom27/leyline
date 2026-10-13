@@ -28,13 +28,14 @@ mod sync_docs;
 mod sync_index;
 mod sync_publish;
 mod sync_settings;
+mod sync_state;
 mod term_events;
 mod thread;
 mod ticket;
 mod ui;
 mod version;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -136,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
     let known_channels = registry.snapshot();
 
     let (net_tx, net_rx) = mpsc::channel(64);
+    let replay_tx = net_tx.clone();
     let (net, joined_channels, active_channel) = Net::start(
         secret_key,
         user_key,
@@ -158,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
     let session = Session {
         net,
         net_rx,
+        replay_tx,
         joined_channels,
         active_channel,
         store,
@@ -198,6 +201,41 @@ async fn main() -> anyhow::Result<()> {
         Ok(None) => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+fn queue_paused_sync_event(
+    queued: &mut HashMap<String, VecDeque<NetEvent>>,
+    channel: String,
+    event: NetEvent,
+) {
+    let events = queued.entry(channel).or_default();
+    if events.len() == PAUSED_SYNC_EVENT_LIMIT {
+        events.pop_front();
+    }
+    events.push_back(event);
+}
+
+fn replay_paused_sync_events(
+    queued: &mut HashMap<String, VecDeque<NetEvent>>,
+    app: &AppState,
+    tx: &mpsc::Sender<NetEvent>,
+) {
+    for (channel, events) in queued.iter_mut() {
+        if !app.sync_active(channel) {
+            continue;
+        }
+        while let Some(event) = events.pop_front() {
+            match tx.try_send(event) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    events.push_front(event);
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
+            }
+        }
+    }
+    queued.retain(|_, events| !events.is_empty());
 }
 
 /// Parsed CLI arguments: an optional `--join <ticket>` to bootstrap into
@@ -382,6 +420,7 @@ fn init_logging(dirs: &directories::ProjectDirs) -> anyhow::Result<()> {
 struct Session {
     net: Net,
     net_rx: mpsc::Receiver<NetEvent>,
+    replay_tx: mpsc::Sender<NetEvent>,
     joined_channels: Vec<String>,
     active_channel: String,
     store: MessageStore,
@@ -442,6 +481,7 @@ struct PendingDm {
 /// interval, not only whoever it happens to be a direct gossip neighbor of
 /// (see concept.md's "Persistence & history backfill" section).
 const HISTORY_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
+const PAUSED_SYNC_EVENT_LIMIT: usize = 256;
 
 /// Announces `channel`'s current history root to the whole channel, if
 /// we've recorded any messages for it yet (see `BackfillStore::current_root`
@@ -460,6 +500,7 @@ async fn run(
     let Session {
         net,
         mut net_rx,
+        replay_tx,
         joined_channels,
         active_channel,
         store,
@@ -486,7 +527,7 @@ async fn run(
     app.load_renames(channel_renames.all());
     app.load_autosave(autosave.channels());
     app.load_outbox(outbox.channels());
-    app.load_sync(sync_settings.channels());
+    app.load_sync(sync_settings.modes());
     app.load_settings(settings.bell_enabled());
     app.load_dm_registry(dm_registry.all());
     app.load_forgotten_devices(forgotten_devices.all());
@@ -568,6 +609,7 @@ async fn run(
     // confirmation, keyed by the freshly chosen channel name -- see
     // `PendingDm` and `InputAction::StartDm`'s handling below.
     let mut pending_dms: HashMap<String, PendingDm> = HashMap::new();
+    let mut paused_sync_events: HashMap<String, VecDeque<NetEvent>> = HashMap::new();
 
     let mut term_events = TermEvents::new();
     let mut tick = interval(Duration::from_millis(250));
@@ -667,12 +709,12 @@ async fn run(
                                     )),
                                 }
                             }
-                            Some(InputAction::SetSync { channel, on }) => {
-                                if let Err(err) = sync_settings.set(&channel, on) {
+                            Some(InputAction::SetSync { channel, mode }) => {
+                                if let Err(err) = sync_settings.set(&channel, mode) {
                                     warn!(%channel, "failed to persist sync setting: {err}");
                                     app.push_system(format!(
                                         "couldn't remember that sync is {}: {err}",
-                                        if on { "on" } else { "off" }
+                                        mode.label()
                                     ));
                                 }
                             }
@@ -746,7 +788,7 @@ async fn run(
                                 if let Err(err) = outbox.disable(&channel) {
                                     warn!(%channel, "failed to forget the outbox setting: {err}");
                                 }
-                                if let Err(err) = sync_settings.set(&channel, false) {
+                                if let Err(err) = sync_settings.forget(&channel) {
                                     warn!(%channel, "failed to forget the sync setting: {err}");
                                 }
                                 match app.direct_peer_for(&channel) {
@@ -931,7 +973,7 @@ async fn run(
                 }
             }
             _ = sync_publish_tick.tick(), if !sync_publish_scan_in_flight => {
-                let channels = sync_settings.channels();
+                let channels = sync_settings.active_channels();
                 if !channels.is_empty() {
                     let root = files_root.clone();
                     let tx = sync_publish_tx.clone();
@@ -1087,7 +1129,13 @@ async fn run(
                         }
                     }
                     NetEvent::RemoteIndex(remote) => {
-                        if app.sync_enabled(&remote.channel) {
+                        if app.sync_paused(&remote.channel) {
+                            queue_paused_sync_event(
+                                &mut paused_sync_events,
+                                remote.channel.clone(),
+                                NetEvent::RemoteIndex(remote),
+                            );
+                        } else if app.sync_active(&remote.channel) {
                             if remote.entry.size > files::DEFAULT_MAX_FILE_SIZE {
                                 app.push_system_to(&remote.channel, format!(
                                     "sync skipped {}: {} exceeds the {} limit",
@@ -1122,14 +1170,24 @@ async fn run(
                                     }
                                     Some(Ok((_source, sync_apply::Relocation::AlreadyThere))) => {}
                                     Some(Ok((_, sync_apply::Relocation::Unavailable))) | None => match sync_apply::reserve(&root, &remote.path) {
-                                    Ok(destination) => net.save_synced_file(
-                                        remote.channel,
-                                        remote.entry.content_hash,
-                                        remote.path,
-                                        vec![remote.entry.author],
-                                        destination,
-                                        files::DEFAULT_MAX_FILE_SIZE,
-                                    ),
+                                    Ok(destination) => {
+                                        if !destination.ends_with(&remote.path) {
+                                            app.sync_conflict(
+                                                &remote.channel,
+                                                remote.path.clone(),
+                                                destination.display().to_string(),
+                                            );
+                                        }
+                                        app.sync_pending(&remote.channel, remote.path.clone());
+                                        net.save_synced_file(
+                                            remote.channel,
+                                            remote.entry.content_hash,
+                                            remote.path,
+                                            vec![remote.entry.author],
+                                            destination,
+                                            files::DEFAULT_MAX_FILE_SIZE,
+                                        );
+                                    }
                                     Err(reason) => app.push_system_to(&remote.channel, reason),
                                     },
                                     Some(Err(reason)) => app.push_system_to(&remote.channel, reason),
@@ -1138,7 +1196,13 @@ async fn run(
                         }
                     }
                     NetEvent::RemoteIndexDelete { channel, path } => {
-                        if app.sync_enabled(&channel) {
+                        if app.sync_paused(&channel) {
+                            queue_paused_sync_event(
+                                &mut paused_sync_events,
+                                channel.clone(),
+                                NetEvent::RemoteIndexDelete { channel, path },
+                            );
+                        } else if app.sync_active(&channel) {
                             if !sync_publish_watcher.may_remove_remote(&channel, &path) {
                                 app.push_system_to(
                                     &channel,
@@ -1172,6 +1236,7 @@ async fn run(
                         filename,
                         path,
                     } => {
+                        app.sync_succeeded(&channel, &filename, message::now_unix_ms());
                         let root = files::channel_dir(&files_root, &channel);
                         match path.strip_prefix(&root).ok().and_then(|path| path.to_str()) {
                             Some(relative) => record_remote_sync_file(
@@ -1228,6 +1293,9 @@ async fn run(
                     // (`AppState::save_failed`).
                     NetEvent::FileSaveFailed { channel, hash, filename, error, mode } => {
                         warn!(%filename, "failed to save file: {error}");
+                        if app.sync_is_pending(&channel, &filename) {
+                            app.sync_failed(&channel, filename.clone(), error.clone());
+                        }
                         app.save_failed(&channel, hash, &filename, &error, mode);
                     }
                     // A `/send`ed file finished importing and is ready to
@@ -1431,7 +1499,7 @@ async fn run(
                 dirty = true;
             }
             _ = tick.tick() => {
-                // Reserved for cursor blink / relative-timestamp refresh.
+                replay_paused_sync_events(&mut paused_sync_events, &app, &replay_tx);
             }
             _ = history_heartbeat.tick() => {
                 // Re-announce every joined channel's history root

@@ -101,7 +101,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/maxsize [size|off]",
     "/autosave [on|off]",
     "/outbox [on|off]",
-    "/sync [on|off]",
+    "/sync [on|off|pause|resume]",
     "/files",
     "/paste (or Ctrl+V)",
     "/alias <hex> <name>",
@@ -305,7 +305,16 @@ fn nav_entry(app: &AppState, index: usize, width: usize, highlighted: bool) -> L
                 .add_modifier(Modifier::BOLD),
         );
     }
-    if channel.has_unread {
+    if let Some(marker) = app.sync_marker(&channel.name) {
+        let gap = width.saturating_sub(line.width() + 1);
+        line.push_span(Span::raw(" ".repeat(gap)));
+        line.push_span(Span::styled(
+            marker.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if channel.has_unread {
         let gap = width.saturating_sub(line.width() + 1);
         line.push_span(Span::raw(" ".repeat(gap)));
         line.push_span(Span::styled(
