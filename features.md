@@ -119,7 +119,8 @@ mechanisms, not one, since they trade off differently:
   backfill (`backfill.rs`); the same blob transport generalizes to
   `/send <path>`, broadcasting a content hash + filename that peers fetch
   on demand (`/save <hash-prefix>`), the same way a history manifest is
-  fetched today. Receiving never downloads anything automatically; a saved
+  fetched today. Receiving never downloads anything unasked (bar a channel's opt-in
+  `/autosave`, below); a saved
   file lands in the OS Downloads folder (`files.rs`) -- in a folder of its
   channel's, see "Per-channel save folders" below.
 - [x] **Clipboard paste-to-share** -- `/paste` (or the `Ctrl+V` keybinding)
@@ -391,6 +392,88 @@ mechanisms, not one, since they trade off differently:
   raised for one deliberate send stays raised until `/maxsize default`. A
   size needs its unit (a bare `5` is refused) and only `B` to `TB` are read,
   1024 apart -- no `G`, `MiB` or the like. See LEY-25.8's notes.
+- [x] **Opt-in auto-save** -- receiving never downloads anything by
+  itself, on purpose: any channel member could otherwise fill your disk.
+  For a channel you trust, such as a private one between your own devices,
+  the manual `/save` is pure friction, so `/autosave on` makes it
+  unnecessary -- for that channel only, and off everywhere to begin with.
+  Which channels is a small `autosave` file in the data directory
+  (`autosave.rs`: a list of stored names, mirroring `channel_renames.rs`);
+  a corrupt one means off everywhere, the safe way to fail. A channel's
+  setting is forgotten when it is left -- main.rs does that first in the
+  leave sequence, so a crash midway leaves it off rather than stale -- and
+  by pairing's wipe, because a ticket's name is chosen by whoever shares
+  it and a setting that outlived its channel would switch downloads on in
+  a different room that reuses the name.
+  `AppState::auto_save` decides, and main.rs calls it for exactly one
+  thing: a message newly accepted off the network, in the live arm of the
+  event loop. History loaded at startup and history backfilled from a peer
+  never reach it, so a file shared before auto-save was on, before this
+  device joined, or while it was away is never fetched on its own, and
+  turning it on is not retroactive. "After it was enabled" is judged by
+  arrival, never by the message's timestamp, which its sender writes. A
+  message without a file, a file of our own, and any file in a channel
+  with auto-save off are none of its business and it says nothing.
+  Who may have a file saved without being asked is one predicate,
+  `is_trusted_peer`: one of your own devices (certified under your own
+  user key, which `display_name` already shows as "you"; a device
+  forgotten with `/forget-device` is not) or a peer you have given an alias
+  (which covers every device of that person). It is used twice, and the
+  second use is the one that matters. Nothing signs a chat message --
+  neither `net::forward_events` nor `direct::receive_loop` checks
+  `ChatMessage::sender` against anything -- so anyone in a channel can
+  claim to be your other device or an aliased friend. The claimed sender
+  therefore only decides whether to try at all, and to say why not; the
+  file is then asked only of peers that are themselves trusted, who are
+  known by their connection (iroh authenticates the endpoint id) rather
+  than by what a message says, and its bytes are checked by their hash.
+  A forged share leads to asking the real devices, which don't have the
+  blob, and fails.
+  The size is checked twice. A file announced as over the limit
+  (`files::AUTOSAVE_MAX_FILE_SIZE`, 25 MB -- not `/maxsize`, which limits
+  what you share) is skipped before any network is touched; and because
+  the announced size is only a number in a message,
+  `BackfillStore::fetch_file` reads the real one too: a blob already in
+  the store is measured there, and for any other the providers are asked
+  in turn for its verified size (`iroh_blobs::get::request::get_verified_size`,
+  which the protocol checks against the hash, so it can't be a lie)
+  before the downloader runs. Over the limit, nothing is downloaded, or
+  exported.
+  Both kinds of save go through one `SaveRequest` and main.rs's
+  `start_save` (claim a name with `files::resolve_destination`, hand over
+  to `Net::save_file`), and differ only in `files::SaveMode`: a manual
+  save is unbounded and answered in the channel you are in, as it always
+  was; an automatic one is bounded and answered in the channel its file
+  arrived in, wherever you are looking -- which is why `FileSaveFailed`
+  now names its channel, and what keeps a background channel's notice off
+  the one on screen. Sanitizing, `name (1).ext` and the record behind the
+  `/files` check mark are therefore the very same code as `/save`'s.
+  What it says goes to the file's channel, and each skip says why and
+  points to the `/save` that fetches the file by hand: `not auto-saving X
+  from <who>: auto-save only takes files from your own devices and the
+  peers you have aliased`, `not auto-saving X (80.0 MB): over the 25.0 MB
+  auto-save limit`, `not auto-saving X: this channel already has a saved
+  copy of it`; a file that landed says `auto-saved X to <path>`, a failure
+  `couldn't auto-save X: <why>`. There is no "saving..." line. A repeat is
+  dropped rather than saved again: a file the channel already holds
+  (`SavedFiles::is_saved`, asked by main.rs through a closure so app.rs
+  still touches no disk) or one still downloading (`auto_saving`, in
+  memory, cleared when it lands, fails or the channel is left) -- a
+  re-sent or replayed share is a new message, and would otherwise start a
+  download, and leave a `name (n).ext`, per copy.
+  Not covered, each left out on purpose for now: the limit is fixed, not
+  a setting (`/maxsize`'s machinery would do for one); there is no cap on
+  the total, so many files each within the limit still add up, held back
+  only by who is trusted and the repeat check; the sender of a chat
+  message is still unauthenticated, which this works around for downloads
+  but not for anything else, and a forged share of a file only a stranger
+  has just produces a failure notice; a sibling device's first file can
+  arrive before its device certificate does (gossip has no ordering), in
+  which case it is skipped, saying why, and `/save` fetches it; and
+  nothing is ever opened -- only `Ctrl+O` in the files overlay does that,
+  and auto-save never presses it. LEY-9 (verified identities) and LEY-10
+  (block a peer) are meant to feed `is_trusted_peer`: a blocked peer
+  should never be auto-saved. See LEY-26.1's notes.
 
 ## Networking & sharing
 

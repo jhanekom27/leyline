@@ -15,15 +15,29 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context;
 use iroh::{Endpoint, EndpointId};
+use iroh_blobs::api::proto::BlobStatus;
+use iroh_blobs::get::request::get_verified_size;
 use iroh_blobs::hashseq::HashSeq;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobFormat, BlobsProtocol, Hash, HashAndFormat};
 use tracing::{debug, warn};
 
+use crate::files::human_size;
 use crate::message::ChatMessage;
+
+/// What a save says when no provider could be reached or had the file.
+const NOBODY_HAS_IT: &str = "no reachable peer has it right now -- its sender may be offline";
+
+/// How long one provider gets to be reached and to say how big a file is
+/// (`verified_size`) before the next is tried. Generous next to the
+/// downloader's one-second connect timeout: this runs for a save nobody is
+/// waiting on, and a probe that gave up early would fail an auto-save that
+/// `/save` would have managed.
+const SIZE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A channel's canonical, sorted view of what's gone into its manifest so
 /// far, plus the manifest's current root hash.
@@ -282,41 +296,62 @@ impl BackfillStore {
     ///
     /// The ids come from peers' messages, so one that is not a valid key is
     /// skipped rather than failing the save for everyone else listed.
+    ///
+    /// `max_bytes`, if given, is the most the file may be -- of what it *is*,
+    /// never of what its sender announced, which is only a number in a
+    /// message. A file already in our own store is measured there; one that
+    /// is not is sized first by asking the providers (`verified_size`), and
+    /// nothing is downloaded -- nor, for the first, exported -- if it is over.
     pub async fn fetch_file(
         &self,
         endpoint: &Endpoint,
         hash: Hash,
         providers: &[[u8; 32]],
         destination: &Path,
+        max_bytes: Option<u64>,
     ) -> anyhow::Result<()> {
-        let held = self
+        let local = self
             .store
-            .remote()
-            .local(HashAndFormat::raw(hash))
+            .blobs()
+            .status(hash)
             .await
-            .map_err(|err| anyhow::anyhow!("failed to look for the file locally: {err}"))?
-            .is_complete();
+            .map_err(|err| anyhow::anyhow!("failed to look for the file locally: {err}"))?;
 
-        if !held {
-            let providers: Vec<EndpointId> = providers
-                .iter()
-                .filter_map(|id| EndpointId::from_bytes(id).ok())
-                .collect();
+        match local {
+            BlobStatus::Complete { size } => {
+                if let Some(limit) = max_bytes {
+                    ensure_within(size, limit)?;
+                }
+            }
+            BlobStatus::NotFound | BlobStatus::Partial { .. } => {
+                let mut providers: Vec<EndpointId> = providers
+                    .iter()
+                    .filter_map(|id| EndpointId::from_bytes(id).ok())
+                    .collect();
 
-            self.store
-                .downloader(endpoint)
-                .download(HashAndFormat::raw(hash), providers)
-                .await
-                .map_err(|err| {
-                    // The downloader only says it was "unable to download"
-                    // the hash once every provider has failed; what each
-                    // one answered stays in its own trace. Nobody can act
-                    // on that, so the user is told what is going on.
-                    debug!(%hash, "no provider served the file: {err}");
-                    anyhow::anyhow!(
-                        "no reachable peer has it right now -- its sender may be offline"
-                    )
-                })?;
+                if let Some(limit) = max_bytes {
+                    let (answered, size) = verified_size(endpoint, hash, &providers)
+                        .await
+                        .ok_or_else(|| anyhow::anyhow!(NOBODY_HAS_IT))?;
+                    ensure_within(size, limit)?;
+                    // The one that just answered has the file: ask it first.
+                    providers.retain(|id| *id != answered);
+                    providers.insert(0, answered);
+                }
+
+                self.store
+                    .downloader(endpoint)
+                    .download(HashAndFormat::raw(hash), providers)
+                    .await
+                    .map_err(|err| {
+                        // The downloader only says it was "unable to download"
+                        // the hash once every provider has failed; what each
+                        // one answered stays in its own trace. Nobody can act
+                        // on that, so the user is told what is going on.
+                        debug!(%hash, "no provider served the file: {err}");
+                        anyhow::anyhow!(NOBODY_HAS_IT)
+                    })?;
+            }
         }
 
         self.store
@@ -326,6 +361,47 @@ impl BackfillStore {
             .map_err(|err| anyhow::anyhow!("failed to write {}: {err}", destination.display()))?;
         Ok(())
     }
+}
+
+/// Refuses a file of `size` bytes if it is over `limit`, saying how big it is.
+fn ensure_within(size: u64, limit: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        size <= limit,
+        "it is {}, over the {} limit",
+        human_size(size),
+        human_size(limit)
+    );
+    Ok(())
+}
+
+/// How big the blob `hash` is, as the first of `providers` that can be
+/// reached and has it says -- and which one that was. The protocol checks the
+/// answer against the hash itself (only the blob's last chunk and its proof
+/// are read, none of its content), so unlike the size a peer wrote in a
+/// message it can't be a lie. `None` if no provider answers.
+async fn verified_size(
+    endpoint: &Endpoint,
+    hash: Hash,
+    providers: &[EndpointId],
+) -> Option<(EndpointId, u64)> {
+    for &provider in providers {
+        let probe = async {
+            let connection = endpoint
+                .connect(provider, iroh_blobs::ALPN)
+                .await
+                .map_err(|err| err.to_string())?;
+            get_verified_size(&connection, &hash)
+                .await
+                .map(|(size, _stats)| size)
+                .map_err(|err| err.to_string())
+        };
+        match tokio::time::timeout(SIZE_PROBE_TIMEOUT, probe).await {
+            Ok(Ok(size)) => return Some((provider, size)),
+            Ok(Err(err)) => debug!(%hash, %provider, "provider could not size the file: {err}"),
+            Err(_) => debug!(%hash, %provider, "provider took too long to size the file"),
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -543,8 +619,33 @@ mod tests {
             destination: &Path,
         ) -> anyhow::Result<()> {
             self.backfill
-                .fetch_file(self.router.endpoint(), hash, providers, destination)
+                .fetch_file(self.router.endpoint(), hash, providers, destination, None)
                 .await
+        }
+
+        /// What an auto-save does: `save`, but refusing a file of more than
+        /// `limit` bytes.
+        async fn save_within(
+            &self,
+            hash: Hash,
+            providers: &[[u8; 32]],
+            destination: &Path,
+            limit: u64,
+        ) -> anyhow::Result<()> {
+            self.backfill
+                .fetch_file(
+                    self.router.endpoint(),
+                    hash,
+                    providers,
+                    destination,
+                    Some(limit),
+                )
+                .await
+        }
+
+        /// Whether `hash` is anywhere in this peer's blob store, even in part.
+        async fn holds_any_of(&self, hash: Hash) -> bool {
+            self.backfill.store.blobs().status(hash).await.unwrap() != BlobStatus::NotFound
         }
 
         /// The peer going away: its endpoint closes and nothing answers on
@@ -738,6 +839,195 @@ mod tests {
         assert!(
             err.to_string().contains("no reachable peer has it"),
             "got: {err}"
+        );
+    }
+
+    /// Bigger than a store keeps inline in its database, like any real
+    /// share: 64 KiB.
+    fn big_file() -> Vec<u8> {
+        vec![7u8; 64 * 1024]
+    }
+
+    #[tokio::test]
+    async fn a_file_over_the_limit_is_refused_and_nothing_is_downloaded() {
+        let sender = TestPeer::start().await;
+        let receiver = TestPeer::start().await;
+        receiver.learn(&sender);
+        let hash = sender.share(&big_file()).await;
+
+        let downloads = tempfile::tempdir().unwrap();
+        let destination = downloads.path().join("big.bin");
+        let err = receiver
+            .save_within(hash, &[sender.id()], &destination, 1024)
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("64.0 KB") && message.contains("over the 1.0 KB limit"),
+            "it says how big the file is and what the limit was, got: {message}"
+        );
+        assert!(!destination.exists(), "nothing is written");
+        assert!(
+            !receiver.holds_any_of(hash).await,
+            "not a byte of it was downloaded into the store either"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_limit_is_exact() {
+        let sender = TestPeer::start().await;
+        let receiver = TestPeer::start().await;
+        receiver.learn(&sender);
+        let content = big_file();
+        let hash = sender.share(&content).await;
+        let size = content.len() as u64;
+
+        let downloads = tempfile::tempdir().unwrap();
+        let one_short = downloads.path().join("refused.bin");
+        receiver
+            .save_within(hash, &[sender.id()], &one_short, size - 1)
+            .await
+            .unwrap_err();
+        let exactly = downloads.path().join("exactly.bin");
+        receiver
+            .save_within(hash, &[sender.id()], &exactly, size)
+            .await
+            .unwrap();
+
+        assert!(!one_short.exists());
+        assert_eq!(std::fs::read(&exactly).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn a_file_within_the_limit_is_saved_like_any_other() {
+        let sender = TestPeer::start().await;
+        let receiver = TestPeer::start().await;
+        receiver.learn(&sender);
+        let hash = sender.share(b"small enough").await;
+
+        let downloads = tempfile::tempdir().unwrap();
+        let destination = downloads.path().join("small.txt");
+        receiver
+            .save_within(hash, &[sender.id()], &destination, 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"small enough");
+    }
+
+    #[tokio::test]
+    async fn the_limit_also_bounds_a_file_already_in_the_local_store() {
+        // Exporting a copy of what is already here still puts that many
+        // bytes on disk, so it is held to the limit like anything else.
+        let receiver = TestPeer::start().await;
+        let content = big_file();
+        let hash = receiver.share(&content).await;
+
+        let downloads = tempfile::tempdir().unwrap();
+        let refused = downloads.path().join("refused.bin");
+        let err = receiver
+            .save_within(hash, &[], &refused, 1024)
+            .await
+            .unwrap_err();
+        let allowed = downloads.path().join("allowed.bin");
+        receiver
+            .save_within(hash, &[], &allowed, 1 << 20)
+            .await
+            .unwrap();
+
+        assert!(
+            err.to_string().contains("over the 1.0 KB limit"),
+            "got: {err}"
+        );
+        assert!(!refused.exists());
+        assert_eq!(std::fs::read(&allowed).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_the_file_does_not_stop_it_being_sized_by_the_next() {
+        let bystander = TestPeer::start().await;
+        let holder = TestPeer::start().await;
+        let receiver = TestPeer::start().await;
+        receiver.learn(&bystander);
+        receiver.learn(&holder);
+        let content = big_file();
+        let hash = holder.share(&content).await;
+        let providers = [bystander.id(), holder.id()];
+
+        let downloads = tempfile::tempdir().unwrap();
+        let allowed = downloads.path().join("allowed.bin");
+        receiver
+            .save_within(hash, &providers, &allowed, 1 << 20)
+            .await
+            .unwrap();
+        let too_big = holder.share(b"x".repeat(4096).as_slice()).await;
+        let refused = downloads.path().join("refused.bin");
+        let err = receiver
+            .save_within(too_big, &providers, &refused, 1024)
+            .await
+            .unwrap_err();
+
+        assert_eq!(std::fs::read(&allowed).unwrap(), content);
+        assert!(
+            err.to_string().contains("over the 1.0 KB limit"),
+            "got: {err}"
+        );
+        assert!(!refused.exists());
+        assert!(
+            !receiver.holds_any_of(too_big).await,
+            "nothing over the limit reached the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_a_limit_a_file_nobody_has_still_says_no_reachable_peer_has_it() {
+        let bystander = TestPeer::start().await;
+        let receiver = TestPeer::start().await;
+        receiver.learn(&bystander);
+
+        let downloads = tempfile::tempdir().unwrap();
+        let destination = downloads.path().join("report.txt");
+        let err = receiver
+            .save_within(
+                Hash::new(b"held by no one"),
+                &[bystander.id()],
+                &destination,
+                1 << 20,
+            )
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("no reachable peer has it")
+                && message.contains("sender may be offline"),
+            "got: {message}"
+        );
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn with_a_limit_a_provider_id_that_is_not_a_valid_key_is_skipped() {
+        let invalid = (0..=u8::MAX)
+            .map(|byte| [byte; 32])
+            .find(|id| EndpointId::from_bytes(id).is_err())
+            .expect("some repeated-byte id is not a valid key");
+        let holder = TestPeer::start().await;
+        let receiver = TestPeer::start().await;
+        receiver.learn(&holder);
+        let hash = holder.share(b"served despite the junk id").await;
+
+        let downloads = tempfile::tempdir().unwrap();
+        let destination = downloads.path().join("report.txt");
+        receiver
+            .save_within(hash, &[invalid, holder.id()], &destination, 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"served despite the junk id"
         );
     }
 }

@@ -55,6 +55,28 @@ const MAX_COLLISION_ATTEMPTS: u32 = 1000;
 /// duplicated on disk locally.
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
 
+/// Largest file auto-save will fetch (`SaveMode::Automatic`): small enough
+/// that a few shares into a channel set to save them can't fill the disk, big
+/// enough for the documents, pictures and small archives passed between your
+/// own machines. Separate from `/maxsize`, which limits what you *share*, and
+/// not configurable yet -- anything bigger is still one `/save` away.
+pub const AUTOSAVE_MAX_FILE_SIZE: u64 = 25 * 1024 * 1024;
+
+/// How a save came about, which decides how far a file is trusted to be what
+/// its sender said it was, and where the outcome is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveMode {
+    /// Asked for by a person -- `/save`, or `Enter` in the files overlay --
+    /// who has the file's name and size in front of them. Nothing limits its
+    /// size, and the outcome is said in the channel they are in.
+    Manual,
+    /// Auto-save: nobody has looked at this file. It is refused above
+    /// `max_bytes` of what it *is* (`BackfillStore::fetch_file` checks the
+    /// verified size, never the one its sender announced), and the outcome is
+    /// said in the channel it arrived in, whichever one the user is looking at.
+    Automatic { max_bytes: u64 },
+}
+
 /// Where received files go until `set_files_root` says otherwise: the OS
 /// Downloads folder (via `directories::UserDirs`) under a `leyline/`
 /// subfolder, so a saved file ends up somewhere the user would actually

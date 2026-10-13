@@ -14,7 +14,8 @@ use iroh_blobs::Hash;
 use iroh_tickets::Ticket;
 
 use crate::files::{
-    DEFAULT_MAX_FILE_SIZE, SizeLimit, StagedAttachment, channel_dir, human_size, runs_when_opened,
+    AUTOSAVE_MAX_FILE_SIZE, DEFAULT_MAX_FILE_SIZE, SaveMode, SizeLimit, StagedAttachment,
+    channel_dir, human_size, runs_when_opened,
 };
 use crate::message::{ChatMessage, FileAttachment, now_unix_ms};
 use crate::net::{DEVICE_SYNC_CHANNEL, NetEvent};
@@ -509,6 +510,31 @@ impl Channel {
     }
 }
 
+/// A file to fetch and the folder to put it in -- what `/save`, `Enter` in
+/// the files overlay and auto-save all hand to main.rs once they have decided
+/// to download one, so the three can only differ in `mode`.
+///
+/// `channel`, `hash`, `filename`, `providers` and `dir` are worked out by
+/// `AppState::save_request` (a save someone asked for) or
+/// `AppState::auto_save` (one nobody did). `providers` are who to ask for it,
+/// best bet first: the file's sender, then the other peers known in its
+/// channel (see `providers_for`) -- for an automatic save, only those we
+/// trust. `dir` is the folder it is saved into: `channel`'s, under the files
+/// root (`files::channel_dir`). `channel` itself, its stored name, also rides
+/// along so that once the file has landed it can be recorded as saved *for
+/// that channel* (`saved_files`). The caller picks the file's name inside
+/// `dir` (`files::resolve_destination`) and performs the download
+/// (`net::Net::save_file`); app.rs never touches the filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveRequest {
+    pub channel: String,
+    pub hash: Hash,
+    pub filename: String,
+    pub providers: Vec<[u8; 32]>,
+    pub dir: PathBuf,
+    pub mode: SaveMode,
+}
+
 /// An action for the caller (`main.rs`) to perform in response to a
 /// keypress, since `AppState` itself never does network I/O.
 pub enum InputAction {
@@ -597,27 +623,18 @@ pub enum InputAction {
         items: Vec<StagedAttachment>,
         caption: String,
     },
-    /// Fetch a previously shared file and save it locally -- `channel`,
-    /// `hash`, `filename`, `providers` and `dir` already resolved by
-    /// `save_request`, for `run_save` (from a typed hash-prefix -- see
-    /// `resolve_attachment` -- or, with none, as the newest file in the
-    /// active channel -- see `newest_shared_file`) and for `Enter` in the
-    /// files overlay. `providers` are who to ask for it, best bet first: the
-    /// file's sender, then the other peers known in its channel (see
-    /// `providers_for`). `dir` is the folder it is saved into: `channel`'s,
-    /// under the files root (see `channel_of_file`). `channel` itself, its
-    /// stored name, only rides along, so that once the file has landed it
-    /// can be recorded as saved *for that channel* (`saved_files`). The
-    /// caller picks the file's name inside `dir`
-    /// (`files::resolve_destination`) and performs the download
-    /// (`net::Net::save_file`); app.rs never touches the filesystem.
-    SaveFile {
-        channel: String,
-        hash: Hash,
-        filename: String,
-        providers: Vec<[u8; 32]>,
-        dir: PathBuf,
-    },
+    /// Fetch a previously shared file and save it locally -- all of it
+    /// already resolved by `save_request`, for `run_save` (from a typed
+    /// hash-prefix -- see `resolve_attachment` -- or, with none, as the
+    /// newest file in the active channel -- see `newest_shared_file`) and for
+    /// `Enter` in the files overlay. See `SaveRequest`. (Auto-save hands the
+    /// caller a `SaveRequest` directly, from `auto_save`.)
+    SaveFile(SaveRequest),
+    /// Remember that auto-save is now on or off for `channel` (a stored
+    /// name), from `/autosave` (see `run_autosave`). Already applied to
+    /// `AppState`; the caller only needs to persist it
+    /// (`autosave::AutoSave::set`).
+    SetAutoSave { channel: String, on: bool },
     /// Move the files root -- the folder every channel's folder lives in --
     /// to the path exactly as typed after `/folder ` (see `run_folder`). The
     /// caller (`files::set_files_root`) expands, creates and remembers it,
@@ -803,6 +820,23 @@ pub struct AppState {
     /// sharing, so every route a file takes -- `/send <path>`, the picker, a
     /// drop, the clipboard -- answers to the same one.
     size_limit: SizeLimit,
+    /// The channels, by stored name, with auto-save on (`/autosave`) --
+    /// seeded at startup from what was remembered across restarts
+    /// (`load_autosave`) and changed by `/autosave on|off`. A channel not in
+    /// here never downloads anything by itself, which is how every channel
+    /// starts. Keyed by stored name like the channel's folder is, so
+    /// `remove_channel` forgets it: a ticket's name is chosen by whoever
+    /// shared it, and a setting that outlived its channel would switch
+    /// downloads on for a different room that reuses the name.
+    autosave: HashSet<String>,
+    /// The files an auto-save is fetching right now, by channel (stored
+    /// name) and content. A repeat of one of them -- a file sent twice, or a
+    /// share replayed by someone who can't be told from its sender -- is
+    /// dropped instead of starting a download per copy, which would leave a
+    /// `name (n).ext` for each. Not persisted: a download doesn't survive the
+    /// process. Cleared when the save finishes (`NetEvent::FileSaved`,
+    /// `save_failed`) and when the channel is left.
+    auto_saving: HashSet<(String, Hash)>,
     /// Counts the folder reads the picker has asked for (`ReadFolder`), so
     /// every one has an id of its own -- across pickers too, which is what
     /// keeps a slow answer to a closed picker's read from landing in the
@@ -880,6 +914,8 @@ impl AppState {
             browse_dir: PathBuf::from(std::path::MAIN_SEPARATOR_STR),
             files_root: PathBuf::from(std::path::MAIN_SEPARATOR_STR),
             size_limit: SizeLimit::Default,
+            autosave: HashSet::new(),
+            auto_saving: HashSet::new(),
             browse_requests: 0,
         }
     }
@@ -964,6 +1000,14 @@ impl AppState {
     /// `load_files_root`.
     pub fn load_size_limit(&mut self, limit: SizeLimit) {
         self.size_limit = limit;
+    }
+
+    /// Seeds the channels with auto-save on (see `autosave::AutoSave`, which
+    /// holds what was remembered across restarts). Intended to be called
+    /// once, right after `AppState::new`, before the event loop starts --
+    /// mirrors `load_renames`.
+    pub fn load_autosave(&mut self, channels: HashSet<String>) {
+        self.autosave = channels;
     }
 
     /// How big a file may be to share right now (`/maxsize`).
@@ -2008,9 +2052,10 @@ impl AppState {
                 }
                 None
             }
-            // A `/save`d file finished downloading -- see
+            // A saved file finished downloading -- see
             // `net::Net::save_file`. main.rs has already recorded where it
-            // went (`saved_files`); what is left is the notice, and, if the
+            // went (`saved_files`); what is left is the notice -- said where
+            // the save's `mode` says (`finish_save`) -- and, if the
             // files overlay is open on the channel it was saved for, the
             // check mark -- put there now rather than at the overlay's next
             // opening.
@@ -2019,13 +2064,20 @@ impl AppState {
                 hash,
                 filename,
                 path,
+                mode,
             } => {
                 if let Some(overlay) = &mut self.viewing_files
                     && overlay.channel == channel
                 {
                     overlay.saved.insert(hash, path.clone());
                 }
-                self.push_system(format!("saved {filename} to {}", path.display()));
+                let notice = match mode {
+                    SaveMode::Manual => format!("saved {filename} to {}", path.display()),
+                    SaveMode::Automatic { .. } => {
+                        format!("auto-saved {filename} to {}", path.display())
+                    }
+                };
+                self.finish_save(&channel, hash, mode, notice);
                 None
             }
             // Handled in main.rs before reaching here: `Announce` triggers
@@ -2062,10 +2114,11 @@ impl AppState {
     }
 
     /// Removes `channel`'s tab and all its in-memory state (transcript,
-    /// presence, dedupe buffers, any DM or point-to-point association, and
-    /// any `/rename` display name -- left behind, the former would
-    /// misclassify and the latter mislabel a later channel that happens to
-    /// reuse the name, see `channel_kind`/`channel_label`) -- called once the
+    /// presence, dedupe buffers, any DM or point-to-point association, any
+    /// `/rename` display name, and its auto-save setting -- left behind, the
+    /// first would misclassify, the second mislabel and the third switch
+    /// downloads on in a later channel that happens to reuse the name, see
+    /// `channel_kind`/`channel_label`/`autosave`) -- called once the
     /// caller has actually torn down its gossip subscription and persisted
     /// state (see `InputAction::Leave`). Adjusts `active` to keep pointing
     /// at the same tab if it was after the removed one, or lands on the
@@ -2094,6 +2147,8 @@ impl AppState {
         self.dm_channels.retain(|_, name| name != channel);
         self.direct_channels.retain(|_, name| name != channel);
         self.renames.remove(channel);
+        self.autosave.remove(channel);
+        self.auto_saving.retain(|(name, _)| name != channel);
         self.channels.remove(index);
         if self.active > index {
             self.active -= 1;
@@ -2247,6 +2302,54 @@ impl AppState {
     /// network.
     pub fn push_system(&mut self, text: impl Into<String>) {
         self.active_mut().push(TranscriptLine::System(text.into()));
+    }
+
+    /// Appends a local-only system notice to `channel`'s transcript, wherever
+    /// the user happens to be looking -- for what concerns one channel and
+    /// happens without anyone having asked just now (auto-save). A no-op if
+    /// `channel` isn't joined, which is only the case once it has been left.
+    fn push_system_to(&mut self, channel: &str, text: impl Into<String>) {
+        if let Some(channel) = self.channel_mut(channel) {
+            channel.push(TranscriptLine::System(text.into()));
+        }
+    }
+
+    /// Says that a save is over, and how it went (`notice`), where its `mode`
+    /// puts it: a save someone asked for is answered in the channel they are
+    /// in, as it always was; an automatic one in the channel its file arrived
+    /// in -- and is no longer in flight, so the same file can be saved again
+    /// (`auto_saving`).
+    fn finish_save(&mut self, channel: &str, hash: Hash, mode: SaveMode, notice: String) {
+        match mode {
+            SaveMode::Manual => self.push_system(notice),
+            SaveMode::Automatic { .. } => {
+                self.auto_saving.remove(&(channel.to_string(), hash));
+                self.push_system_to(channel, notice);
+            }
+        }
+    }
+
+    /// Says that a save didn't happen -- the download failed
+    /// (`NetEvent::FileSaveFailed`) or there was nowhere to put the file
+    /// (main.rs's `start_save`) -- `error` being the reason. A save someone
+    /// asked for says so exactly as it always did; an automatic one says
+    /// which file and how to fetch it by hand, in the channel it arrived in.
+    pub fn save_failed(
+        &mut self,
+        channel: &str,
+        hash: Hash,
+        filename: &str,
+        error: &str,
+        mode: SaveMode,
+    ) {
+        let notice = match mode {
+            SaveMode::Manual => format!("failed to save {filename}: {error}"),
+            SaveMode::Automatic { .. } => format!(
+                "couldn't auto-save {filename}: {error} -- {} to download it yourself",
+                save_hint(hash)
+            ),
+        };
+        self.finish_save(channel, hash, mode, notice);
     }
 
     /// Moves `active` forward (`step = 1`) or backward (`step = -1`)
@@ -2407,6 +2510,7 @@ impl AppState {
             "save" => self.run_save(arg.trim()),
             "folder" => self.run_folder(arg.trim()),
             "maxsize" => self.run_maxsize(arg.trim()),
+            "autosave" => self.run_autosave(arg.trim()),
             "files" => self.run_files(),
             "paste" => self.run_paste(),
             "search" | "s" => self.run_search(arg.trim()),
@@ -2444,11 +2548,13 @@ impl AppState {
     /// `ui::render_input`) to stay uncluttered, so this is where that
     /// detail actually lives.
     fn run_help(&mut self) -> Option<InputAction> {
-        self.push_system(
+        let autosave_limit = human_size(AUTOSAVE_MAX_FILE_SIZE);
+        self.push_system(format!(
             "commands: /join <name|ticket>, /invite, /pair [ticket], /forget-device <hex-prefix>, \
              /msg <alias|hex-prefix> [text], /dm <alias|hex-prefix|endpoint-id> [text], \
              /leave [channel], /rename [name], /who, /send [path], \
-             /save [hash-prefix], /folder [path], /maxsize [size|off|default], /files, /paste, \
+             /save [hash-prefix], /folder [path], /maxsize [size|off|default], \
+             /autosave [on|off], /files, /paste, \
              /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
              ticket for a new device to redeem, /pair <ticket> redeems one (after an \
@@ -2457,6 +2563,7 @@ impl AppState {
              unlike /msg -- /save keeps each channel's files in a folder of its own, \
              /folder shows where and, with a path, moves them all -- \
              /maxsize shows the biggest file you can share (500 MB to begin with) and, with a size like 2GB, changes it (off lifts it, default restores it) -- \
+             /autosave on saves the files your own devices and the peers you have aliased share in this channel as they arrive, up to {autosave_limit}, with no command (off by default, per channel; files from before, and from anyone else, are never fetched this way) -- \
              /files lists the files shared in this channel (type to filter, \u{2191}/\u{2193} pick, \
              Enter save, Ctrl+O open one already saved (never a program or script), Esc close) -- \
              keys: Tab/Shift+Tab switch channels, \
@@ -2467,8 +2574,8 @@ impl AppState {
              first: Enter sends it, Backspace on an empty input unstages, Esc clears), \
              Ctrl+R reply (\u{2191}/\u{2193} pick, \
              Enter confirm), Ctrl+T thread (\u{2191}/\u{2193} pick, Enter confirm), \
-             Up/Down scroll, Esc/Ctrl+C quit",
-        );
+             Up/Down scroll, Esc/Ctrl+C quit"
+        ));
         None
     }
 
@@ -3131,7 +3238,9 @@ impl AppState {
     /// differ. `filename` and `sender` are as `resolve_attachment` gives
     /// them. The file is asked of its sender first and then of every other
     /// peer known where it was shared (`providers_for`), and goes into the
-    /// folder (`files::channel_dir`) of `channel`, a stored name.
+    /// folder (`files::channel_dir`) of `channel`, a stored name. Someone
+    /// asked for this file and can see what it is, so it is a
+    /// `SaveMode::Manual` save: no limit on its size.
     fn save_request(
         &mut self,
         channel: String,
@@ -3142,13 +3251,118 @@ impl AppState {
         let providers = self.providers_for(hash, sender);
         let dir = channel_dir(&self.files_root, &channel);
         self.push_system(format!("saving {filename}..."));
-        InputAction::SaveFile {
+        InputAction::SaveFile(SaveRequest {
             channel,
             hash,
             filename,
             providers,
             dir,
+            mode: SaveMode::Manual,
+        })
+    }
+
+    /// Decides what to do about a file that has just arrived live in
+    /// `channel` (a stored name). main.rs calls this for each message newly
+    /// accepted off the network (`handle_net_event`), and for nothing else:
+    /// history loaded at startup and history backfilled from a peer never
+    /// come here, so a file shared before this session, while auto-save was
+    /// off, or before this device joined is never fetched on its own.
+    /// `already_saved` says whether the channel's folder already holds a copy
+    /// of a file, which app.rs can't look at.
+    ///
+    /// Only a file from another device, in a channel with auto-save on
+    /// (`/autosave`), is any concern of this; for anything else it says
+    /// nothing. For one that is, it says why and stops when the sender isn't
+    /// trusted (`is_trusted_peer`), the file is over the limit
+    /// (`AUTOSAVE_MAX_FILE_SIZE`) or the channel already holds a copy, and
+    /// otherwise returns the `SaveRequest`. Every notice goes to `channel`'s
+    /// transcript, wherever the user is looking, and points to the `/save`
+    /// that fetches the file by hand.
+    ///
+    /// `message.sender` is only what the sender wrote: nothing signs a chat
+    /// message, so anyone in the channel can claim to be someone else. It
+    /// decides whether to try at all and is not what keeps strangers out --
+    /// the providers are. The file is only ever asked of peers that are
+    /// themselves trusted, who are known by the connection to them rather
+    /// than by what a message says, so a forged share of a file that only a
+    /// stranger has fetches nothing. The download is refused, too, if the
+    /// file turns out bigger than its sender said (`SaveMode::Automatic`).
+    pub fn auto_save(
+        &mut self,
+        channel: &str,
+        message: &ChatMessage,
+        already_saved: impl Fn(Hash) -> bool,
+    ) -> Option<SaveRequest> {
+        let file = message.attachment.as_ref()?;
+        if message.sender == self.self_id || !self.autosave.contains(channel) {
+            return None;
         }
+        let hash = file.hash;
+        let by_hand = format!("{} to download it yourself", save_hint(hash));
+        if !self.is_trusted_peer(&message.sender) {
+            self.push_system_to(
+                channel,
+                format!(
+                    "not auto-saving {} from {}: auto-save only takes files from your own devices and the peers you have aliased -- {by_hand}",
+                    file.filename,
+                    self.display_name(&message.sender)
+                ),
+            );
+            return None;
+        }
+        if file.size > AUTOSAVE_MAX_FILE_SIZE {
+            self.push_system_to(
+                channel,
+                format!(
+                    "not auto-saving {} ({}): over the {} auto-save limit -- {by_hand}",
+                    file.filename,
+                    human_size(file.size),
+                    human_size(AUTOSAVE_MAX_FILE_SIZE)
+                ),
+            );
+            return None;
+        }
+        if already_saved(hash) {
+            self.push_system_to(
+                channel,
+                format!(
+                    "not auto-saving {}: this channel already has a saved copy of it",
+                    file.filename
+                ),
+            );
+            return None;
+        }
+        if !self.auto_saving.insert((channel.to_string(), hash)) {
+            // The same file is being fetched right now: its notice will come.
+            return None;
+        }
+        let providers = self
+            .providers_for(hash, message.sender)
+            .into_iter()
+            .filter(|id| self.is_trusted_peer(id))
+            .collect();
+        Some(SaveRequest {
+            channel: channel.to_string(),
+            hash,
+            filename: file.filename.clone(),
+            providers,
+            dir: channel_dir(&self.files_root, channel),
+            mode: SaveMode::Automatic {
+                max_bytes: AUTOSAVE_MAX_FILE_SIZE,
+            },
+        })
+    }
+
+    /// Whether files from `id` may be saved without anyone asking: one of our
+    /// own devices -- certified under our own user key, so it resolves
+    /// (`canonical_id`) to `self_user_id`; a device forgotten with
+    /// `/forget-device` doesn't -- or a peer we have given an alias
+    /// (`petnames`, keyed by the same resolved identity, so an alias set on
+    /// any one of a person's devices covers them all). The one answer both
+    /// halves of auto-save go by (`auto_save`).
+    fn is_trusted_peer(&self, id: &[u8; 32]) -> bool {
+        let identity = self.canonical_id(id);
+        identity == self.self_user_id || self.petnames.contains_key(&identity)
     }
 
     /// Handles `/folder [path]`: `arg` is everything after `/folder `
@@ -3197,6 +3411,56 @@ impl AppState {
                 self.push_system(message);
                 None
             }
+        }
+    }
+
+    /// Handles `/autosave [on|off]`: `arg` is everything after `/autosave `
+    /// (already trimmed). With nothing, says whether auto-save is on for the
+    /// active channel -- it is off until turned on, for every channel -- and
+    /// what it would do. With `on` or `off`, switches it for the active
+    /// channel (a group channel, `/msg` DM or `/dm` chat alike) and asks the
+    /// caller to remember it (`InputAction::SetAutoSave`), but only if that
+    /// changed anything: asking for what already holds writes nothing.
+    /// Anything else is usage, and changes nothing.
+    fn run_autosave(&mut self, arg: &str) -> Option<InputAction> {
+        let channel = self.active().name.clone();
+        let on = match arg {
+            "" => {
+                self.push_system(self.autosave_notice(&channel));
+                return None;
+            }
+            "on" => true,
+            "off" => false,
+            _ => {
+                self.push_system("usage: /autosave [on|off]");
+                return None;
+            }
+        };
+        let changed = if on {
+            self.autosave.insert(channel.clone())
+        } else {
+            self.autosave.remove(&channel)
+        };
+        self.push_system(self.autosave_notice(&channel));
+        changed.then_some(InputAction::SetAutoSave { channel, on })
+    }
+
+    /// What `/autosave` says about `channel`: whether auto-save is on for it,
+    /// whose files it takes, up to how big, and where they go -- the same
+    /// words for asking and for having just switched it.
+    fn autosave_notice(&self, channel: &str) -> String {
+        let heading = self.channel_heading(channel);
+        let limit = human_size(AUTOSAVE_MAX_FILE_SIZE);
+        let folder = channel_dir(&self.files_root, channel);
+        let folder = folder.display();
+        if self.autosave.contains(channel) {
+            format!(
+                "auto-save is on for {heading} -- files from your own devices and the peers you have aliased, up to {limit}, are saved into {folder} as they arrive; /autosave off turns it off"
+            )
+        } else {
+            format!(
+                "auto-save is off for {heading} -- /autosave on saves files from your own devices and the peers you have aliased, up to {limit}, into {folder} as they arrive"
+            )
         }
     }
 
@@ -3707,6 +3971,13 @@ fn strip_quotes(arg: &str) -> &str {
         && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
             || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''));
     if quoted { &arg[1..arg.len() - 1] } else { arg }
+}
+
+/// The command that downloads the file `hash` by hand -- what a notice about
+/// a file that was not saved automatically points to, in the words the
+/// transcript's own line for the file uses (`ui::attachment_line`).
+fn save_hint(hash: Hash) -> String {
+    format!("/save {}", &hash.to_hex()[..8])
 }
 
 /// The next id of `counter`, which counts the folder reads the file picker
@@ -6247,15 +6518,15 @@ mod tests {
         let action = submit(&mut app, &format!("/save {}", &full_hash[..8]));
 
         match action.expect("a successful /save returns an action") {
-            InputAction::SaveFile {
-                hash: resolved_hash,
-                filename,
-                providers,
-                ..
-            } => {
-                assert_eq!(resolved_hash, hash);
-                assert_eq!(filename, "report.pdf");
-                assert_eq!(providers, vec![PEER_ID]);
+            InputAction::SaveFile(request) => {
+                assert_eq!(request.hash, hash);
+                assert_eq!(request.filename, "report.pdf");
+                assert_eq!(request.providers, vec![PEER_ID]);
+                assert_eq!(
+                    request.mode,
+                    SaveMode::Manual,
+                    "someone asked for it and can see it: no limit on its size"
+                );
             }
             _ => panic!("expected InputAction::SaveFile"),
         }
@@ -6308,12 +6579,7 @@ mod tests {
     /// else.
     fn save_request(action: Option<InputAction>) -> (Hash, String, Vec<[u8; 32]>) {
         match action.expect("a /save with a file to save returns an action") {
-            InputAction::SaveFile {
-                hash,
-                filename,
-                providers,
-                ..
-            } => (hash, filename, providers),
+            InputAction::SaveFile(request) => (request.hash, request.filename, request.providers),
             _ => panic!("expected InputAction::SaveFile"),
         }
     }
@@ -6322,7 +6588,7 @@ mod tests {
     /// else.
     fn save_dir(action: Option<InputAction>) -> PathBuf {
         match action.expect("a /save with a file to save returns an action") {
-            InputAction::SaveFile { dir, .. } => dir,
+            InputAction::SaveFile(request) => request.dir,
             _ => panic!("expected InputAction::SaveFile"),
         }
     }
@@ -6677,7 +6943,7 @@ mod tests {
         let by_prefix = submit(&mut app, &format!("/save {prefix}"));
 
         let channel_of = |action: Option<InputAction>| match action.expect("saves a file") {
-            InputAction::SaveFile { channel, .. } => channel,
+            InputAction::SaveFile(request) => request.channel,
             _ => panic!("expected InputAction::SaveFile"),
         };
         assert_eq!(channel_of(bare), "random");
@@ -7063,8 +7329,11 @@ mod tests {
             error: "no such file".to_string(),
         });
         app.handle_net_event(NetEvent::FileSaveFailed {
+            channel: "general".to_string(),
+            hash: iroh_blobs::Hash::new(b"report"),
             filename: "report.pdf".to_string(),
             error: "boom".to_string(),
+            mode: SaveMode::Manual,
         });
 
         assert_eq!(app.active().messages.len(), before);
@@ -7078,6 +7347,7 @@ mod tests {
             hash: iroh_blobs::Hash::new(b"report"),
             filename: "report.pdf".to_string(),
             path: std::path::PathBuf::from("/home/alice/Downloads/leyline/report.pdf"),
+            mode: SaveMode::Manual,
         });
         let last = as_system(app.active().messages.back().unwrap());
         assert_eq!(
@@ -8907,13 +9177,13 @@ mod tests {
     /// overlay asks for with what `/save` asks for.
     fn save_fields(action: Option<InputAction>) -> (String, Hash, String, Vec<[u8; 32]>, PathBuf) {
         match action.expect("a save returns an action") {
-            InputAction::SaveFile {
-                channel,
-                hash,
-                filename,
-                providers,
-                dir,
-            } => (channel, hash, filename, providers, dir),
+            InputAction::SaveFile(request) => (
+                request.channel,
+                request.hash,
+                request.filename,
+                request.providers,
+                request.dir,
+            ),
             _ => panic!("expected InputAction::SaveFile"),
         }
     }
@@ -9847,6 +10117,7 @@ mod tests {
             hash: hash_of(b"report"),
             filename: "report.pdf".to_string(),
             path: PathBuf::from("/files/general/report.pdf"),
+            mode: SaveMode::Manual,
         });
 
         assert_eq!(
@@ -9870,6 +10141,7 @@ mod tests {
             hash: hash_of(b"report"),
             filename: "report.pdf".to_string(),
             path: PathBuf::from("/files/general/report.pdf"),
+            mode: SaveMode::Manual,
         });
 
         assert_eq!(
@@ -10133,5 +10405,745 @@ mod tests {
             app.switcher_matches().is_empty(),
             "the stored name is not searched"
         );
+    }
+
+    // -- auto-save ------------------------------------------------------------
+    // `/autosave` and `auto_save`. Most of these start from
+    // `app_with_autosave`: `general` (active) with auto-save on and the files
+    // root at `/files`.
+
+    fn app_with_autosave() -> AppState {
+        let mut app = app();
+        app.load_files_root(PathBuf::from("/files"));
+        app.load_autosave(HashSet::from(["general".to_string()]));
+        app
+    }
+
+    /// `SaveMode` of every auto-save.
+    fn automatic() -> SaveMode {
+        SaveMode::Automatic {
+            max_bytes: AUTOSAVE_MAX_FILE_SIZE,
+        }
+    }
+
+    /// What main.rs does with a message off the network: hands it to the
+    /// app and -- only if that made it a new line in the transcript -- asks
+    /// what auto-save makes of it, with nothing yet saved on disk.
+    fn arrive(app: &mut AppState, channel: &str, message: ChatMessage) -> Option<SaveRequest> {
+        let (channel, message) =
+            app.handle_net_event(NetEvent::Received(channel.to_string(), message))?;
+        app.auto_save(&channel, &message, |_| false)
+    }
+
+    /// Gives `app` a user key of its own and returns it, so that devices can
+    /// be certified under it.
+    fn own_user_key(app: &mut AppState) -> SecretKey {
+        let key = SecretKey::generate();
+        app.load_self_user_id(*key.public().as_bytes());
+        key
+    }
+
+    /// Certifies `device` under `key`, as its own announcement would.
+    fn certify(app: &mut AppState, key: &SecretKey, device: [u8; 32]) {
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(key, device),
+        ));
+    }
+
+    /// The newest line in `channel`'s transcript, which must be a notice.
+    fn newest_notice<'a>(app: &'a AppState, channel: &str) -> &'a str {
+        let channel = app
+            .channels
+            .iter()
+            .find(|c| c.name == channel)
+            .expect("a joined channel");
+        as_system(channel.messages.back().expect("a line in the transcript"))
+    }
+
+    /// How many notices `channel`'s transcript holds.
+    fn notices_in(app: &AppState, channel: &str) -> usize {
+        app.channels
+            .iter()
+            .find(|c| c.name == channel)
+            .expect("a joined channel")
+            .messages
+            .iter()
+            .filter(|line| matches!(line, TranscriptLine::System(_)))
+            .count()
+    }
+
+    /// A file message from `sender` that announces `size` bytes, whatever
+    /// the file really holds.
+    fn file_message_of_size(id: u64, sender: [u8; 32], filename: &str, size: u64) -> ChatMessage {
+        let mut message = file_message(id, sender, filename, filename.as_bytes());
+        message.attachment.as_mut().unwrap().size = size;
+        message
+    }
+
+    /// The first eight hex digits of the hash `file_message` gives `content`,
+    /// which is what a `/save` hint names.
+    fn hint_prefix(content: &[u8]) -> String {
+        hash_of(content).to_hex()[..8].to_string()
+    }
+
+    fn alice() -> HashMap<[u8; 32], String> {
+        HashMap::from([(PEER_ID, "Alice".to_string())])
+    }
+
+    #[test]
+    fn auto_save_is_off_until_it_is_turned_on_and_a_bare_command_says_so() {
+        let mut app = app();
+        app.load_files_root(PathBuf::from("/files"));
+
+        let action = submit(&mut app, "/autosave");
+
+        assert!(action.is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(
+            last.starts_with("auto-save is off for #general"),
+            "got: {last}"
+        );
+        assert!(last.contains("25.0 MB"), "the limit, got: {last}");
+        assert!(last.contains("/files/general"), "the folder, got: {last}");
+        assert!(
+            last.contains("/autosave on"),
+            "how to turn it on, got: {last}"
+        );
+    }
+
+    #[test]
+    fn autosave_on_switches_it_on_for_the_active_channel_and_asks_to_remember_it() {
+        let mut app = app();
+
+        match submit(&mut app, "/autosave on") {
+            Some(InputAction::SetAutoSave { channel, on }) => {
+                assert_eq!(channel, "general");
+                assert!(on);
+            }
+            _ => panic!("expected InputAction::SetAutoSave"),
+        }
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(
+            last.starts_with("auto-save is on for #general"),
+            "got: {last}"
+        );
+        assert!(last.contains("/autosave off"), "got: {last}");
+
+        // A bare command agrees.
+        assert!(submit(&mut app, "/autosave").is_none());
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(
+            last.starts_with("auto-save is on for #general"),
+            "got: {last}"
+        );
+    }
+
+    #[test]
+    fn autosave_off_switches_it_off_again_and_asks_to_remember_that_too() {
+        let mut app = app_with_autosave();
+
+        match submit(&mut app, "/autosave off") {
+            Some(InputAction::SetAutoSave { channel, on }) => {
+                assert_eq!(channel, "general");
+                assert!(!on);
+            }
+            _ => panic!("expected InputAction::SetAutoSave"),
+        }
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(
+            last.starts_with("auto-save is off for #general"),
+            "got: {last}"
+        );
+    }
+
+    #[test]
+    fn asking_for_what_already_holds_remembers_nothing_but_still_says_it() {
+        let mut app = app();
+
+        assert!(submit(&mut app, "/autosave off").is_none(), "already off");
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.starts_with("auto-save is off"), "got: {last}");
+
+        assert!(submit(&mut app, "/autosave on").is_some());
+        assert!(submit(&mut app, "/autosave on").is_none(), "already on");
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.starts_with("auto-save is on"), "got: {last}");
+    }
+
+    #[test]
+    fn auto_save_is_per_channel() {
+        let mut app = multi_channel_app(); // "random" is active
+
+        submit(&mut app, "/autosave on");
+        app.active = 0; // general
+        submit(&mut app, "/autosave");
+
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(
+            last.starts_with("auto-save is off for #general"),
+            "got: {last}"
+        );
+    }
+
+    #[test]
+    fn auto_save_can_be_switched_on_in_a_conversation_and_names_it_by_its_heading() {
+        let mut app = app_for_the_switcher();
+        app.active = 1; // the /msg DM, shown as Alice
+
+        match submit(&mut app, "/autosave on") {
+            Some(InputAction::SetAutoSave { channel, on }) => {
+                assert_eq!(channel, "dm-Alice", "by stored name, like its folder");
+                assert!(on);
+            }
+            _ => panic!("expected InputAction::SetAutoSave"),
+        }
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(
+            last.starts_with("auto-save is on for @Alice"),
+            "got: {last}"
+        );
+    }
+
+    #[test]
+    fn a_bad_autosave_argument_is_usage_and_changes_nothing() {
+        let mut app = app();
+
+        for typed in ["maybe", "on off", "ON"] {
+            let action = submit(&mut app, &format!("/autosave {typed}"));
+
+            assert!(action.is_none(), "{typed}");
+            let last = as_system(app.active().messages.back().unwrap());
+            assert_eq!(last, "usage: /autosave [on|off]", "{typed}");
+        }
+        assert!(app.autosave.is_empty());
+    }
+
+    #[test]
+    fn load_autosave_seeds_the_channels_that_have_it_on() {
+        let mut app = multi_channel_app();
+
+        app.load_autosave(HashSet::from(["general".to_string()]));
+
+        submit(&mut app, "/autosave"); // random is active
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(
+            last.starts_with("auto-save is off for #random"),
+            "got: {last}"
+        );
+        app.active = 0;
+        submit(&mut app, "/autosave");
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(
+            last.starts_with("auto-save is on for #general"),
+            "got: {last}"
+        );
+    }
+
+    #[test]
+    fn help_lists_autosave_and_its_limit() {
+        let mut app = app();
+
+        submit(&mut app, "/help");
+
+        let last = as_system(app.active().messages.back().unwrap());
+        assert!(last.contains("/autosave [on|off]"), "got: {last}");
+        assert!(
+            last.contains(&format!("up to {}", human_size(AUTOSAVE_MAX_FILE_SIZE))),
+            "got: {last}"
+        );
+    }
+
+    #[test]
+    fn a_file_from_one_of_our_own_devices_is_saved() {
+        let mut app = app_with_autosave();
+        let key = own_user_key(&mut app);
+        certify(&mut app, &key, PEER_ID);
+
+        let request = arrive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        )
+        .expect("our own device is trusted");
+
+        assert_eq!(
+            request,
+            SaveRequest {
+                channel: "general".to_string(),
+                hash: hash_of(b"report"),
+                filename: "report.pdf".to_string(),
+                providers: vec![PEER_ID],
+                dir: PathBuf::from("/files/general"),
+                mode: automatic(),
+            }
+        );
+        assert_eq!(
+            notices_in(&app, "general"),
+            0,
+            "nothing to say until it has landed"
+        );
+    }
+
+    #[test]
+    fn a_file_from_a_peer_we_have_aliased_is_saved() {
+        let mut app = app_with_autosave();
+        app.load_contacts(alice());
+
+        let request = arrive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+
+        assert_eq!(request.expect("Alice is aliased").providers, vec![PEER_ID]);
+    }
+
+    #[test]
+    fn an_alias_covers_every_device_of_that_person() {
+        let mut app = app_with_autosave();
+        let their_key = SecretKey::generate();
+        for device in [PEER_ID, PEER_ID_2] {
+            app.handle_net_event(NetEvent::Device(
+                "general".to_string(),
+                device_cert(&their_key, device),
+            ));
+        }
+        // Given to one of their devices; kept under who they are.
+        app.load_contacts(HashMap::from([(
+            app.canonical_id(&PEER_ID),
+            "Jurgen".to_string(),
+        )]));
+
+        let request = arrive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID_2, "report.pdf", b"report"),
+        );
+
+        assert!(request.is_some());
+    }
+
+    #[test]
+    fn a_file_from_a_stranger_is_skipped_and_says_why() {
+        let mut app = app_with_autosave();
+
+        let request = arrive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+
+        assert!(request.is_none());
+        let notice = newest_notice(&app, "general");
+        assert!(
+            notice.starts_with("not auto-saving report.pdf from "),
+            "got: {notice}"
+        );
+        assert!(notice.contains(&hex_prefix(&PEER_ID)), "who, got: {notice}");
+        assert!(
+            notice.contains("your own devices and the peers you have aliased"),
+            "why, got: {notice}"
+        );
+        assert!(
+            notice.contains(&format!(
+                "/save {} to download it yourself",
+                hint_prefix(b"report")
+            )),
+            "the way out, got: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_device_we_forgot_is_no_longer_one_of_our_own() {
+        let mut app = app_with_autosave();
+        let key = own_user_key(&mut app);
+        certify(&mut app, &key, PEER_ID);
+        app.load_forgotten_devices(HashSet::from([PEER_ID]));
+
+        let request = arrive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+
+        assert!(request.is_none());
+        assert!(newest_notice(&app, "general").starts_with("not auto-saving report.pdf"));
+    }
+
+    #[test]
+    fn a_file_from_ourselves_is_never_auto_saved_and_nothing_is_said() {
+        let mut app = app_with_autosave();
+
+        let request = arrive(
+            &mut app,
+            "general",
+            file_message(1, SELF_ID, "report.pdf", b"report"),
+        );
+
+        assert!(request.is_none());
+        assert_eq!(notices_in(&app, "general"), 0);
+    }
+
+    #[test]
+    fn a_message_without_a_file_is_none_of_auto_saves_business() {
+        let mut app = app_with_autosave();
+        app.load_contacts(alice());
+
+        let request = arrive(&mut app, "general", compose_message(PEER_ID, "hello", None));
+
+        assert!(request.is_none());
+        assert_eq!(notices_in(&app, "general"), 0);
+    }
+
+    #[test]
+    fn nothing_is_saved_or_said_while_auto_save_is_off() {
+        let mut app = app();
+        app.load_contacts(alice());
+
+        let request = arrive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+
+        assert!(request.is_none());
+        assert_eq!(notices_in(&app, "general"), 0);
+    }
+
+    #[test]
+    fn a_file_over_the_limit_is_skipped_with_its_size_and_the_way_to_fetch_it() {
+        let mut app = app_with_autosave();
+        app.load_contacts(alice());
+        let message = file_message_of_size(1, PEER_ID, "video.mov", 80 * 1024 * 1024);
+        let prefix = message.attachment.as_ref().unwrap().hash.to_hex()[..8].to_string();
+
+        let request = arrive(&mut app, "general", message);
+
+        assert!(request.is_none());
+        let notice = newest_notice(&app, "general");
+        assert!(notice.contains("video.mov (80.0 MB)"), "got: {notice}");
+        assert!(
+            notice.contains("over the 25.0 MB auto-save limit"),
+            "got: {notice}"
+        );
+        assert!(
+            notice.contains(&format!("/save {prefix} to download it yourself")),
+            "got: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_file_exactly_at_the_limit_is_saved_and_one_byte_more_is_not() {
+        let mut app = app_with_autosave();
+        app.load_contacts(alice());
+
+        let at = file_message_of_size(1, PEER_ID, "at.bin", AUTOSAVE_MAX_FILE_SIZE);
+        let over = file_message_of_size(2, PEER_ID, "over.bin", AUTOSAVE_MAX_FILE_SIZE + 1);
+
+        assert!(arrive(&mut app, "general", at).is_some());
+        assert!(arrive(&mut app, "general", over).is_none());
+    }
+
+    #[test]
+    fn a_file_the_channel_already_holds_is_skipped_and_says_so() {
+        let mut app = app_with_autosave();
+        app.load_contacts(alice());
+        let (channel, message) = app
+            .handle_net_event(NetEvent::Received(
+                "general".to_string(),
+                file_message(1, PEER_ID, "report.pdf", b"report"),
+            ))
+            .unwrap();
+
+        let request = app.auto_save(&channel, &message, |hash| hash == hash_of(b"report"));
+
+        assert!(request.is_none());
+        let notice = newest_notice(&app, "general");
+        assert!(
+            notice.contains("not auto-saving report.pdf")
+                && notice.contains("already has a saved copy"),
+            "got: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_repeat_of_a_save_in_flight_is_dropped_until_it_finishes() {
+        let mut app = app_with_autosave();
+        app.load_contacts(alice());
+        assert!(
+            arrive(
+                &mut app,
+                "general",
+                file_message(1, PEER_ID, "report.pdf", b"report")
+            )
+            .is_some()
+        );
+
+        // The same file again -- sent twice, or a share replayed -- while the
+        // first is still downloading: one download is enough.
+        let again = arrive(
+            &mut app,
+            "general",
+            file_message(2, PEER_ID, "report.pdf", b"report"),
+        );
+        assert!(again.is_none());
+        assert_eq!(
+            notices_in(&app, "general"),
+            0,
+            "dropped quietly: the first one's notice is on its way"
+        );
+
+        // Once it has landed it is a new matter (main.rs asks the disk first).
+        app.handle_net_event(NetEvent::FileSaved {
+            channel: "general".to_string(),
+            hash: hash_of(b"report"),
+            filename: "report.pdf".to_string(),
+            path: PathBuf::from("/files/general/report.pdf"),
+            mode: automatic(),
+        });
+        let later = arrive(
+            &mut app,
+            "general",
+            file_message(3, PEER_ID, "report.pdf", b"report"),
+        );
+        assert!(later.is_some());
+    }
+
+    #[test]
+    fn a_save_that_failed_can_be_tried_again_by_the_next_share() {
+        let mut app = app_with_autosave();
+        app.load_contacts(alice());
+        assert!(
+            arrive(
+                &mut app,
+                "general",
+                file_message(1, PEER_ID, "report.pdf", b"report")
+            )
+            .is_some()
+        );
+
+        app.save_failed(
+            "general",
+            hash_of(b"report"),
+            "report.pdf",
+            "boom",
+            automatic(),
+        );
+
+        let next = arrive(
+            &mut app,
+            "general",
+            file_message(2, PEER_ID, "report.pdf", b"report"),
+        );
+        assert!(next.is_some());
+    }
+
+    #[test]
+    fn a_redelivered_message_is_not_auto_saved_a_second_time() {
+        let mut app = app_with_autosave();
+        app.load_contacts(alice());
+        let message = file_message(1, PEER_ID, "report.pdf", b"report");
+        assert!(arrive(&mut app, "general", message.clone()).is_some());
+        app.handle_net_event(NetEvent::FileSaved {
+            channel: "general".to_string(),
+            hash: hash_of(b"report"),
+            filename: "report.pdf".to_string(),
+            path: PathBuf::from("/files/general/report.pdf"),
+            mode: automatic(),
+        });
+
+        // The very same message again: not a new line, so never asked about.
+        assert!(arrive(&mut app, "general", message).is_none());
+    }
+
+    #[test]
+    fn a_file_is_only_ever_asked_of_peers_we_trust() {
+        let mut app = app_with_autosave();
+        app.load_contacts(HashMap::from([
+            (PEER_ID, "Alice".to_string()),
+            (PEER_ID_3, "Carol".to_string()),
+        ]));
+        // A stranger who is online and has posted, listed ahead of Carol.
+        receive(
+            &mut app,
+            "general",
+            compose_message(PEER_ID_2, "hello", None),
+        );
+        peers_join(&mut app, "general", &[PEER_ID_2, PEER_ID_3]);
+
+        let request = arrive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        )
+        .unwrap();
+
+        assert_eq!(request.providers, vec![PEER_ID, PEER_ID_3]);
+    }
+
+    #[test]
+    fn our_other_devices_that_are_online_are_asked_too() {
+        let mut app = app_with_autosave();
+        let key = own_user_key(&mut app);
+        certify(&mut app, &key, PEER_ID);
+        certify(&mut app, &key, PEER_ID_2);
+        peers_join(&mut app, "general", &[PEER_ID_2]);
+
+        let request = arrive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        )
+        .unwrap();
+
+        assert_eq!(request.providers, vec![PEER_ID, PEER_ID_2]);
+    }
+
+    #[test]
+    fn a_share_forged_as_a_trusted_peer_still_cannot_reach_a_stranger() {
+        // Nothing signs a chat message, so a stranger in the channel can claim
+        // to be Alice. What it can't do is be asked for the file: the only
+        // peers asked are the ones we trust, known by their connection.
+        let mut app = app_with_autosave();
+        app.load_contacts(alice());
+        peers_join(&mut app, "general", &[PEER_ID_2]); // the stranger, online
+        let forged = file_message(1, PEER_ID, "invoice.pdf", b"the stranger's own bytes");
+
+        let request = arrive(&mut app, "general", forged).expect("claims to be Alice: tried");
+
+        assert_eq!(
+            request.providers,
+            vec![PEER_ID],
+            "only the real Alice is asked, and she doesn't have it"
+        );
+    }
+
+    #[test]
+    fn a_file_goes_into_the_folder_of_the_channel_it_arrived_in_whichever_is_active() {
+        let mut app = multi_channel_app(); // "random" is active
+        app.load_files_root(PathBuf::from("/files"));
+        app.load_autosave(HashSet::from(["general".to_string()]));
+        app.load_contacts(alice());
+
+        let request = arrive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        )
+        .unwrap();
+
+        assert_eq!(request.channel, "general");
+        assert_eq!(request.dir, PathBuf::from("/files/general"));
+    }
+
+    #[test]
+    fn what_auto_save_says_lands_in_the_channel_the_file_arrived_in() {
+        let mut app = multi_channel_app(); // "random" is active
+        app.load_autosave(HashSet::from(["general".to_string()]));
+
+        arrive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+
+        assert!(newest_notice(&app, "general").starts_with("not auto-saving report.pdf"));
+        assert_eq!(
+            notices_in(&app, "random"),
+            0,
+            "the channel being looked at hears nothing"
+        );
+    }
+
+    #[test]
+    fn an_automatic_save_is_reported_in_its_own_channel_and_a_manual_one_where_you_are() {
+        let mut app = multi_channel_app(); // "random" is active
+        let saved = |mode| NetEvent::FileSaved {
+            channel: "general".to_string(),
+            hash: hash_of(b"report"),
+            filename: "report.pdf".to_string(),
+            path: PathBuf::from("/files/general/report.pdf"),
+            mode,
+        };
+
+        app.handle_net_event(saved(automatic()));
+        assert_eq!(
+            newest_notice(&app, "general"),
+            "auto-saved report.pdf to /files/general/report.pdf"
+        );
+        assert_eq!(notices_in(&app, "random"), 0);
+
+        app.handle_net_event(saved(SaveMode::Manual));
+        assert_eq!(
+            newest_notice(&app, "random"),
+            "saved report.pdf to /files/general/report.pdf"
+        );
+    }
+
+    #[test]
+    fn a_failed_save_says_so_in_the_words_of_its_mode() {
+        let mut app = multi_channel_app(); // "random" is active
+        let hash = hash_of(b"report");
+
+        app.save_failed("general", hash, "report.pdf", "boom", SaveMode::Manual);
+        assert_eq!(
+            newest_notice(&app, "random"),
+            "failed to save report.pdf: boom"
+        );
+
+        app.save_failed("general", hash, "report.pdf", "boom", automatic());
+        assert_eq!(
+            newest_notice(&app, "general"),
+            format!(
+                "couldn't auto-save report.pdf: boom -- /save {} to download it yourself",
+                hint_prefix(b"report")
+            )
+        );
+        assert_eq!(notices_in(&app, "random"), 1, "only the manual one");
+    }
+
+    #[test]
+    fn leaving_a_channel_forgets_its_auto_save_so_a_later_room_of_that_name_starts_off() {
+        let mut app = app_for_the_switcher(); // Alice (PEER_ID) is aliased
+        app.load_autosave(HashSet::from(["project-x".to_string()]));
+
+        app.remove_channel("project-x");
+        // A different room, rejoined under the very same stored name.
+        app.handle_net_event(NetEvent::Joined("project-x".to_string()));
+        assert_eq!(app.active().name, "project-x");
+
+        let request = arrive(
+            &mut app,
+            "project-x",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+
+        assert!(
+            request.is_none(),
+            "it must not inherit the old room's setting"
+        );
+        assert_eq!(notices_in(&app, "project-x"), 0);
+        submit(&mut app, "/autosave");
+        assert!(newest_notice(&app, "project-x").starts_with("auto-save is off"));
+    }
+
+    #[test]
+    fn leaving_a_channel_drops_its_saves_in_flight() {
+        let mut app = app_for_the_switcher(); // Alice (PEER_ID) is aliased
+        app.load_autosave(HashSet::from(["project-x".to_string()]));
+        let file = || file_message(1, PEER_ID, "report.pdf", b"report");
+        assert!(arrive(&mut app, "project-x", file()).is_some());
+
+        app.remove_channel("project-x");
+        app.handle_net_event(NetEvent::Joined("project-x".to_string()));
+        submit(&mut app, "/autosave on");
+
+        let request = arrive(
+            &mut app,
+            "project-x",
+            file_message(2, PEER_ID, "report.pdf", b"report"),
+        );
+        assert!(request.is_some(), "no stale entry may block it");
     }
 }

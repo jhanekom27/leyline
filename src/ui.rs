@@ -96,6 +96,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/save [hash]",
     "/folder [path]",
     "/maxsize [size|off]",
+    "/autosave [on|off]",
     "/files",
     "/paste (or Ctrl+V)",
     "/alias <hex> <name>",
@@ -3952,6 +3953,11 @@ mod tests {
     #[test]
     fn the_maxsize_command_is_among_the_hints() {
         assert!(COMMAND_HINTS.contains(&"/maxsize [size|off]"));
+    }
+
+    #[test]
+    fn the_autosave_command_is_among_the_hints() {
+        assert!(COMMAND_HINTS.contains(&"/autosave [on|off]"));
     }
 
     #[test]

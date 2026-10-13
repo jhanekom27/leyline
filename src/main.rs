@@ -1,4 +1,5 @@
 mod app;
+mod autosave;
 mod backfill;
 mod channel_registry;
 mod channel_renames;
@@ -42,7 +43,8 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
-use app::{AppState, InputAction};
+use app::{AppState, InputAction, SaveRequest};
+use autosave::AutoSave;
 use backfill::BackfillStore;
 use channel_registry::ChannelRegistry;
 use channel_renames::ChannelRenames;
@@ -88,6 +90,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize contacts")?;
     let channel_renames = ChannelRenames::load(dirs.data_dir().join("channel_renames"))
         .context("failed to initialize channel renames")?;
+    let autosave = AutoSave::load(dirs.data_dir().join("autosave"))
+        .context("failed to initialize auto-save settings")?;
     let dm_registry = DmRegistry::load(dirs.data_dir().join("dms"))
         .context("failed to initialize DM registry")?;
     let direct_registry = DirectRegistry::load(dirs.data_dir().join("direct_peers"))
@@ -147,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
         registry,
         contacts,
         channel_renames,
+        autosave,
         dm_registry,
         direct_registry,
         settings,
@@ -251,6 +256,7 @@ fn paths_to_wipe_for_pairing(data_dir: &Path, config_dir: &Path) -> Vec<PathBuf>
         data_dir.join("blobs"),
         data_dir.join("contacts"),
         data_dir.join("channel_renames"),
+        data_dir.join("autosave"),
         data_dir.join("dms"),
         data_dir.join("direct_peers"),
         data_dir.join("settings"),
@@ -383,6 +389,10 @@ struct Session {
     registry: ChannelRegistry,
     contacts: Contacts,
     channel_renames: ChannelRenames,
+    /// Which channels have auto-save on -- see `autosave`. Seeded into
+    /// `AppState` (`load_autosave`) at startup; written when `/autosave`
+    /// switches a channel and when one is left.
+    autosave: AutoSave,
     dm_registry: DmRegistry,
     direct_registry: DirectRegistry,
     settings: Settings,
@@ -453,6 +463,28 @@ fn route_send(net: &Net, app: &AppState, channel: &str, message: ChatMessage) {
     match app.direct_peer_for(channel) {
         Some(peer) => net.send_direct(peer, message),
         None => net.send(channel, message),
+    }
+}
+
+/// Starts the download behind `request`: claims a free name in its folder
+/// first (`files::resolve_destination`, which makes the folder too), so a
+/// folder that can't be written to is reported now rather than after a
+/// download, then hands the fetch to `net`. It lands as `NetEvent::FileSaved`
+/// or `FileSaveFailed`. `/save`, `Enter` in the files overlay and auto-save
+/// all come through here, so a file is named, made safe and kept apart from
+/// a namesake the same way whichever of them asked.
+fn start_save(net: &Net, app: &mut AppState, request: SaveRequest) {
+    let SaveRequest {
+        channel,
+        hash,
+        filename,
+        providers,
+        dir,
+        mode,
+    } = request;
+    match resolve_destination(&dir, &filename) {
+        Ok(destination) => net.save_file(channel, hash, filename, providers, destination, mode),
+        Err(err) => app.save_failed(&channel, hash, &filename, &err.to_string(), mode),
     }
 }
 
@@ -541,6 +573,7 @@ async fn run(
         mut registry,
         mut contacts,
         mut channel_renames,
+        mut autosave,
         mut dm_registry,
         mut direct_registry,
         mut settings,
@@ -555,6 +588,7 @@ async fn run(
     app.load_self_user_id(net.our_user_id());
     app.load_contacts(contacts.all());
     app.load_renames(channel_renames.all());
+    app.load_autosave(autosave.channels());
     app.load_settings(settings.bell_enabled());
     app.load_dm_registry(dm_registry.all());
     app.load_forgotten_devices(forgotten_devices.all());
@@ -746,6 +780,15 @@ async fn run(
                                 net.set_nickname(name);
                             }
                             Some(InputAction::Leave(channel)) => {
+                                // Auto-save is forgotten first, so that if
+                                // anything below fails -- or the process dies
+                                // midway -- a channel is left with auto-save
+                                // off, never a setting left on a channel that
+                                // is gone and whose name a different room
+                                // could be given later.
+                                if let Err(err) = autosave.set(&channel, false) {
+                                    warn!(%channel, "failed to forget the auto-save setting: {err}");
+                                }
                                 match app.direct_peer_for(&channel) {
                                     Some(peer) => {
                                         net.close_direct(peer);
@@ -797,16 +840,22 @@ async fn run(
                             Some(InputAction::SendStaged { channel, items, caption }) => {
                                 net.send_staged(channel, items, caption);
                             }
-                            Some(InputAction::SaveFile { channel, hash, filename, providers, dir }) => {
-                                match resolve_destination(&dir, &filename) {
-                                    Ok(destination) => {
-                                        net.save_file(channel, hash, filename, providers, destination);
-                                    }
-                                    Err(err) => {
-                                        app.push_system(format!(
-                                            "failed to save {filename}: {err}"
-                                        ));
-                                    }
+                            Some(InputAction::SaveFile(request)) => {
+                                start_save(&net, &mut app, request);
+                            }
+                            // `/autosave on|off`: already applied to `app`, so
+                            // only remembering it is left. A write that fails
+                            // leaves it in force for this session -- and says
+                            // so, with what that means for the next: an `off`
+                            // that didn't stick is `on` again after a restart.
+                            Some(InputAction::SetAutoSave { channel, on }) => {
+                                if let Err(err) = autosave.set(&channel, on) {
+                                    warn!(%channel, "failed to persist the auto-save setting: {err}");
+                                    app.push_system(if on {
+                                        format!("couldn't remember that auto-save is on: {err} -- it holds until you quit")
+                                    } else {
+                                        format!("couldn't remember that auto-save is off: {err} -- it will be on again after a restart")
+                                    });
                                 }
                             }
                             // `/folder <path>`: only the filesystem can say
@@ -1060,12 +1109,14 @@ async fn run(
                         warn!(%path, "failed to send file: {error}");
                         app.push_system(format!("failed to send {path}: {error}"));
                     }
-                    // A `/save`d file failed to download or write to disk
+                    // A saved file failed to download or write to disk
                     // -- see `net::Net::save_file`. Logged for the same
-                    // reason as `FileSendFailed` above.
-                    NetEvent::FileSaveFailed { filename, error } => {
+                    // reason as `FileSendFailed` above; what is said, and
+                    // where, depends on how the save came about
+                    // (`AppState::save_failed`).
+                    NetEvent::FileSaveFailed { channel, hash, filename, error, mode } => {
                         warn!(%filename, "failed to save file: {error}");
-                        app.push_system(format!("failed to save {filename}: {error}"));
+                        app.save_failed(&channel, hash, &filename, &error, mode);
                     }
                     // A `/send`ed file finished importing and is ready to
                     // broadcast -- see `net::Net::send_file`. Broadcasting
@@ -1136,6 +1187,17 @@ async fn run(
                             }
                             if app.bell_enabled {
                                 ring_bell();
+                            }
+                            // A file that has just arrived live may be
+                            // saved on its own, if its channel has
+                            // auto-save on -- see `AppState::auto_save`. Only
+                            // here: history loaded at startup and history
+                            // backfilled from a peer never come through
+                            // this arm, so nothing from before is fetched.
+                            if let Some(request) = app.auto_save(&channel, &message, |hash| {
+                                saved_files.is_saved(&channel, hash)
+                            }) {
+                                start_save(&net, &mut app, request);
                             }
                         }
                     }

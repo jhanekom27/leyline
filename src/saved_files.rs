@@ -111,6 +111,16 @@ impl SavedFiles {
             .collect()
     }
 
+    /// Whether `channel`'s copy of the file `hash` is on disk right now --
+    /// `present_in` for one file, so the question "have I already got this
+    /// one?" doesn't stat every file the channel has saved. Asks the
+    /// filesystem every time, for the same reason `present_in` does.
+    pub fn is_saved(&self, channel: &str, hash: Hash) -> bool {
+        self.records.iter().any(|record| {
+            record.channel == channel && record.hash == hash && Path::new(&record.path).is_file()
+        })
+    }
+
     /// Re-encodes and rewrites the whole records file.
     fn save(&self) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
@@ -262,6 +272,37 @@ mod tests {
         saved.record("general", hash(b"report"), &copy).unwrap();
 
         assert!(saved.present_in("general").is_empty());
+    }
+
+    #[test]
+    fn a_file_is_saved_only_in_the_channel_it_was_recorded_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = copy_in(&dir, "report.pdf");
+        let mut saved = saved_at(&dir);
+        assert!(!saved.is_saved("general", hash(b"report")), "nothing yet");
+
+        saved.record("general", hash(b"report"), &copy).unwrap();
+
+        assert!(saved.is_saved("general", hash(b"report")));
+        assert!(
+            !saved.is_saved("random", hash(b"report")),
+            "another channel"
+        );
+        assert!(!saved.is_saved("general", hash(b"other")), "another file");
+    }
+
+    #[test]
+    fn a_deleted_copy_is_no_longer_saved_and_is_again_once_it_comes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = copy_in(&dir, "report.pdf");
+        let mut saved = saved_at(&dir);
+        saved.record("general", hash(b"report"), &copy).unwrap();
+
+        fs::remove_file(&copy).unwrap();
+        assert!(!saved.is_saved("general", hash(b"report")));
+
+        fs::write(&copy, b"restored").unwrap();
+        assert!(saved.is_saved("general", hash(b"report")));
     }
 
     #[test]

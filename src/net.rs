@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 
 use crate::backfill::BackfillStore;
 use crate::direct::{self, Direct};
-use crate::files::{self, StagedAttachment, StagedSource};
+use crate::files::{self, SaveMode, StagedAttachment, StagedSource};
 use crate::message::{
     ChannelSyncAnnounce, ChatMessage, DeviceCert, FileAttachment, GossipPayload, HistoryAnnounce,
     IdentityAnnounce, VersionAnnounce, now_unix_ms,
@@ -158,20 +158,30 @@ pub enum NetEvent {
     FileReady(String, ChatMessage),
     /// A `/send`ed file failed to import -- see `Net::send_file`.
     FileSendFailed { path: String, error: String },
-    /// A `/save`d file finished downloading and was written to disk --
-    /// see `Net::save_file`. Says which channel's copy it is and which file
+    /// A saved file finished downloading and was written to disk -- see
+    /// `Net::save_file`. Says which channel's copy it is and which file
     /// (`hash`, as in `message::FileAttachment`), so the caller can record
     /// where it went (`saved_files::SavedFiles`) without having to remember
-    /// what each in-flight save was for.
+    /// what each in-flight save was for, and how the save came about
+    /// (`mode`), which decides where the notice is said.
     FileSaved {
         channel: String,
         hash: Hash,
         filename: String,
         path: PathBuf,
+        mode: SaveMode,
     },
-    /// A `/save`d file failed to download or write to disk -- see
-    /// `Net::save_file`.
-    FileSaveFailed { filename: String, error: String },
+    /// A saved file failed to download or write to disk -- see
+    /// `Net::save_file`. Names the channel and file for the same reason
+    /// `FileSaved` does: an auto-save fails for a channel the user may not
+    /// be looking at.
+    FileSaveFailed {
+        channel: String,
+        hash: Hash,
+        filename: String,
+        error: String,
+        mode: SaveMode,
+    },
     /// `/paste` found one or more real files on the OS clipboard (e.g. a
     /// Finder/Explorer copy) -- see `Net::paste`. Reported as paths, not
     /// already-imported attachments, so the caller can stage each one via
@@ -1312,10 +1322,13 @@ impl Net {
     /// along, to come back on `NetEvent::FileSaved`. `providers` are who to
     /// ask for it, in order -- the file's sender, then the other peers known
     /// in its channel (see `app::AppState::providers_for`), so it can still
-    /// be had while its sender is offline. Spawned like `send_file`,
-    /// reporting the outcome back as `NetEvent::FileSaved`/`FileSaveFailed`
-    /// since the download can take a while and must not block the caller's
-    /// event loop. Fire-and-forget, like `send` and `announce`.
+    /// be had while its sender is offline. `mode` says whether the file's
+    /// size is bounded -- an automatic save refuses one over its `max_bytes`
+    /// (see `BackfillStore::fetch_file`) -- and rides along too, to come back
+    /// with the outcome. Spawned like `send_file`, reporting the outcome back
+    /// as `NetEvent::FileSaved`/`FileSaveFailed` since the download can take
+    /// a while and must not block the caller's event loop. Fire-and-forget,
+    /// like `send` and `announce`.
     pub fn save_file(
         &self,
         channel: String,
@@ -1323,13 +1336,18 @@ impl Net {
         filename: String,
         providers: Vec<[u8; 32]>,
         destination: PathBuf,
+        mode: SaveMode,
     ) {
         let backfill = self.backfill.clone();
         let endpoint = self.router.endpoint().clone();
         let events_tx = self.events_tx.clone();
+        let max_bytes = match mode {
+            SaveMode::Manual => None,
+            SaveMode::Automatic { max_bytes } => Some(max_bytes),
+        };
         tokio::spawn(async move {
             match backfill
-                .fetch_file(&endpoint, hash, &providers, &destination)
+                .fetch_file(&endpoint, hash, &providers, &destination, max_bytes)
                 .await
             {
                 Ok(()) => {
@@ -1339,6 +1357,7 @@ impl Net {
                             hash,
                             filename,
                             path: destination,
+                            mode,
                         })
                         .await;
                 }
@@ -1351,8 +1370,11 @@ impl Net {
                     let _ = std::fs::remove_file(&destination);
                     let _ = events_tx
                         .send(NetEvent::FileSaveFailed {
+                            channel,
+                            hash,
                             filename,
                             error: err.to_string(),
+                            mode,
                         })
                         .await;
                 }

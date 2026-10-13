@@ -341,8 +341,9 @@ a channel before its history can sync to you.
 
 A shared file is a `ChatMessage` whose `attachment` names a content hash in
 the same `iroh-blobs` store that backs history backfill; nothing is fetched
-until someone runs `/save`. Peers serve files out of that store, never out
-of the folder a file was saved into: `/send` imports a copy into it, and
+until someone runs `/save` -- or a channel with auto-save on takes it, below.
+Peers serve files out of that store, never out of the folder a file was
+saved into: `/send` imports a copy into it, and
 `/save` downloads into it first and only then exports a copy into the
 channel's folder (`files.rs`, below). So moving or deleting what you saved
 changes nothing for anyone else, and since the store is never
@@ -400,6 +401,34 @@ nothing re-checks it at send, so main.rs hands both the one limit `AppState`
 holds. Only what you share is limited, never what you receive, and a pasted
 clipboard image counts as a file (features.md lists what the limit leaves out).
 
+Auto-save (`/autosave`) is the one way a file is fetched that nobody asked
+for, so it is opt-in per channel and held three ways. Which channels is
+`autosave.rs`: their stored names in a small postcard file, forgotten when
+one is left and wiped by pairing, since a ticket's name is chosen by whoever
+shares it and the setting must not outlive its channel. `AppState::auto_save`
+decides, and main.rs calls it for exactly one thing -- a message newly
+accepted off the network -- so history loaded at startup or backfilled never
+reaches it and nothing from before is ever fetched. It returns a
+`SaveRequest`, the same thing `/save` and the files overlay hand main.rs's
+`start_save`, differing only in `files::SaveMode`: a manual save is unbounded
+and answered in the channel you are in, an automatic one is bounded and
+answered in the channel its file arrived in, wherever you are looking
+(`AppState::push_system_to`).
+
+- *Who.* Nothing signs a chat message, so `ChatMessage::sender` is only a
+  claim: it decides whether to try, and it is not the boundary. The file is
+  asked only of peers who are themselves trusted -- your own devices
+  (certified under your user key) and peers you have aliased -- and those are
+  known by their connection, so a forged share fetches nothing.
+- *How big.* A file announced over `files::AUTOSAVE_MAX_FILE_SIZE` is skipped
+  up front; and since the announced size is only a number in a message,
+  `BackfillStore::fetch_file` also reads the real one -- from its own store,
+  or by asking providers for the verified size
+  (`iroh_blobs::get::request::get_verified_size`, checked against the hash)
+  before the downloader runs.
+- *How often.* A file the channel already holds (`saved_files.rs`) or is
+  already fetching is not fetched again.
+
 ## Point-to-point messaging
 
 `/dm <alias|hex-prefix|endpoint-id> [text]` (`direct.rs`) is a second,
@@ -456,6 +485,7 @@ src/
   pairing.rs          // device pairing: one-time ticket exchange protocol
   channel_registry.rs // persisted channel list, room secrets, known peers
   channel_renames.rs  // persisted local display names for group channels, for /rename
+  autosave.rs         // persisted set of channels with auto-save on (their stored names), for /autosave
   contacts.rs         // persisted local pet names for peers
   dm_registry.rs      // persisted peer id <-> 1:1 DM channel name, for /msg
   direct.rs           // point-to-point (non-gossip) 1:1 messaging: connection lifecycle, framing
@@ -465,8 +495,8 @@ src/
   search.rs           // shared match predicate + on-disk scan for /search
   thread.rs           // reply-chain (ancestors + descendants) builder for /thread
   backfill.rs         // iroh-blobs history manifests for offline backfill
-  files.rs            // /save destination resolution (a folder per channel under the files root), filename safety, sizes, outgoing-file checks + the size limit on them (/maxsize) + staged attachments, drag-and-drop paste detection, opening a saved file with the OS (and which kinds -- programs, scripts -- never to)
-  saved_files.rs      // persisted record of which channel's copy of which file /save put where, for the /files overlay's check mark and open key
+  files.rs            // /save destination resolution (a folder per channel under the files root), filename safety, sizes, outgoing-file checks + the size limit on them (/maxsize) + the auto-save limit and how a save came about (`SaveMode`) + staged attachments, drag-and-drop paste detection, opening a saved file with the OS (and which kinds -- programs, scripts -- never to)
+  saved_files.rs      // persisted record of which channel's copy of which file /save put where, for the /files overlay's check mark and open key, and auto-save's "already have it" check
   term_events.rs      // crossterm EventStream wrapper: a drop a terminal types out (Warp) becomes one paste
   picker.rs           // in-TUI file picker behind a bare /send: pure state, folder reads, remembered start folder
   version.rs          // build version/git-hash constants, newer-than-ours comparison
