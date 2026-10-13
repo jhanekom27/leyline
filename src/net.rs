@@ -208,13 +208,20 @@ pub enum NetEvent {
     /// plain text -- shared as an ordinary chat message, the same as if it
     /// had been typed and sent.
     ClipboardText(String, String),
-    /// A replicated file-index entry changed. The runtime deliberately does
-    /// not apply it to the filesystem; a later sync-folder feature owns that.
-    IndexChanged(String, Vec<u8>),
+    /// A decoded index entry received from another member.  The runtime owns
+    /// validation and any filesystem application.
+    RemoteIndex(RemoteIndexEntry),
     /// `/paste` couldn't find anything to share (an empty or unreadable
     /// clipboard, or the clipboard itself was unavailable) -- see
     /// `Net::paste`.
     PasteFailed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteIndexEntry {
+    pub channel: String,
+    pub path: String,
+    pub entry: FileIndexEntry,
 }
 
 /// Metadata replicated as the value for a path-keyed channel index entry.
@@ -1355,6 +1362,55 @@ impl Net {
     /// as `NetEvent::FileSaved`/`FileSaveFailed` since the download can take
     /// a while and must not block the caller's event loop. Fire-and-forget,
     /// like `send` and `announce`.
+    pub fn save_synced_file(
+        &self,
+        channel: String,
+        hash: Hash,
+        filename: String,
+        providers: Vec<[u8; 32]>,
+        destination: PathBuf,
+        max_bytes: u64,
+    ) {
+        let backfill = self.backfill.clone();
+        let endpoint = self.router.endpoint().clone();
+        let events_tx = self.events_tx.clone();
+        tokio::spawn(async move {
+            let temporary = crate::sync_apply::temporary_for(&destination);
+            let outcome = backfill
+                .fetch_file(&endpoint, hash, &providers, &temporary, Some(max_bytes))
+                .await
+                .and_then(|()| {
+                    crate::sync_apply::finalize(&temporary, &destination)
+                        .map_err(anyhow::Error::msg)
+                });
+            match outcome {
+                Ok(()) => {
+                    let _ = events_tx
+                        .send(NetEvent::FileSaved {
+                            channel,
+                            hash,
+                            filename,
+                            path: destination,
+                            mode: SaveMode::Automatic { max_bytes },
+                        })
+                        .await;
+                }
+                Err(err) => {
+                    let _ = std::fs::remove_file(&temporary);
+                    let _ = events_tx
+                        .send(NetEvent::FileSaveFailed {
+                            channel,
+                            hash,
+                            filename,
+                            error: err.to_string(),
+                            mode: SaveMode::Automatic { max_bytes },
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
     pub fn save_file(
         &self,
         channel: String,

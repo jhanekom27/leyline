@@ -101,6 +101,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/maxsize [size|off]",
     "/autosave [on|off]",
     "/outbox [on|off]",
+    "/sync [on|off]",
     "/files",
     "/paste (or Ctrl+V)",
     "/alias <hex> <name>",

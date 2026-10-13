@@ -189,7 +189,7 @@ impl AppState {
             | NetEvent::ClipboardImage(..)
             | NetEvent::ClipboardText(..)
             | NetEvent::PasteFailed(..)
-            | NetEvent::IndexChanged(..)
+            | NetEvent::RemoteIndex(..)
             | NetEvent::DirectJoined { .. } => None,
         }
     }

@@ -22,9 +22,11 @@ mod saved_files;
 mod search;
 mod settings;
 mod storage;
+mod sync_apply;
 #[cfg(test)]
 mod sync_docs;
 mod sync_index;
+mod sync_settings;
 mod term_events;
 mod thread;
 mod ticket;
@@ -69,6 +71,7 @@ use saved_files::SavedFiles;
 use search::{SearchOutcome, run_on_disk_scan};
 use settings::Settings;
 use storage::MessageStore;
+use sync_settings::SyncSettings;
 use term_events::TermEvents;
 
 #[tokio::main]
@@ -99,6 +102,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize auto-save settings")?;
     let outbox = Outbox::load(dirs.data_dir().join("outbox"))
         .context("failed to initialize outbox settings")?;
+    let sync_settings = SyncSettings::load(dirs.data_dir().join("sync"))
+        .context("failed to initialize sync settings")?;
     let dm_registry = DmRegistry::load(dirs.data_dir().join("dms"))
         .context("failed to initialize DM registry")?;
     let direct_registry = DirectRegistry::load(dirs.data_dir().join("direct_peers"))
@@ -161,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
         channel_renames,
         autosave,
         outbox,
+        sync_settings,
         dm_registry,
         direct_registry,
         settings,
@@ -388,6 +394,8 @@ struct Session {
     autosave: AutoSave,
     /// Enabled one-way outboxes and their durable de-duplication records.
     outbox: Outbox,
+    /// Enabled receive-only channel-folder mirrors.
+    sync_settings: SyncSettings,
     dm_registry: DmRegistry,
     direct_registry: DirectRegistry,
     settings: Settings,
@@ -460,6 +468,7 @@ async fn run(
         mut channel_renames,
         mut autosave,
         mut outbox,
+        mut sync_settings,
         mut dm_registry,
         mut direct_registry,
         mut settings,
@@ -476,6 +485,7 @@ async fn run(
     app.load_renames(channel_renames.all());
     app.load_autosave(autosave.channels());
     app.load_outbox(outbox.channels());
+    app.load_sync(sync_settings.channels());
     app.load_settings(settings.bell_enabled());
     app.load_dm_registry(dm_registry.all());
     app.load_forgotten_devices(forgotten_devices.all());
@@ -651,6 +661,15 @@ async fn run(
                                     )),
                                 }
                             }
+                            Some(InputAction::SetSync { channel, on }) => {
+                                if let Err(err) = sync_settings.set(&channel, on) {
+                                    warn!(%channel, "failed to persist sync setting: {err}");
+                                    app.push_system(format!(
+                                        "couldn't remember that sync is {}: {err}",
+                                        if on { "on" } else { "off" }
+                                    ));
+                                }
+                            }
                             Some(InputAction::Join(arg)) => {
                                 if let Some(message) = net.join(arg) {
                                     app.push_system(message);
@@ -720,6 +739,9 @@ async fn run(
                                 }
                                 if let Err(err) = outbox.disable(&channel) {
                                     warn!(%channel, "failed to forget the outbox setting: {err}");
+                                }
+                                if let Err(err) = sync_settings.set(&channel, false) {
+                                    warn!(%channel, "failed to forget the sync setting: {err}");
                                 }
                                 match app.direct_peer_for(&channel) {
                                     Some(peer) => {
@@ -1039,12 +1061,29 @@ async fn run(
                             net.sync_channel(&tag, announce);
                         }
                     }
-                    NetEvent::IndexChanged(channel, key) => {
-                        debug!(
-                            %channel,
-                            path = %String::from_utf8_lossy(&key),
-                            "replicated file index changed; filesystem application is deferred"
-                        );
+                    NetEvent::RemoteIndex(remote) => {
+                        if app.sync_enabled(&remote.channel) {
+                            if remote.entry.size > files::DEFAULT_MAX_FILE_SIZE {
+                                app.push_system_to(&remote.channel, format!(
+                                    "sync skipped {}: {} exceeds the {} limit",
+                                    remote.path, files::human_size(remote.entry.size),
+                                    files::human_size(files::DEFAULT_MAX_FILE_SIZE)
+                                ));
+                            } else {
+                                let root = files::channel_dir(&files_root, &remote.channel);
+                                match sync_apply::reserve(&root, &remote.path) {
+                                    Ok(destination) => net.save_synced_file(
+                                        remote.channel,
+                                        remote.entry.content_hash,
+                                        remote.path,
+                                        vec![remote.entry.author],
+                                        destination,
+                                        files::DEFAULT_MAX_FILE_SIZE,
+                                    ),
+                                    Err(reason) => app.push_system_to(&remote.channel, reason),
+                                }
+                            }
+                        }
                     }
                     // A peer reached us over a point-to-point connection
                     // for the first time this session (see `direct.rs`) --

@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-use crate::net::NetEvent;
+use crate::net::{FileIndexEntry, NetEvent, RemoteIndexEntry};
 
 struct ActiveIndex {
     doc: Doc,
@@ -38,6 +38,7 @@ pub struct SyncIndex {
     author: AuthorId,
     indexes: Arc<Mutex<HashMap<String, ActiveIndex>>>,
     events_tx: mpsc::Sender<NetEvent>,
+    blobs: FsStore,
 }
 
 impl SyncIndex {
@@ -55,7 +56,7 @@ impl SyncIndex {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("failed to create docs store at {}", dir.display()))?;
         let docs = Docs::persistent(dir.to_path_buf())
-            .spawn(endpoint, blobs.into(), gossip)
+            .spawn(endpoint, blobs.clone().into(), gossip)
             .await
             .context("failed to start iroh-docs")?;
         let author = docs
@@ -69,6 +70,7 @@ impl SyncIndex {
                 author,
                 indexes: Arc::new(Mutex::new(HashMap::new())),
                 events_tx,
+                blobs,
             },
             protocol,
         ))
@@ -116,7 +118,12 @@ impl SyncIndex {
         doc.start_sync(peers)
             .await
             .context("failed to start channel index sync")?;
-        let watch_task = watch(channel.to_string(), stream, self.events_tx.clone());
+        let watch_task = watch(
+            channel.to_string(),
+            stream,
+            self.events_tx.clone(),
+            self.blobs.clone(),
+        );
         self.indexes.lock().expect("indexes lock poisoned").insert(
             channel.to_string(),
             ActiveIndex {
@@ -189,17 +196,36 @@ fn watch(
     + Unpin
     + 'static,
     events_tx: mpsc::Sender<NetEvent>,
+    blobs: FsStore,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = stream.next().await {
             match event {
-                Ok(iroh_docs::engine::LiveEvent::InsertLocal { entry })
-                | Ok(iroh_docs::engine::LiveEvent::InsertRemote { entry, .. }) => {
+                Ok(iroh_docs::engine::LiveEvent::InsertRemote { entry, .. }) => {
+                    let Ok(path) = String::from_utf8(entry.key().to_vec()) else {
+                        warn!(%channel, "dropping non-UTF-8 remote index path");
+                        continue;
+                    };
+                    let metadata = match blobs.blobs().get_bytes(entry.content_hash()).await {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            warn!(%channel, "failed to read remote index metadata: {err}");
+                            continue;
+                        }
+                    };
+                    let entry = match postcard::from_bytes::<FileIndexEntry>(&metadata) {
+                        Ok(entry) => entry,
+                        Err(err) => {
+                            warn!(%channel, "dropping malformed remote index metadata: {err}");
+                            continue;
+                        }
+                    };
                     if events_tx
-                        .send(NetEvent::IndexChanged(
-                            channel.clone(),
-                            entry.key().to_vec(),
-                        ))
+                        .send(NetEvent::RemoteIndex(RemoteIndexEntry {
+                            channel: channel.clone(),
+                            path,
+                            entry,
+                        }))
                         .await
                         .is_err()
                     {

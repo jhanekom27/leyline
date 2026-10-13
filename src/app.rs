@@ -642,6 +642,9 @@ pub enum InputAction {
     /// Create or remove the active channel's one-way outbox setting. The
     /// runtime creates and snapshots the folder before applying this state.
     SetOutbox { channel: String, on: bool },
+    /// Persist receive-only folder mirroring for one channel.  Application
+    /// of remote entries remains runtime-owned.
+    SetSync { channel: String, on: bool },
     /// Move the files root -- the folder every channel's folder lives in --
     /// to the path exactly as typed after `/folder ` (see `run_folder`). The
     /// caller (`files::set_files_root`) expands, creates and remembers it,
@@ -840,6 +843,10 @@ pub struct AppState {
     /// files. `outbox.rs` owns durable settings and de-duplication; app
     /// state only exposes this enabled set to `/outbox`.
     outbox: HashSet<String>,
+    /// Channels whose remote iroh-docs entries may be mirrored into their
+    /// local channel folder.  This is receive-only; app state never watches
+    /// or publishes local paths.
+    sync: HashSet<String>,
     /// The files an auto-save is fetching right now, by channel (stored
     /// name) and content. A repeat of one of them -- a file sent twice, or a
     /// share replayed by someone who can't be told from its sender -- is
@@ -927,6 +934,7 @@ impl AppState {
             size_limit: SizeLimit::Default,
             autosave: HashSet::new(),
             outbox: HashSet::new(),
+            sync: HashSet::new(),
             auto_saving: HashSet::new(),
             browse_requests: 0,
         }
@@ -1025,6 +1033,14 @@ impl AppState {
     /// Seeds the enabled one-way outboxes persisted by the caller.
     pub fn load_outbox(&mut self, channels: HashSet<String>) {
         self.outbox = channels;
+    }
+
+    pub fn load_sync(&mut self, channels: HashSet<String>) {
+        self.sync = channels;
+    }
+
+    pub fn sync_enabled(&self, channel: &str) -> bool {
+        self.sync.contains(channel)
     }
 
     /// Applies a successfully persisted outbox change from the runtime.
@@ -2109,6 +2125,7 @@ impl AppState {
             "maxsize" => self.run_maxsize(arg.trim()),
             "autosave" => self.run_autosave(arg.trim()),
             "outbox" => self.run_outbox(arg.trim()),
+            "sync" => self.run_sync(arg.trim()),
             "files" => self.run_files(),
             "paste" => self.run_paste(),
             "search" | "s" => self.run_search(arg.trim()),
@@ -2153,6 +2170,7 @@ impl AppState {
              /leave [channel], /rename [name], /who, /send [path], \
              /save [hash-prefix], /folder [path], /maxsize [size|off|default], \
              /autosave [on|off], /outbox [on|off], /files, /paste, \
+             /sync [on|off], \
              /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
              ticket for a new device to redeem, /pair <ticket> redeems one (after an \
@@ -2162,6 +2180,7 @@ impl AppState {
              /folder shows where and, with a path, moves them all -- \
              /maxsize shows the biggest file you can share (500 MB to begin with) and, with a size like 2GB, changes it (off lifts it, default restores it) -- \
              /autosave on saves the files your own devices and the peers you have aliased share in this channel as they arrive, up to {autosave_limit}, with no command (off by default, per channel; files from before, and from anyone else, are never fetched this way) -- \
+             /sync on mirrors safe remote index entries into this channel's folder (off by default, per channel); it never publishes local files or propagates deletes or renames -- \\
              /outbox on watches this channel's local send folder and shares new stable files once (off by default; existing, hidden, and temporary files are ignored) -- \
              /files lists the files shared in this channel (type to filter, \u{2191}/\u{2193} pick, \
              Enter save, Ctrl+O open one already saved (never a program or script), Esc close) -- \
@@ -2886,6 +2905,47 @@ impl AppState {
             return None;
         }
         Some(InputAction::SetOutbox { channel, on })
+    }
+
+    /// Handles `/sync [on|off]`. This enables receive-only mirroring for the
+    /// active channel; no local folder observation or publishing occurs.
+    fn run_sync(&mut self, arg: &str) -> Option<InputAction> {
+        let channel = self.active().name.clone();
+        let on = match arg {
+            "" => {
+                self.push_system(self.sync_notice(&channel));
+                return None;
+            }
+            "on" => true,
+            "off" => false,
+            _ => {
+                self.push_system("usage: /sync [on|off]");
+                return None;
+            }
+        };
+        let changed = if on {
+            self.sync.insert(channel.clone())
+        } else {
+            self.sync.remove(&channel)
+        };
+        self.push_system(self.sync_notice(&channel));
+        changed.then_some(InputAction::SetSync { channel, on })
+    }
+
+    fn sync_notice(&self, channel: &str) -> String {
+        let heading = self.channel_heading(channel);
+        let folder = channel_dir(&self.files_root, channel);
+        if self.sync.contains(channel) {
+            format!(
+                "sync is on for {heading} -- safe remote files are mirrored into {}; local files are never published and remote deletes or renames are ignored; /sync off turns it off",
+                folder.display()
+            )
+        } else {
+            format!(
+                "sync is off for {heading} -- /sync on mirrors safe remote files into {} (receive-only: it never publishes local files or applies deletes or renames)",
+                folder.display()
+            )
+        }
     }
 
     /// What `/outbox` says about the active channel's local one-way folder.
