@@ -7,6 +7,14 @@ leyline is a peer-to-peer terminal chat app (Rust, iroh + iroh-gossip + ratatui)
 - Format: `cargo fmt`
 - Lint: `cargo clippy`
 Tests live inline per-module (`#[cfg(test)]`), not in a separate `tests/` directory. No custom rustfmt/clippy config; defaults apply.
+## Versioning
+Every completed Backlog task bumps `version` in `Cargo.toml`, in the same commit as the work, following semver (`MAJOR.MINOR.PATCH`) and mirroring the conventional commit type:
+- `feat` (a new feature or enhancement): minor
+- `fix`, `perf`: patch
+- breaking (`!` or `BREAKING CHANGE:` -- anything older peers or existing on-disk data can no longer handle): major. While we are on 0.x, bump the minor instead, and ask before going to 1.0.0
+- `docs`, `test`, `refactor`, `style`, `build`, `ci`, `chore`: no bump, nothing user-visible changed
+Bumping a component resets the ones below it (0.3.1 -> 0.4.0). Building updates `Cargo.lock` to match, so commit it with `Cargo.toml`.
+Peers broadcast this version and compare it as a plain `X.Y.Z` triple (`src/version.rs`) to tell each other an update is available, so never use a pre-release suffix such as `-beta`: it reads as "not newer" and the update goes unnoticed.
 <!-- BACKLOG.MD GUIDELINES START -->
 <!-- backlog.md-instructions-version: 1.53.0 -->
 <CRITICAL_INSTRUCTION>
