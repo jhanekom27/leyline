@@ -26,6 +26,7 @@ mod sync_apply;
 #[cfg(test)]
 mod sync_docs;
 mod sync_index;
+mod sync_publish;
 mod sync_settings;
 mod term_events;
 mod thread;
@@ -64,7 +65,7 @@ use files::{
 use forgotten_devices::ForgottenDevices;
 use message::ChatMessage;
 use net::{DEVICE_SYNC_CHANNEL, Net, NetEvent};
-use outbox::{Outbox, Watcher};
+use outbox::{Outbox, Watcher as OutboxWatcher};
 use picker::{FolderListing, read_folder, remember_folder, start_folder};
 use runtime::*;
 use saved_files::SavedFiles;
@@ -584,9 +585,14 @@ async fn run(
     // up blocking jobs.
     let (outbox_tx, mut outbox_rx) =
         mpsc::channel::<Vec<(String, Result<Vec<outbox::Candidate>, String>)>>(1);
-    let mut outbox_watcher = Watcher::default();
+    let mut outbox_watcher = OutboxWatcher::default();
     let mut outbox_scan_in_flight = false;
     let mut outbox_tick = interval(Duration::from_secs(1));
+    let (sync_publish_tx, mut sync_publish_rx) =
+        mpsc::channel::<Vec<(String, Result<Vec<sync_publish::Candidate>, String>)>>(1);
+    let mut sync_publish_watcher = sync_publish::Watcher::default();
+    let mut sync_publish_scan_in_flight = false;
+    let mut sync_publish_tick = interval(Duration::from_secs(1));
     let mut dirty = true;
 
     while !app.should_quit {
@@ -924,6 +930,25 @@ async fn run(
                     });
                 }
             }
+            _ = sync_publish_tick.tick(), if !sync_publish_scan_in_flight => {
+                let channels = sync_settings.channels();
+                if !channels.is_empty() {
+                    let root = files_root.clone();
+                    let tx = sync_publish_tx.clone();
+                    sync_publish_scan_in_flight = true;
+                    tokio::task::spawn_blocking(move || {
+                        let results = channels
+                            .into_iter()
+                            .map(|channel| {
+                                let folder = files::channel_dir(&root, &channel);
+                                let result = sync_publish::scan(channel.clone(), folder);
+                                (channel, result)
+                            })
+                            .collect();
+                        let _ = tx.blocking_send(results);
+                    });
+                }
+            }
             Some(net_event) = net_rx.recv() => {
                 // Peek (without consuming) for a channel gaining a gossip
                 // neighbor, so we can also announce our history root, our
@@ -1084,6 +1109,34 @@ async fn run(
                                 }
                             }
                         }
+                    }
+                    NetEvent::SyncFileSaved {
+                        channel,
+                        hash,
+                        filename,
+                        path,
+                    } => {
+                        let root = files::channel_dir(&files_root, &channel);
+                        match path.strip_prefix(&root).ok().and_then(|path| path.to_str()) {
+                            Some(relative) => sync_publish_watcher
+                                .suppress_remote(
+                                    channel.clone(),
+                                    relative.replace(std::path::MAIN_SEPARATOR, "/"),
+                                ),
+                            None => warn!(path = %path.display(), "sync file completed outside its channel folder"),
+                        }
+                        if let Err(err) = saved_files.record(&channel, hash, &path) {
+                            warn!(%channel, "failed to record synced file: {err}");
+                        }
+                        app.handle_net_event(NetEvent::FileSaved {
+                            channel,
+                            hash,
+                            filename,
+                            path,
+                            mode: files::SaveMode::Automatic {
+                                max_bytes: files::DEFAULT_MAX_FILE_SIZE,
+                            },
+                        });
                     }
                     // A peer reached us over a point-to-point connection
                     // for the first time this session (see `direct.rs`) --
@@ -1269,6 +1322,45 @@ async fn run(
                             format!("outbox skipped {}: {error}", candidate.name),
                         );
                     }
+                }
+                dirty = true;
+            }
+            Some(results) = sync_publish_rx.recv() => {
+                sync_publish_scan_in_flight = false;
+                let mut candidates = Vec::new();
+                for (channel, result) in results {
+                    match result {
+                        Ok(found) => candidates.extend(found),
+                        Err(error) => app.push_system_to(&channel, error),
+                    }
+                }
+                for candidate in sync_publish_watcher.stable(candidates) {
+                    if candidate.size > files::DEFAULT_MAX_FILE_SIZE {
+                        app.push_system_to(
+                            &candidate.channel,
+                            format!(
+                                "sync skipped {}: {} exceeds the {} limit",
+                                candidate.relative,
+                                files::human_size(candidate.size),
+                                files::human_size(files::DEFAULT_MAX_FILE_SIZE)
+                            ),
+                        );
+                        continue;
+                    }
+                    let modified_unix_ms = candidate
+                        .modified
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX);
+                    net.publish_index_file(
+                        candidate.channel,
+                        candidate.path,
+                        candidate.relative,
+                        candidate.size,
+                        modified_unix_ms,
+                    );
                 }
                 dirty = true;
             }

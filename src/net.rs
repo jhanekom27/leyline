@@ -211,6 +211,14 @@ pub enum NetEvent {
     /// A decoded index entry received from another member.  The runtime owns
     /// validation and any filesystem application.
     RemoteIndex(RemoteIndexEntry),
+    /// A remote index file reached its final local destination. The runtime
+    /// records it as sync-originated before the local publisher next scans.
+    SyncFileSaved {
+        channel: String,
+        hash: Hash,
+        filename: String,
+        path: PathBuf,
+    },
     /// `/paste` couldn't find anything to share (an empty or unreadable
     /// clipboard, or the clipboard itself was unavailable) -- see
     /// `Net::paste`.
@@ -538,16 +546,53 @@ impl Net {
         Ok((net, joined, active))
     }
 
-    /// Publishes metadata for a path into an already-joined channel index.
-    /// This does not read or write any channel-folder data.
-    pub fn set_index_entry(
+    /// Imports one stable local file and publishes its content-addressed
+    /// description into the channel's docs index. This is fire-and-forget so
+    /// filesystem and docs work cannot delay the TUI event loop.
+    pub fn publish_index_file(
         &self,
-        channel: &str,
-        path: String,
-        entry: FileIndexEntry,
-    ) -> anyhow::Result<()> {
-        let metadata = postcard::to_stdvec(&entry).context("failed to encode file index entry")?;
-        self.sync_index.set(channel, path, metadata)
+        channel: String,
+        path: PathBuf,
+        relative: String,
+        size: u64,
+        modified_unix_ms: u64,
+    ) {
+        let backfill = self.backfill.clone();
+        let sync_index = self.sync_index.clone();
+        let author = self.our_id;
+        tokio::spawn(async move {
+            let hash = match backfill.add_file(&path).await {
+                Ok(hash) => hash,
+                Err(err) => {
+                    warn!(%channel, path = %path.display(), "failed to import sync file: {err}");
+                    return;
+                }
+            };
+            match sync_index.matches_content(&channel, &relative, hash).await {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(%channel, path = %relative, "failed to resolve sync index entry: {err}");
+                    return;
+                }
+            }
+            let entry = FileIndexEntry {
+                content_hash: hash,
+                size,
+                modified_unix_ms,
+                author,
+            };
+            let metadata = match postcard::to_stdvec(&entry) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    warn!(%channel, path = %relative, "failed to encode sync index entry: {err}");
+                    return;
+                }
+            };
+            if let Err(err) = sync_index.set(&channel, relative, metadata) {
+                warn!(%channel, "failed to publish sync index entry: {err}");
+            }
+        });
     }
 
     /// Subscribes to `secret`'s topic, registers `name` to the resulting
@@ -1386,12 +1431,11 @@ impl Net {
             match outcome {
                 Ok(()) => {
                     let _ = events_tx
-                        .send(NetEvent::FileSaved {
+                        .send(NetEvent::SyncFileSaved {
                             channel,
                             hash,
                             filename,
                             path: destination,
-                            mode: SaveMode::Automatic { max_bytes },
                         })
                         .await;
                 }
