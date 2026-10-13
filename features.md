@@ -215,6 +215,29 @@ mechanisms, not one, since they trade off differently:
   destination notice and the failures are the ones that path always had.
   An older file stays with the hash prefix rather than a second picker
   mode.
+- [x] **Fetch from any channel peer** -- `/save` used to dial only the peer
+  who shared a file, so it failed whenever that peer was offline, even
+  though anyone who had already saved the file could have served it. Peers
+  serve files out of their own `iroh-blobs` store, never out of the
+  Downloads folder: `/send` imports a copy into the store
+  (`ImportMode::Copy`), and `/save` downloads into it first and only then
+  exports a copy (`ExportMode::Copy`), so a file stays available from
+  whoever has it even after they move or delete what they saved. The store
+  is never garbage-collected (`FsStore::load` configures none), so a saved
+  file stays servable. Nothing on the wire changed.
+  `/save` now hands the downloader every peer it knows
+  (`AppState::providers_for`), best bet first: the sender, then the peers
+  online in the channels that carry the file, then everyone who has posted
+  there -- gossip only keeps a handful of direct neighbors, so someone who
+  has the file may be online without being one. Never this device, except
+  as the sender, whose file is already in our own store
+  (`BackfillStore::fetch_file` looks there before it asks anyone). The
+  downloader asks one at a time and moves on from one that can't be
+  reached (at most its 1s connect timeout) or doesn't have the file, so
+  only a save nobody can serve fails, and it says `no reachable peer has
+  it right now -- its sender may be offline` instead of a raw network
+  error. A provider id comes from a message, so one that isn't a valid key
+  is skipped rather than failing the save for everyone else.
 
 ## Networking & sharing
 

@@ -1295,17 +1295,26 @@ impl Net {
     /// it to `destination` -- the `/save` counterpart to `send_file`.
     /// `destination` is already fully resolved by the caller (see
     /// `files::resolve_destination`), so this is purely a network/blob-store
-    /// concern. Spawned like `send_file`, reporting the outcome back as
-    /// `NetEvent::FileSaved`/`FileSaveFailed` since the download can take a
-    /// while and must not block the caller's event loop. Fire-and-forget,
-    /// like `send` and `announce`.
-    pub fn save_file(&self, hash: Hash, filename: String, sender: [u8; 32], destination: PathBuf) {
+    /// concern. `providers` are who to ask for it, in order -- the file's
+    /// sender, then the other peers known in its channel (see
+    /// `app::AppState::providers_for`), so it can still be had while its
+    /// sender is offline. Spawned like `send_file`, reporting the outcome
+    /// back as `NetEvent::FileSaved`/`FileSaveFailed` since the download can
+    /// take a while and must not block the caller's event loop.
+    /// Fire-and-forget, like `send` and `announce`.
+    pub fn save_file(
+        &self,
+        hash: Hash,
+        filename: String,
+        providers: Vec<[u8; 32]>,
+        destination: PathBuf,
+    ) {
         let backfill = self.backfill.clone();
         let endpoint = self.router.endpoint().clone();
         let events_tx = self.events_tx.clone();
         tokio::spawn(async move {
             match backfill
-                .fetch_file(&endpoint, hash, sender, &destination)
+                .fetch_file(&endpoint, hash, &providers, &destination)
                 .await
             {
                 Ok(()) => {

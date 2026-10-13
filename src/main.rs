@@ -765,11 +765,11 @@ async fn run(
                             Some(InputAction::SendStaged { channel, items, caption }) => {
                                 net.send_staged(channel, items, caption);
                             }
-                            Some(InputAction::SaveFile { hash, filename, sender }) => {
+                            Some(InputAction::SaveFile { hash, filename, providers }) => {
                                 let destination_dir = downloads_dir(&data_dir);
                                 match resolve_destination(&destination_dir, &filename) {
                                     Ok(destination) => {
-                                        net.save_file(hash, filename, sender, destination);
+                                        net.save_file(hash, filename, providers, destination);
                                     }
                                     Err(err) => {
                                         app.push_system(format!(

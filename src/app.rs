@@ -285,6 +285,19 @@ impl Channel {
         })
     }
 
+    /// Whether a chat message in this channel's loaded transcript carries
+    /// the file `hash` -- what makes a channel a place the file was shared,
+    /// see `AppState::providers_for`.
+    fn carries_file(&self, hash: Hash) -> bool {
+        self.messages.iter().any(|line| match line {
+            TranscriptLine::Chat(message) => message
+                .attachment
+                .as_ref()
+                .is_some_and(|file| file.hash == hash),
+            TranscriptLine::System(_) => false,
+        })
+    }
+
     fn char_count(&self) -> usize {
         self.input.chars().count()
     }
@@ -502,15 +515,17 @@ pub enum InputAction {
         caption: String,
     },
     /// Fetch a previously shared file and save it locally -- `hash`,
-    /// `filename`, and `sender` already resolved by `run_save`, from a
+    /// `filename`, and `providers` already resolved by `run_save`, from a
     /// typed hash-prefix (see `resolve_attachment`) or, with none, as the
-    /// newest file in the active channel (see `newest_shared_file`). The
+    /// newest file in the active channel (see `newest_shared_file`).
+    /// `providers` are who to ask for it, best bet first: the file's sender,
+    /// then the other peers known in its channel (see `providers_for`). The
     /// caller (`net::Net::save_file`) picks the destination and performs
     /// the download; app.rs never touches the filesystem.
     SaveFile {
         hash: Hash,
         filename: String,
-        sender: [u8; 32],
+        providers: Vec<[u8; 32]>,
     },
     /// Share whatever's on the OS clipboard with `channel` -- from `/paste`
     /// or the `Ctrl+V`/`Cmd+V` keybinding (see `run_paste`). The caller
@@ -2660,7 +2675,9 @@ impl AppState {
     /// With none, it takes the newest file another peer shared in the
     /// active channel (`newest_shared_file`), mirroring a bare `/reply`'s
     /// "most recent message" default -- name an older file by its prefix.
-    /// Either way the file goes through the same `InputAction::SaveFile`.
+    /// Either way the file goes through the same `InputAction::SaveFile`,
+    /// asking its sender and every other peer known where it was shared
+    /// (`providers_for`), not only the sender.
     fn run_save(&mut self, arg: &str) -> Option<InputAction> {
         let file = if arg.is_empty() {
             self.newest_shared_file()
@@ -2669,11 +2686,12 @@ impl AppState {
         };
         match file {
             Ok((hash, filename, sender)) => {
+                let providers = self.providers_for(hash, sender);
                 self.push_system(format!("saving {filename}..."));
                 Some(InputAction::SaveFile {
                     hash,
                     filename,
-                    sender,
+                    providers,
                 })
             }
             Err(err) => {
@@ -2914,8 +2932,8 @@ impl AppState {
 
     /// Resolves a hex-prefix (case-insensitive, as typed after `/save`) to
     /// exactly one attachment in `known_attachments`, returning its hash,
-    /// filename, and original sender (who `/save` fetches from -- see
-    /// `net::Net::save_file`). Mirrors `resolve_id`'s errors for a
+    /// filename, and original sender (the first peer `/save` asks for it --
+    /// see `providers_for`). Mirrors `resolve_id`'s errors for a
     /// consistent UX: invalid hex, no match, or an ambiguous prefix.
     fn resolve_attachment(&self, prefix: &str) -> Result<(Hash, String, [u8; 32]), String> {
         let prefix = prefix.to_lowercase();
@@ -2961,8 +2979,8 @@ impl AppState {
 
     /// The newest file another peer shared in the active channel -- what a
     /// bare `/save` fetches, as a bare `/reply` answers the newest message
-    /// -- as `resolve_attachment` returns one: its hash, filename, and the
-    /// sender to fetch it from. "Another peer" is anyone but this device
+    /// -- as `resolve_attachment` returns one: its hash, filename, and its
+    /// sender. "Another peer" is anyone but this device
     /// (`self_id`), the test `ui::attachment_line` uses to give a file its
     /// `/save <hash>` hint, so this is always the newest file that shows
     /// one -- including a file from one of our own other devices, which
@@ -2984,6 +3002,48 @@ impl AppState {
                 _ => None,
             })
             .ok_or_else(|| "no file from another peer to save in this channel".to_string())
+    }
+
+    /// Who `/save` asks for the file `hash`, best bet first: its `sender`;
+    /// then the peers online right now in the channels that carry it
+    /// (`Channel::peers`); then everyone who has posted in those channels.
+    /// Anyone who saved the file serves it from their own blob store (see
+    /// `BackfillStore::fetch_file`), so a file does not depend on its
+    /// sender being online -- but nothing says who saved it, so every peer
+    /// we know of is a candidate, the ones reachable now before the ones
+    /// that are probably gone. Posters come after the online peers because
+    /// gossip only keeps a handful of direct neighbors: someone who has the
+    /// file may be online without being one of them.
+    ///
+    /// Never this device -- except as the sender, when the file is already
+    /// in our own blob store and needs no one -- and each peer once. A
+    /// channel carries the file if its loaded transcript has a message with
+    /// this hash; a file shared in several asks all of them, so the answer
+    /// does not depend on which channel `/save` happened to resolve it in.
+    fn providers_for(&self, hash: Hash, sender: [u8; 32]) -> Vec<[u8; 32]> {
+        let channels: Vec<&Channel> = self
+            .channels
+            .iter()
+            .filter(|channel| channel.carries_file(hash))
+            .collect();
+        let online = channels
+            .iter()
+            .flat_map(|channel| channel.peers.iter().copied());
+        let posters = channels
+            .iter()
+            .flat_map(|channel| channel.messages.iter())
+            .filter_map(|line| match line {
+                TranscriptLine::Chat(message) => Some(message.sender),
+                TranscriptLine::System(_) => None,
+            });
+
+        let mut providers = vec![sender];
+        for id in online.chain(posters) {
+            if id != self.self_id && !providers.contains(&id) {
+                providers.push(id);
+            }
+        }
+        providers
     }
 
     /// Whether keys -- and pastes -- currently go to the message box. False
@@ -3130,6 +3190,7 @@ mod tests {
     const SELF_ID: [u8; 32] = [9; 32];
     const PEER_ID: [u8; 32] = [7; 32];
     const PEER_ID_2: [u8; 32] = [8; 32];
+    const PEER_ID_3: [u8; 32] = [6; 32];
 
     fn app() -> AppState {
         AppState::new(SELF_ID, vec!["general".to_string()], "general")
@@ -3510,7 +3571,6 @@ mod tests {
     #[test]
     fn unique_peer_ids_preserves_original_order_including_mixed_groups() {
         let mut app = app();
-        const PEER_ID_3: [u8; 32] = [6; 32];
         let user_key = SecretKey::generate();
         app.handle_net_event(NetEvent::Device(
             "general".to_string(),
@@ -5632,11 +5692,11 @@ mod tests {
             InputAction::SaveFile {
                 hash: resolved_hash,
                 filename,
-                sender,
+                providers,
             } => {
                 assert_eq!(resolved_hash, hash);
                 assert_eq!(filename, "report.pdf");
-                assert_eq!(sender, PEER_ID);
+                assert_eq!(providers, vec![PEER_ID]);
             }
             _ => panic!("expected InputAction::SaveFile"),
         }
@@ -5684,16 +5744,32 @@ mod tests {
         app.handle_net_event(NetEvent::Received(channel.to_string(), message));
     }
 
-    /// What a `/save` asked to fetch -- the hash, filename, and sender of
-    /// its `InputAction::SaveFile` -- panicking on anything else.
-    fn saved_file(action: Option<InputAction>) -> (Hash, String, [u8; 32]) {
+    /// What a `/save` asked to fetch, in full -- the hash, filename, and
+    /// providers of its `InputAction::SaveFile` -- panicking on anything
+    /// else.
+    fn save_request(action: Option<InputAction>) -> (Hash, String, Vec<[u8; 32]>) {
         match action.expect("a /save with a file to save returns an action") {
             InputAction::SaveFile {
                 hash,
                 filename,
-                sender,
-            } => (hash, filename, sender),
+                providers,
+            } => (hash, filename, providers),
             _ => panic!("expected InputAction::SaveFile"),
+        }
+    }
+
+    /// Which file a `/save` chose: its hash, its filename, and the sender --
+    /// the first provider, the one asked before anyone else.
+    fn saved_file(action: Option<InputAction>) -> (Hash, String, [u8; 32]) {
+        let (hash, filename, providers) = save_request(action);
+        (hash, filename, providers[0])
+    }
+
+    /// Delivers a gossip neighbor coming up on `channel` for each of `peers`,
+    /// in order.
+    fn peers_join(app: &mut AppState, channel: &str, peers: &[[u8; 32]]) {
+        for peer in peers {
+            app.handle_net_event(NetEvent::PeerJoined(channel.to_string(), *peer));
         }
     }
 
@@ -5881,6 +5957,139 @@ mod tests {
         ));
 
         assert_eq!(saved, (older_hash, "old.pdf".to_string(), PEER_ID));
+    }
+
+    #[test]
+    fn save_asks_the_sender_first_then_online_peers_then_those_who_only_posted() {
+        let mut app = app();
+        // A poster who spoke before the file was shared still comes after a
+        // peer who is online now: someone reachable beats someone who may
+        // be long gone.
+        receive(
+            &mut app,
+            "general",
+            compose_message(PEER_ID_3, "morning", None),
+        );
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        peers_join(&mut app, "general", &[PEER_ID_2]);
+
+        let (_, _, providers) = save_request(submit(&mut app, "/save"));
+
+        assert_eq!(providers, vec![PEER_ID, PEER_ID_2, PEER_ID_3]);
+    }
+
+    #[test]
+    fn save_asks_each_peer_once() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        receive(
+            &mut app,
+            "general",
+            compose_message(PEER_ID_2, "thanks", None),
+        );
+        // Both are online *and* posted, and the sender is among them.
+        peers_join(&mut app, "general", &[PEER_ID_2, PEER_ID]);
+
+        let (_, _, providers) = save_request(submit(&mut app, "/save"));
+
+        assert_eq!(providers, vec![PEER_ID, PEER_ID_2]);
+    }
+
+    #[test]
+    fn save_never_asks_this_device_but_does_ask_a_paired_sibling() {
+        let mut app = app();
+        let user_key = SecretKey::generate();
+        app.load_self_user_id(*user_key.public().as_bytes());
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID_2),
+        ));
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        app.record_sent_message("general", compose_message(SELF_ID, "got it", None));
+        peers_join(&mut app, "general", &[PEER_ID_2]);
+
+        let (_, _, providers) = save_request(submit(&mut app, "/save"));
+
+        assert_eq!(
+            providers,
+            vec![PEER_ID, PEER_ID_2],
+            "our other device may hold the file; this one is never asked"
+        );
+    }
+
+    #[test]
+    fn save_of_our_own_file_still_lists_this_device_first_since_it_holds_the_file() {
+        // Left out of everyone else's list, but as the sender it stays: the
+        // file is already in our own blob store, so it needs no one.
+        let mut app = app();
+        let mine = file_message(1, SELF_ID, "mine.pdf", b"mine");
+        let hash = mine.attachment.as_ref().unwrap().hash;
+        app.record_sent_message("general", mine);
+        peers_join(&mut app, "general", &[PEER_ID]);
+
+        let (_, _, providers) =
+            save_request(submit(&mut app, &format!("/save {}", &hash.to_hex()[..8])));
+
+        assert_eq!(providers, vec![SELF_ID, PEER_ID]);
+    }
+
+    #[test]
+    fn save_only_asks_peers_of_the_channels_that_carried_the_file() {
+        let mut app = multi_channel_app(); // "random" is active
+        receive(
+            &mut app,
+            "random",
+            file_message(1, PEER_ID, "here.pdf", b"here"),
+        );
+        peers_join(&mut app, "random", &[PEER_ID_3]);
+        // Someone who is only in #general, where the file was never shared.
+        receive(
+            &mut app,
+            "general",
+            compose_message(PEER_ID_2, "hello", None),
+        );
+        peers_join(&mut app, "general", &[PEER_ID_2]);
+
+        let (_, _, providers) = save_request(submit(&mut app, "/save"));
+
+        assert_eq!(providers, vec![PEER_ID, PEER_ID_3]);
+    }
+
+    #[test]
+    fn save_asks_every_channel_the_file_was_shared_in() {
+        let mut app = multi_channel_app(); // "random" is active
+        let content = b"same bytes";
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", content),
+        );
+        receive(
+            &mut app,
+            "random",
+            file_message(2, PEER_ID_2, "report.pdf", content),
+        );
+        peers_join(&mut app, "general", &[PEER_ID_3]);
+        let prefix = &iroh_blobs::Hash::new(content).to_hex()[..8];
+
+        // Resolved by prefix, the same answer whichever channel is active:
+        // the first sender seen, then the peer online in #general, then the
+        // one who only posted in #random.
+        let (_, _, providers) = save_request(submit(&mut app, &format!("/save {prefix}")));
+
+        assert_eq!(providers, vec![PEER_ID, PEER_ID_3, PEER_ID_2]);
     }
 
     #[test]

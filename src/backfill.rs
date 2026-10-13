@@ -21,7 +21,7 @@ use iroh::{Endpoint, EndpointId};
 use iroh_blobs::hashseq::HashSeq;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobFormat, BlobsProtocol, Hash, HashAndFormat};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::message::ChatMessage;
 
@@ -263,25 +263,61 @@ impl BackfillStore {
         Ok(tag.hash)
     }
 
-    /// Fetches a single file blob from `sender` and writes it straight to
-    /// `destination` -- the `/save` counterpart to `add_file`, using the
-    /// same pull-on-demand downloader as `fetch` above, just for one raw
-    /// blob instead of a history manifest.
+    /// Fetches a single file blob and writes it straight to `destination`
+    /// -- the `/save` counterpart to `add_file`, using the same
+    /// pull-on-demand downloader as `fetch` above, just for one raw blob
+    /// instead of a history manifest.
+    ///
+    /// `providers` are asked one at a time, in the order given, until one
+    /// serves the whole blob -- the file's sender first, then the other
+    /// peers known in its channel (see `app::AppState::providers_for`).
+    /// Anyone who already saved the file holds it in their own blob store
+    /// and serves it from there: a download lands in the store first and
+    /// `destination` only gets an exported copy, so the file outlives its
+    /// sender's session, and moving or deleting that copy changes nothing
+    /// for whoever else wants it. A provider that is offline, or online
+    /// without the blob, only hands over to the next one. A blob already
+    /// in our own store -- a file we sent, or saved before -- is exported
+    /// without asking anyone.
+    ///
+    /// The ids come from peers' messages, so one that is not a valid key is
+    /// skipped rather than failing the save for everyone else listed.
     pub async fn fetch_file(
         &self,
         endpoint: &Endpoint,
         hash: Hash,
-        sender: [u8; 32],
+        providers: &[[u8; 32]],
         destination: &Path,
     ) -> anyhow::Result<()> {
-        let sender_id = EndpointId::from_bytes(&sender)
-            .map_err(|err| anyhow::anyhow!("invalid sender id: {err}"))?;
-
-        self.store
-            .downloader(endpoint)
-            .download(HashAndFormat::raw(hash), vec![sender_id])
+        let held = self
+            .store
+            .remote()
+            .local(HashAndFormat::raw(hash))
             .await
-            .map_err(|err| anyhow::anyhow!("failed to download file: {err}"))?;
+            .map_err(|err| anyhow::anyhow!("failed to look for the file locally: {err}"))?
+            .is_complete();
+
+        if !held {
+            let providers: Vec<EndpointId> = providers
+                .iter()
+                .filter_map(|id| EndpointId::from_bytes(id).ok())
+                .collect();
+
+            self.store
+                .downloader(endpoint)
+                .download(HashAndFormat::raw(hash), providers)
+                .await
+                .map_err(|err| {
+                    // The downloader only says it was "unable to download"
+                    // the hash once every provider has failed; what each
+                    // one answered stays in its own trace. Nobody can act
+                    // on that, so the user is told what is going on.
+                    debug!(%hash, "no provider served the file: {err}");
+                    anyhow::anyhow!(
+                        "no reachable peer has it right now -- its sender may be offline"
+                    )
+                })?;
+        }
 
         self.store
             .blobs()
@@ -294,6 +330,10 @@ impl BackfillStore {
 
 #[cfg(test)]
 mod tests {
+    use iroh::address_lookup::memory::MemoryLookup;
+    use iroh::endpoint::presets;
+    use iroh::protocol::Router;
+
     use super::*;
 
     fn message(ts_unix_ms: u64, id: u64, text: &str) -> ChatMessage {
@@ -444,58 +484,98 @@ mod tests {
         assert_eq!(first, second, "identical bytes must hash identically");
     }
 
+    /// A running peer for the file-fetch tests: its own blob store served
+    /// over a real endpoint -- the same pieces net.rs wires together --
+    /// bound with no relay or discovery, so each test decides who can find
+    /// whom (`learn`) without depending on public infrastructure.
+    struct TestPeer {
+        backfill: BackfillStore,
+        router: Router,
+        lookup: MemoryLookup,
+        /// Keeps the store's directory alive as long as the peer.
+        _dir: tempfile::TempDir,
+    }
+
+    impl TestPeer {
+        async fn start() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let backfill = BackfillStore::new(dir.path()).await.unwrap();
+            let lookup = MemoryLookup::new();
+            let endpoint = Endpoint::builder(presets::Minimal)
+                .address_lookup(lookup.clone())
+                .bind()
+                .await
+                .unwrap();
+            let router = Router::builder(endpoint)
+                .accept(iroh_blobs::ALPN, backfill.protocol_handler())
+                .spawn();
+            Self {
+                backfill,
+                router,
+                lookup,
+                _dir: dir,
+            }
+        }
+
+        fn id(&self) -> [u8; 32] {
+            *self.router.endpoint().id().as_bytes()
+        }
+
+        /// Lets this peer dial `other` by its id alone, as net.rs can for
+        /// anyone it holds an address hint for. Done while `other` is up: a
+        /// peer that has gone offline has no address left to give.
+        fn learn(&self, other: &TestPeer) {
+            self.lookup
+                .add_endpoint_info(other.router.endpoint().addr());
+        }
+
+        /// Puts `bytes` into this peer's blob store, as sending a file does.
+        async fn share(&self, bytes: &[u8]) -> Hash {
+            self.backfill.add_bytes(bytes.to_vec()).await.unwrap()
+        }
+
+        /// What `/save` does: fetches `hash` from `providers`, in order,
+        /// and exports it to `destination`.
+        async fn save(
+            &self,
+            hash: Hash,
+            providers: &[[u8; 32]],
+            destination: &Path,
+        ) -> anyhow::Result<()> {
+            self.backfill
+                .fetch_file(self.router.endpoint(), hash, providers, destination)
+                .await
+        }
+
+        /// The peer going away: its endpoint closes and nothing answers on
+        /// its id any more.
+        async fn go_offline(&self) {
+            self.router.shutdown().await.unwrap();
+        }
+    }
+
     /// Regression test for the multi-device identity story (LEY-20):
-    /// `/save` always fetches a file by dialing the *sender's* EndpointId
-    /// directly (see `net::Net::save_file`), never from "the channel" at
-    /// large, so sending from one device and saving from another is really
-    /// just this -- a different device's `BackfillStore` fetching from the
-    /// sender's real, running endpoint over loopback, not merely one
-    /// store's own round trip (the other tests in this file never involve
-    /// a second store or any real networking).
+    /// `/save` fetches a file by dialing endpoint ids directly (see
+    /// `net::Net::save_file`), never "the channel" at large, so sending
+    /// from one device and saving from another is really just this -- a
+    /// different device's `BackfillStore` fetching from the sender's real,
+    /// running endpoint over loopback, not merely one store's own round
+    /// trip (the other tests in this file never involve a second store or
+    /// any real networking).
     #[tokio::test]
     async fn fetch_file_retrieves_a_file_from_a_different_devices_backfill_store() {
-        use iroh::Endpoint;
-        use iroh::address_lookup::memory::MemoryLookup;
-        use iroh::endpoint::presets;
-        use iroh::protocol::Router;
-
-        let sender_dir = tempfile::tempdir().unwrap();
-        let sender_store = BackfillStore::new(sender_dir.path()).await.unwrap();
-        let sender_endpoint = Endpoint::bind(presets::Minimal).await.unwrap();
-        let sender_id = sender_endpoint.id();
-        let sender_addr = sender_endpoint.addr();
-        let sender_router = Router::builder(sender_endpoint)
-            .accept(iroh_blobs::ALPN, sender_store.protocol_handler())
-            .spawn();
+        let sender = TestPeer::start().await;
+        let receiver = TestPeer::start().await;
+        receiver.learn(&sender);
 
         let file_dir = tempfile::tempdir().unwrap();
         let file_path = file_dir.path().join("report.txt");
         std::fs::write(&file_path, b"shared across devices").unwrap();
-        let hash = sender_store.add_file(&file_path).await.unwrap();
-
-        // The receiving device: a separate store, a separate endpoint, and
-        // (mirroring net.rs's own `MemoryLookup` pre-seeding for a ticket's
-        // address hints) the sender's address seeded ahead of time, so
-        // `fetch_file`'s dial-by-bare-EndpointId has somewhere real to go
-        // without depending on public discovery infrastructure in a test.
-        let receiver_dir = tempfile::tempdir().unwrap();
-        let receiver_store = BackfillStore::new(receiver_dir.path()).await.unwrap();
-        let address_lookup = MemoryLookup::new();
-        address_lookup.add_endpoint_info(sender_addr);
-        let receiver_endpoint = Endpoint::builder(presets::Minimal)
-            .address_lookup(address_lookup)
-            .bind()
-            .await
-            .unwrap();
+        let hash = sender.backfill.add_file(&file_path).await.unwrap();
 
         let destination = file_dir.path().join("downloaded.txt");
-        receiver_store
-            .fetch_file(
-                &receiver_endpoint,
-                hash,
-                *sender_id.as_bytes(),
-                &destination,
-            )
+        receiver
+            .save(hash, &[sender.id()], &destination)
             .await
             .unwrap();
 
@@ -503,8 +583,161 @@ mod tests {
             std::fs::read(&destination).unwrap(),
             b"shared across devices"
         );
+    }
 
-        receiver_endpoint.close().await;
-        sender_router.shutdown().await.unwrap();
+    /// LEY-25.5: a file outlives the session of whoever sent it. Anyone who
+    /// saved it serves it from their own blob store, so it can still be
+    /// fetched from them once the sender is gone -- and once they have
+    /// moved or deleted the copy in their Downloads folder, which is only an
+    /// export out of the store, never what gets served.
+    #[tokio::test]
+    async fn fetch_file_falls_back_to_a_peer_that_saved_it_when_the_sender_is_offline() {
+        let sender = TestPeer::start().await;
+        let saver = TestPeer::start().await;
+        let latecomer = TestPeer::start().await;
+        saver.learn(&sender);
+        latecomer.learn(&sender);
+        latecomer.learn(&saver);
+
+        // Bigger than a store keeps inline in its database, so this is a
+        // file on disk inside the store, like any real share -- the case a
+        // moved Downloads copy would matter for.
+        let content = vec![7u8; 64 * 1024];
+        let hash = sender.share(&content).await;
+
+        let downloads = tempfile::tempdir().unwrap();
+        let saved = downloads.path().join("report.bin");
+        saver.save(hash, &[sender.id()], &saved).await.unwrap();
+        std::fs::remove_file(&saved).unwrap();
+        sender.go_offline().await;
+
+        let destination = downloads.path().join("late.bin");
+        latecomer
+            .save(hash, &[sender.id(), saver.id()], &destination)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn fetch_file_skips_an_online_peer_that_does_not_have_the_file() {
+        // Online and reachable, but it never saw the file: listed ahead of
+        // the one that has it, it must not fail the save.
+        let bystander = TestPeer::start().await;
+        let holder = TestPeer::start().await;
+        let receiver = TestPeer::start().await;
+        receiver.learn(&bystander);
+        receiver.learn(&holder);
+        let hash = holder.share(b"only the holder has this").await;
+
+        let downloads = tempfile::tempdir().unwrap();
+        let destination = downloads.path().join("report.txt");
+        receiver
+            .save(hash, &[bystander.id(), holder.id()], &destination)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"only the holder has this"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_file_says_no_reachable_peer_has_it_when_every_provider_fails() {
+        let sender = TestPeer::start().await;
+        let bystander = TestPeer::start().await;
+        let receiver = TestPeer::start().await;
+        receiver.learn(&sender);
+        receiver.learn(&bystander);
+        let hash = sender.share(b"nobody left to serve this").await;
+        sender.go_offline().await;
+
+        let downloads = tempfile::tempdir().unwrap();
+        let destination = downloads.path().join("report.txt");
+        let err = receiver
+            .save(hash, &[sender.id(), bystander.id()], &destination)
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("no reachable peer has it"),
+            "got: {message}"
+        );
+        assert!(message.contains("sender may be offline"), "got: {message}");
+        assert!(
+            !message.contains("Unable to download"),
+            "the downloader's own wording must not reach the user, got: {message}"
+        );
+        assert!(
+            !destination.exists(),
+            "a failed save must not leave a file behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_file_saves_a_file_already_in_the_local_store_whatever_the_providers() {
+        // A file we sent ourselves, or saved before, is in our own store:
+        // saving it again needs no peer, so none being reachable -- or
+        // listed at all -- is fine.
+        let gone = TestPeer::start().await;
+        let receiver = TestPeer::start().await;
+        receiver.learn(&gone);
+        gone.go_offline().await;
+        let hash = receiver.share(b"already here").await;
+
+        let downloads = tempfile::tempdir().unwrap();
+        let unreachable = downloads.path().join("unreachable.txt");
+        receiver
+            .save(hash, &[gone.id()], &unreachable)
+            .await
+            .unwrap();
+        let unlisted = downloads.path().join("unlisted.txt");
+        receiver.save(hash, &[], &unlisted).await.unwrap();
+
+        assert_eq!(std::fs::read(&unreachable).unwrap(), b"already here");
+        assert_eq!(std::fs::read(&unlisted).unwrap(), b"already here");
+    }
+
+    #[tokio::test]
+    async fn fetch_file_skips_a_provider_id_that_is_not_a_valid_key() {
+        // Provider ids come from peers' messages, so a crafted one must not
+        // be able to break `/save` for everyone else in the channel.
+        let invalid = (0..=u8::MAX)
+            .map(|byte| [byte; 32])
+            .find(|id| EndpointId::from_bytes(id).is_err())
+            .expect("some repeated-byte id is not a valid key");
+        let holder = TestPeer::start().await;
+        let receiver = TestPeer::start().await;
+        receiver.learn(&holder);
+        let hash = holder.share(b"served despite the junk id").await;
+
+        let downloads = tempfile::tempdir().unwrap();
+        let destination = downloads.path().join("report.txt");
+        receiver
+            .save(hash, &[invalid, holder.id()], &destination)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"served despite the junk id"
+        );
+
+        // With nobody valid to ask it fails like any other save that has no
+        // one to serve it.
+        let err = receiver
+            .save(
+                Hash::new(b"held by no one"),
+                &[invalid],
+                &downloads.path().join("other.txt"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no reachable peer has it"),
+            "got: {err}"
+        );
     }
 }

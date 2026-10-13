@@ -337,6 +337,28 @@ Backfill only rides a channel's existing gossip topic, so it only ever
 covers channels already joined — a name or ticket is still needed to join
 a channel before its history can sync to you.
 
+## File sharing
+
+A shared file is a `ChatMessage` whose `attachment` names a content hash in
+the same `iroh-blobs` store that backs history backfill; nothing is fetched
+until someone runs `/save`. Peers serve files out of that store, never out
+of the Downloads folder: `/send` imports a copy into it, and `/save`
+downloads into it first and only then exports a copy to Downloads
+(`files.rs`). So moving or deleting what you saved changes nothing for
+anyone else, and since the store is never garbage-collected, everyone who
+has saved a file keeps serving it -- a file outlives the session of its
+sender.
+
+Nothing records who has saved what, so `/save` asks everyone it knows
+(`AppState::providers_for`): the sender first, then the peers online in
+the channels that carry the file, then everyone who has posted there.
+`BackfillStore::fetch_file` hands them to the `iroh-blobs` downloader,
+which tries them one at a time and moves on from one that is offline or
+doesn't have the blob. Which peer served a blob never matters for
+integrity -- it is verified against its hash as it streams in -- and, as
+with [Room privacy](#room-privacy), the hash is the capability: anyone who
+can reach a peer and knows it can fetch the blob.
+
 ## Point-to-point messaging
 
 `/dm <alias|hex-prefix|endpoint-id> [text]` (`direct.rs`) is a second,
