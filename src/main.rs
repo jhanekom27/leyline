@@ -514,7 +514,7 @@ async fn run(
         mut settings,
         mut forgotten_devices,
         mut saved_files,
-        mut files_root,
+        files_root,
         size_limit,
         data_dir,
     } = session;
@@ -585,6 +585,9 @@ async fn run(
         let docs = direct_registry.docs_for(peer);
         let channel = net.open_direct(peer);
         net.sync_direct(peer, docs);
+        if let Some(folder) = direct_registry.folder_for(peer) {
+            app.load_direct_folder(channel.clone(), folder);
+        }
         if app.background_direct_channel(channel.clone(), peer) {
             match store.load(&channel) {
                 Ok(history) => app.load_history(&channel, history),
@@ -663,7 +666,9 @@ async fn run(
                             Some(InputAction::OpenDirect { peer, text }) => {
                                 let channel = net.open_direct(peer);
                                 if app.activate_direct_channel(channel.clone(), peer) {
-                                    if let Err(err) = direct_registry.record(peer) {
+                                    if let Err(err) =
+                                        record_direct_peer(&mut direct_registry, &mut app, peer)
+                                    {
                                         warn!(%channel, "failed to persist direct peer registry entry: {err}");
                                     }
                                     match store.load(&channel) {
@@ -682,7 +687,7 @@ async fn run(
                                 }
                             }
                             Some(InputAction::SetOutbox { channel, on }) => {
-                                let folder = files::outbox_dir(&files_root, &channel);
+                                let folder = app.folder_dir(&channel).join("send");
                                 let result = if on {
                                     outbox.enable(&channel, &folder)
                                 } else {
@@ -877,7 +882,6 @@ async fn run(
                                             "files will now be saved under {} (files saved before stay where they are)",
                                             root.display()
                                         ));
-                                        files_root = root.clone();
                                         app.load_files_root(root);
                                     }
                                     Err(message) => app.push_system(message),
@@ -963,14 +967,16 @@ async fn run(
             _ = outbox_tick.tick(), if !outbox_scan_in_flight => {
                 let channels = outbox.channels();
                 if !channels.is_empty() {
-                    let root = files_root.clone();
+                    let folders: Vec<_> = channels
+                        .into_iter()
+                        .map(|channel| (app.folder_dir(&channel).join("send"), channel))
+                        .collect();
                     let tx = outbox_tx.clone();
                     outbox_scan_in_flight = true;
                     tokio::task::spawn_blocking(move || {
-                        let results = channels
+                        let results = folders
                             .into_iter()
-                            .map(|channel| {
-                                let folder = files::outbox_dir(&root, &channel);
+                            .map(|(folder, channel)| {
                                 let result = outbox::scan(channel.clone(), folder);
                                 (channel, result)
                             })
@@ -982,14 +988,16 @@ async fn run(
             _ = sync_publish_tick.tick(), if !sync_publish_scan_in_flight => {
                 let channels = sync_settings.active_channels();
                 if !channels.is_empty() {
-                    let root = files_root.clone();
+                    let folders: Vec<_> = channels
+                        .into_iter()
+                        .map(|channel| (app.folder_dir(&channel), channel))
+                        .collect();
                     let tx = sync_publish_tx.clone();
                     sync_publish_scan_in_flight = true;
                     tokio::task::spawn_blocking(move || {
-                        let results = channels
+                        let results = folders
                             .into_iter()
-                            .map(|channel| {
-                                let folder = files::channel_dir(&root, &channel);
+                            .map(|(folder, channel)| {
                                 let result = sync_publish::scan(channel.clone(), folder);
                                 (channel, result)
                             })
@@ -1160,7 +1168,7 @@ async fn run(
                                     files::human_size(files::DEFAULT_MAX_FILE_SIZE)
                                 ));
                             } else {
-                                let root = files::channel_dir(&files_root, &remote.channel);
+                                let root = app.folder_dir(&remote.channel);
                                 let relocation = saved_files
                                     .present_in(&remote.channel)
                                     .get(&remote.entry.content_hash)
@@ -1226,7 +1234,7 @@ async fn run(
                                     format!("sync kept locally changed {path} after a remote delete"),
                                 );
                             } else {
-                                let root = files::channel_dir(&files_root, &channel);
+                                let root = app.folder_dir(&channel);
                                 match sync_apply::trash(&root, &path) {
                                     Ok(sync_apply::Trash::Moved(trash)) => {
                                         let source = root.join(&path);
@@ -1254,7 +1262,7 @@ async fn run(
                         path,
                     } => {
                         app.sync_succeeded(&channel, &filename, message::now_unix_ms());
-                        let root = files::channel_dir(&files_root, &channel);
+                        let root = app.folder_dir(&channel);
                         match path.strip_prefix(&root).ok().and_then(|path| path.to_str()) {
                             Some(relative) => record_remote_sync_file(
                                 &mut sync_publish_watcher,
@@ -1285,7 +1293,9 @@ async fn run(
                     // same way the startup restore loop above does.
                     NetEvent::DirectJoined { channel, peer } => {
                         if app.background_direct_channel(channel.clone(), peer) {
-                            if let Err(err) = direct_registry.record(peer) {
+                            if let Err(err) =
+                                record_direct_peer(&mut direct_registry, &mut app, peer)
+                            {
                                 warn!(%channel, "failed to persist direct peer registry entry: {err}");
                             }
                             match store.load(&channel) {
@@ -1298,7 +1308,9 @@ async fn run(
                     NetEvent::DirectDocs { peer, docs } => {
                         if peer >= net.our_id {
                             warn!("ignoring direct docs capability from non-owner");
-                        } else if let Err(err) = direct_registry.record(peer) {
+                        } else if let Err(err) =
+                            record_direct_peer(&mut direct_registry, &mut app, peer)
+                        {
                             warn!("failed to persist direct peer registry entry: {err}");
                         } else if let Err(err) = direct_registry.record_docs(peer, docs.clone()) {
                             warn!("failed to persist direct docs capability: {err}");
@@ -1307,7 +1319,9 @@ async fn run(
                         }
                     }
                     NetEvent::DirectDocsReady { peer, docs } => {
-                        if let Err(err) = direct_registry.record(peer) {
+                        if let Err(err) =
+                            record_direct_peer(&mut direct_registry, &mut app, peer)
+                        {
                             warn!("failed to persist direct peer registry entry: {err}");
                         } else if let Err(err) = direct_registry.record_docs(peer, docs) {
                             warn!("failed to persist direct docs capability: {err}");
@@ -1555,6 +1569,20 @@ async fn run(
     net.shutdown().await?;
 
     Ok(app.restart_with_ticket)
+}
+
+fn record_direct_peer(
+    registry: &mut DirectRegistry,
+    app: &mut AppState,
+    peer: [u8; 32],
+) -> anyhow::Result<()> {
+    if registry.record(peer)? {
+        registry.record_folder(peer, files::direct_folder(&app.display_name(&peer), &peer))?;
+    }
+    if let Some(folder) = registry.folder_for(peer) {
+        app.load_direct_folder(direct::channel_name(&peer), folder);
+    }
+    Ok(())
 }
 fn record_remote_sync_file(
     watcher: &mut sync_publish::Watcher,

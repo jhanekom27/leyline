@@ -149,11 +149,21 @@ pub fn channel_dir(root: &Path, channel: &str) -> PathBuf {
     root.join(channel_folder(channel))
 }
 
-/// The one-way drop folder for `channel`. It deliberately lives beside that
-/// channel's received files, while remaining a local convention only: no
-/// folder contents are synchronized or ever copied back from a peer.
-pub fn outbox_dir(root: &Path, channel: &str) -> PathBuf {
-    channel_dir(root, channel).join("send")
+/// A new direct conversation's local folder name. `label` is useful only
+/// for recognition; the peer-id suffix remains part of the persisted name
+/// so aliases can collide or later change without affecting the folder.
+pub fn direct_folder(label: &str, peer: &[u8; 32]) -> String {
+    let id = peer[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let label = readable_part(label).to_lowercase();
+    let name = if label == id {
+        format!("dm-{id}")
+    } else {
+        format!("dm-{label}-{id}")
+    };
+    channel_folder(&name)
 }
 
 /// The name of the folder for the channel stored as `channel`: a pure
@@ -293,6 +303,7 @@ pub fn resolve_destination(dir: &Path, filename: &str) -> std::io::Result<PathBu
             return Ok(path);
         }
     }
+
     Err(std::io::Error::other(format!(
         "could not find a free name for {safe_name:?} in {}",
         dir.display()
@@ -726,6 +737,17 @@ pub fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_folder_combines_a_readable_label_with_a_peer_suffix() {
+        let mut peer = [0; 32];
+        peer[..4].copy_from_slice(&[0x48, 0x43, 0x3c, 0x9d]);
+        let mut other = peer;
+        other[3] = 0x9e;
+
+        assert_eq!(direct_folder("Matt", &peer), "dm-matt-48433c9d");
+        assert_eq!(direct_folder("48433c9d", &peer), "dm-48433c9d");
+        assert_ne!(direct_folder("Matt", &peer), direct_folder("Matt", &other));
+    }
 
     #[test]
     fn sanitize_filename_keeps_a_plain_name() {

@@ -16,7 +16,7 @@ use iroh_tickets::Ticket;
 use crate::autosave::{AutoSaveLimit, DEFAULT_AUTOSAVE_LIMIT};
 use crate::files::{
     DEFAULT_MAX_FILE_SIZE, SaveMode, SizeLimit, StagedAttachment, channel_dir, human_size,
-    outbox_dir, runs_when_opened,
+    runs_when_opened,
 };
 use crate::message::{ChatMessage, FileAttachment, now_unix_ms};
 use crate::net::{DEVICE_SYNC_CHANNEL, NetEvent};
@@ -851,6 +851,10 @@ pub struct AppState {
     /// (`activate_direct_channel`) or via `NetEvent::DirectJoined` when a
     /// peer reaches us first (`background_direct_channel`).
     direct_channels: HashMap<[u8; 32], String>,
+    /// Stored channel name -> local physical folder name for direct chats.
+    /// Group channels deliberately have no entry and continue to derive
+    /// their folder from the immutable channel name.
+    direct_folders: HashMap<String, String>,
     /// Local display names given to group channels via `/rename`, keyed by
     /// the channel's stored name (its identity, which never changes) --
     /// checked by `channel_label`, the channel counterpart to `petnames`.
@@ -995,6 +999,7 @@ impl AppState {
             forgotten: HashSet::new(),
             dm_channels: HashMap::new(),
             direct_channels: HashMap::new(),
+            direct_folders: HashMap::new(),
             renames: HashMap::new(),
             picking_reply: None,
             picking_thread: None,
@@ -1089,6 +1094,23 @@ impl AppState {
     /// starts -- mirrors `load_browse_dir`.
     pub fn load_files_root(&mut self, root: PathBuf) {
         self.files_root = root;
+    }
+
+    /// Associates one direct channel with its persisted local folder name.
+    /// The caller owns persistence; app state only resolves paths from the
+    /// already validated mapping.
+    pub fn load_direct_folder(&mut self, channel: String, folder: String) {
+        self.direct_folders.insert(channel, folder);
+    }
+
+    /// The physical folder for `channel`. Direct mappings are local-only;
+    /// every other channel retains its original stored-name folder.
+    pub fn folder_dir(&self, channel: &str) -> PathBuf {
+        let folder = self
+            .direct_folders
+            .get(channel)
+            .map_or(channel, String::as_str);
+        channel_dir(&self.files_root, folder)
     }
 
     /// Seeds the size limit (see `files::size_limit`, which resolves what
@@ -1912,6 +1934,7 @@ impl AppState {
         let heading = self.channel_heading(channel);
         self.dm_channels.retain(|_, name| name != channel);
         self.direct_channels.retain(|_, name| name != channel);
+        self.direct_folders.remove(channel);
         self.renames.remove(channel);
         self.autosave.remove(channel);
         self.outbox.remove(channel);
@@ -2842,7 +2865,7 @@ impl AppState {
         sender: [u8; 32],
     ) -> InputAction {
         let providers = self.providers_for(hash, sender);
-        let dir = channel_dir(&self.files_root, &channel);
+        let dir = self.folder_dir(&channel);
         self.push_system(format!("saving {filename}..."));
         InputAction::SaveFile(SaveRequest {
             channel,
@@ -2940,7 +2963,7 @@ impl AppState {
             hash,
             filename: file.filename.clone(),
             providers,
-            dir: channel_dir(&self.files_root, channel),
+            dir: self.folder_dir(channel),
             mode: SaveMode::Automatic { max_bytes },
         })
     }
@@ -2971,7 +2994,7 @@ impl AppState {
             self.push_system(format!(
                 "files from {} are saved in {} -- every channel's folder is under {}, which /folder <path> moves",
                 self.channel_heading(&channel),
-                channel_dir(&self.files_root, &channel).display(),
+                self.folder_dir(&channel).display(),
                 self.files_root.display()
             ));
             return None;
@@ -3097,7 +3120,7 @@ impl AppState {
 
     fn sync_notice(&self, channel: &str) -> String {
         let heading = self.channel_heading(channel);
-        let folder = channel_dir(&self.files_root, channel);
+        let folder = self.folder_dir(channel);
         let status = self.sync_status(channel);
         let pending = status.map_or(0, SyncStatus::pending_count);
         let errors = status.map_or(0, SyncStatus::error_count);
@@ -3125,7 +3148,7 @@ impl AppState {
     /// What `/outbox` says about the active channel's local one-way folder.
     fn outbox_notice(&self, channel: &str) -> String {
         let heading = self.channel_heading(channel);
-        let folder = outbox_dir(&self.files_root, channel);
+        let folder = self.folder_dir(channel).join("send");
         if self.outbox.contains(channel) {
             format!(
                 "outbox is on for {heading} -- new stable files in {} are shared once; /outbox off turns it off",
@@ -6814,6 +6837,43 @@ mod tests {
         assert_eq!(dm, channel_dir(Path::new("/files"), "dm-Alice"));
         assert_eq!(chat, PathBuf::from("/files/p2p-08080808"));
         assert_ne!(dm, chat);
+    }
+
+    #[test]
+    fn a_direct_folder_mapping_controls_saves_without_following_later_aliases() {
+        let mut app = app_for_the_switcher();
+        app.load_files_root(PathBuf::from("/files"));
+        app.load_direct_folder("p2p-08080808".into(), "dm-bob-08080808".into());
+        app.active = 3;
+        receive(
+            &mut app,
+            "p2p-08080808",
+            file_message(1, PEER_ID_2, "report.pdf", b"report"),
+        );
+
+        let before = save_dir(submit(&mut app, "/save"));
+        submit(
+            &mut app,
+            &format!("/alias {} Carol", &hex_id(&PEER_ID_2)[..8]),
+        );
+        let after = save_dir(submit(&mut app, "/save"));
+
+        assert_eq!(before, PathBuf::from("/files/dm-bob-08080808"));
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn sync_status_reports_a_mapped_direct_folder() {
+        let mut app = app_for_the_switcher();
+        app.load_files_root(PathBuf::from("/files"));
+        app.load_direct_folder("p2p-08080808".into(), "dm-bob-08080808".into());
+        app.active = 3;
+
+        submit(&mut app, "/sync");
+
+        assert!(
+            as_system(app.active().messages.back().unwrap()).contains("/files/dm-bob-08080808")
+        );
     }
 
     #[test]

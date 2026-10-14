@@ -21,6 +21,12 @@ use tracing::warn;
 struct DirectRecord {
     peer: [u8; 32],
     docs: Option<Capability>,
+    folder: Option<String>,
+}
+#[derive(Serialize, Deserialize)]
+struct DirectRecordV2 {
+    peer: [u8; 32],
+    docs: Option<Capability>,
 }
 
 /// Local, whole-file-rewrite-on-change store of known point-to-point peer
@@ -70,17 +76,45 @@ impl DirectRegistry {
             .find(|record| record.peer == peer)
             .and_then(|record| record.docs.clone())
     }
+    /// The local physical folder assigned to a direct conversation. Missing
+    /// means this is an older conversation that continues using its stable
+    /// `p2p-*` channel name as the folder.
+    pub fn folder_for(&self, peer: [u8; 32]) -> Option<String> {
+        self.peers
+            .iter()
+            .find(|record| record.peer == peer)
+            .and_then(|record| record.folder.clone())
+    }
 
     /// Records `peer` as having a point-to-point conversation, if not
     /// already known -- called whenever a point-to-point tab is newly
     /// created this session (see `direct.rs`'s `NetEvent::DirectJoined`
     /// and `InputAction::OpenDirect` handling in main.rs). A no-op
     /// (including no write to disk) if already recorded.
-    pub fn record(&mut self, peer: [u8; 32]) -> anyhow::Result<()> {
+    pub fn record(&mut self, peer: [u8; 32]) -> anyhow::Result<bool> {
         if self.peers.iter().any(|record| record.peer == peer) {
+            return Ok(false);
+        }
+        self.peers.push(DirectRecord {
+            peer,
+            docs: None,
+            folder: None,
+        });
+        self.save()?;
+        Ok(true)
+    }
+
+    /// Assigns a local physical folder to a newly-recorded conversation.
+    /// Existing peer-only records deliberately remain unmapped so their
+    /// current `p2p-*` folder is never moved or duplicated.
+    pub fn record_folder(&mut self, peer: [u8; 32], folder: String) -> anyhow::Result<()> {
+        let Some(record) = self.peers.iter_mut().find(|record| record.peer == peer) else {
+            anyhow::bail!("cannot persist folder for unknown direct peer");
+        };
+        if record.folder.as_deref() == Some(&folder) {
             return Ok(());
         }
-        self.peers.push(DirectRecord { peer, docs: None });
+        record.folder = Some(folder);
         self.save()
     }
     /// Stores the shared docs capability after it is created or received
@@ -131,10 +165,24 @@ fn decode(bytes: &[u8]) -> Vec<DirectRecord> {
     if let Ok(records) = postcard::from_bytes(bytes) {
         return records;
     }
+    if let Ok(records) = postcard::from_bytes::<Vec<DirectRecordV2>>(bytes) {
+        return records
+            .into_iter()
+            .map(|record| DirectRecord {
+                peer: record.peer,
+                docs: record.docs,
+                folder: None,
+            })
+            .collect();
+    }
     if let Ok(peers) = postcard::from_bytes::<Vec<[u8; 32]>>(bytes) {
         return peers
             .into_iter()
-            .map(|peer| DirectRecord { peer, docs: None })
+            .map(|peer| DirectRecord {
+                peer,
+                docs: None,
+                folder: None,
+            })
             .collect();
     }
     warn!("dropping corrupt direct-peer registry");
@@ -174,6 +222,48 @@ mod tests {
 
         assert_eq!(registry.all(), vec![ALICE]);
         assert!(registry.docs_for(ALICE).is_none());
+        assert!(registry.folder_for(ALICE).is_none());
+    }
+
+    #[test]
+    fn pre_folder_records_keep_their_existing_p2p_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("direct_peers");
+        fs::write(
+            &path,
+            postcard::to_stdvec(&vec![DirectRecordV2 {
+                peer: ALICE,
+                docs: None,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            DirectRegistry::load(path)
+                .unwrap()
+                .folder_for(ALICE)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_new_direct_folder_persists_across_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("direct_peers");
+        let mut registry = DirectRegistry::load(path.clone()).unwrap();
+        assert!(registry.record(ALICE).unwrap());
+        registry
+            .record_folder(ALICE, "dm-alice-01010101".into())
+            .unwrap();
+
+        assert_eq!(
+            DirectRegistry::load(path)
+                .unwrap()
+                .folder_for(ALICE)
+                .as_deref(),
+            Some("dm-alice-01010101")
+        );
     }
 
     #[test]
