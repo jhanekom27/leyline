@@ -194,7 +194,9 @@ impl AppState {
             | NetEvent::SyncFileSaved { .. }
             | NetEvent::DirectJoined { .. }
             | NetEvent::DirectDocs { .. }
-            | NetEvent::DirectDocsReady { .. } => None,
+            | NetEvent::DirectDocsReady { .. }
+            | NetEvent::ChannelDocs(..)
+            | NetEvent::ChannelDocsAdopted(..) => None,
         }
     }
 }

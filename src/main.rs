@@ -1011,6 +1011,7 @@ async fn run(
                     net.announce_nickname(channel);
                     net.announce_version(channel);
                     net.announce_device(channel);
+                    net.announce_docs(channel);
                 }
 
                 // Also peek for a channel finishing a runtime `/join`, so
@@ -1134,6 +1135,15 @@ async fn run(
                         if !forgotten_devices.is_forgotten(&announce.sender) {
                             net.sync_channel(&tag, announce);
                         }
+                    }
+                    NetEvent::ChannelDocs(channel, announce) => {
+                        net.adopt_channel_docs(&channel, announce);
+                    }
+                    NetEvent::ChannelDocsAdopted(channel, docs) => {
+                        if let Err(err) = registry.record_docs(&channel, docs) {
+                            warn!(%channel, "failed to persist adopted channel index capability: {err}");
+                        }
+                        net.announce_docs(&channel);
                     }
                     NetEvent::RemoteIndex(remote) => {
                         if app.sync_paused(&remote.channel) {
@@ -1536,6 +1546,7 @@ async fn run(
                 // history backfill" section).
                 for channel in &app.channels {
                     announce_history(&net, &backfill, &channel.name);
+                    net.announce_docs(&channel.name);
                 }
             }
         }

@@ -3,6 +3,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iroh::{EndpointAddr, PublicKey, SecretKey, Signature};
+use iroh_docs::Capability;
 use serde::{Deserialize, Serialize};
 
 use crate::ticket::RoomSecret;
@@ -166,6 +167,9 @@ pub enum GossipPayload {
     /// Another of our own devices announcing it joined a channel -- see
     /// `ChannelSyncAnnounce`.
     ChannelJoined(ChannelSyncAnnounce),
+    /// A group member advertising its channel file-index capability so
+    /// legacy members can converge on one shared docs namespace.
+    Docs(DocsAnnounce),
 }
 
 /// Flooded to the whole channel whenever a channel gains a gossip neighbor
@@ -316,6 +320,27 @@ pub struct ChannelSyncAnnounce {
     /// the announcing device's own address (see `announce_channel_joined`).
     pub peers: Vec<EndpointAddr>,
 }
+
+/// Advertises a group channel's file-index capability and a reachable
+/// member that can seed reconciliation for it. The capability is already
+/// protected by membership in the private gossip topic; carrying it here
+/// repairs channels created before tickets began distributing it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocsAnnounce {
+    pub sender: [u8; 32],
+    pub addr: EndpointAddr,
+    pub docs: Capability,
+}
+
+impl PartialEq for DocsAnnounce {
+    fn eq(&self, other: &Self) -> bool {
+        self.sender == other.sender
+            && self.addr == other.addr
+            && self.docs.raw() == other.docs.raw()
+    }
+}
+
+impl Eq for DocsAnnounce {}
 
 #[cfg(test)]
 mod tests {

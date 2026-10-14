@@ -37,8 +37,8 @@ use crate::channel_registry::KnownChannel;
 use crate::direct::{self, Direct};
 use crate::files::{self, SaveMode, StagedAttachment, StagedSource};
 use crate::message::{
-    ChannelSyncAnnounce, ChatMessage, DeviceCert, FileAttachment, GossipPayload, HistoryAnnounce,
-    IdentityAnnounce, VersionAnnounce, now_unix_ms,
+    ChannelSyncAnnounce, ChatMessage, DeviceCert, DocsAnnounce, FileAttachment, GossipPayload,
+    HistoryAnnounce, IdentityAnnounce, VersionAnnounce, now_unix_ms,
 };
 use crate::pairing::{self, PairingProtocol};
 use crate::sync_index::SyncIndex;
@@ -161,6 +161,12 @@ pub enum NetEvent {
     /// channel in the background must not yank focus away from whatever
     /// this device's user is actually looking at.
     ChannelSyncJoined(String),
+    /// A member advertised the docs capability for an existing group
+    /// channel. The network layer decides whether to adopt it.
+    ChannelDocs(String, DocsAnnounce),
+    /// A group channel adopted a shared docs capability and needs it
+    /// persisted with its local channel record.
+    ChannelDocsAdopted(String, Capability),
     /// A history backfill fetch finished and decoded some messages, ready
     /// to be deduped, persisted, and merged into the transcript.
     HistoryFetched(String, Vec<ChatMessage>),
@@ -692,6 +698,78 @@ impl Net {
             .expect("channels lock poisoned")
             .get(name)
             .map(|channel| channel.docs.clone())
+    }
+
+    /// Floods the current group index capability so members created before
+    /// ticket-based propagation can converge on one namespace.
+    pub fn announce_docs(&self, channel: &str) {
+        let Some((sender, docs)) = self
+            .channels
+            .lock()
+            .expect("channels lock poisoned")
+            .get(channel)
+            .map(|channel| (channel.sender.clone(), channel.docs.clone()))
+        else {
+            return;
+        };
+        let payload = GossipPayload::Docs(DocsAnnounce {
+            sender: self.our_id,
+            addr: self.router.endpoint().addr(),
+            docs,
+        });
+        tokio::spawn(async move {
+            let bytes = match postcard::to_stdvec(&payload) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    warn!("failed to encode docs capability announcement: {err}");
+                    return;
+                }
+            };
+            if let Err(err) = sender.broadcast(bytes.into()).await {
+                warn!("failed to broadcast docs capability announcement: {err}");
+            }
+        });
+    }
+
+    /// Adopts the smallest capability observed for a group channel. Legacy
+    /// peers have one locally-created index each; choosing by capability
+    /// bytes makes every member select the same one without a leader.
+    pub fn adopt_channel_docs(&self, channel: &str, announce: DocsAnnounce) {
+        if announce.sender == self.our_id || *announce.addr.id.as_bytes() != announce.sender {
+            return;
+        }
+        let Some(current) = self.docs_for(channel) else {
+            return;
+        };
+        if current.raw() <= announce.docs.raw() {
+            return;
+        }
+        let channel = channel.to_string();
+        let sync_index = self.sync_index.clone();
+        let channels = Arc::clone(&self.channels);
+        let events_tx = self.events_tx.clone();
+        tokio::spawn(async move {
+            let docs = match sync_index
+                .adopt(&channel, announce.docs, vec![announce.addr])
+                .await
+            {
+                Ok(docs) => docs,
+                Err(err) => {
+                    warn!(%channel, "failed to adopt shared channel index: {err}");
+                    return;
+                }
+            };
+            {
+                let mut channels = channels.lock().expect("channels lock poisoned");
+                let Some(joined) = channels.get_mut(&channel) else {
+                    return;
+                };
+                joined.docs = docs.clone();
+            }
+            let _ = events_tx
+                .send(NetEvent::ChannelDocsAdopted(channel, docs))
+                .await;
+        });
     }
 
     /// Our own canonical user identity -- the shared user key's public
@@ -1707,6 +1785,9 @@ async fn forward_events(
                     }
                     Ok(GossipPayload::ChannelJoined(announce)) => {
                         NetEvent::ChannelSync(channel.clone(), announce)
+                    }
+                    Ok(GossipPayload::Docs(announce)) => {
+                        NetEvent::ChannelDocs(channel.clone(), announce)
                     }
                     Err(err) => {
                         warn!("dropping malformed gossip message: {err}");

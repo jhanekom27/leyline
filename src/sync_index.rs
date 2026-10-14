@@ -144,6 +144,54 @@ impl SyncIndex {
             .map(|index| index.capability.clone())
     }
 
+    /// Rebinds `channel` to a capability learned from an existing member.
+    /// Legacy peers can have independently-created local documents for the
+    /// same gossip channel; abandoning the noncanonical namespace lets the
+    /// channel converge on one index without changing its chat membership.
+    pub async fn adopt(
+        &self,
+        channel: &str,
+        capability: Capability,
+        peers: Vec<EndpointAddr>,
+    ) -> anyhow::Result<Capability> {
+        let existing = self
+            .indexes
+            .lock()
+            .expect("indexes lock poisoned")
+            .remove(channel);
+        if let Some(index) = existing {
+            if index.capability.raw() == capability.raw() {
+                index
+                    .doc
+                    .start_sync(peers)
+                    .await
+                    .context("failed to restart channel index sync")?;
+                let capability = index.capability.clone();
+                self.indexes
+                    .lock()
+                    .expect("indexes lock poisoned")
+                    .insert(channel.to_string(), index);
+                return Ok(capability);
+            }
+            index.watch_task.abort();
+            index
+                .doc
+                .leave()
+                .await
+                .context("failed to leave divergent channel index")?;
+            index
+                .doc
+                .close()
+                .await
+                .context("failed to close divergent channel index")?;
+            self.docs
+                .drop_doc(index.capability.id())
+                .await
+                .context("failed to remove divergent channel index")?;
+        }
+        self.join(channel, Some(capability), peers).await
+    }
+
     /// Adds an index entry.  This is intentionally network-only; callers
     /// must not use it to alter a channel folder.
     pub fn set(&self, channel: &str, path: String, metadata: Vec<u8>) -> anyhow::Result<()> {
@@ -500,6 +548,59 @@ mod tests {
         .expect("remote tombstone did not arrive");
 
         assert_eq!(deleted, ("general".into(), "removed.txt".into()));
+        alpha.shutdown().await;
+        beta.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn adopts_a_peer_index_after_legacy_peers_created_separate_documents() {
+        let alpha = Peer::start().await;
+        let mut beta = Peer::start().await;
+        let alpha_capability = alpha.index.join("general", None, vec![]).await.unwrap();
+        let beta_capability = beta.index.join("general", None, vec![]).await.unwrap();
+        assert_ne!(alpha_capability.raw(), beta_capability.raw());
+
+        let adopted = beta
+            .index
+            .adopt(
+                "general",
+                alpha_capability.clone(),
+                vec![alpha.router.endpoint().addr()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(adopted.raw(), alpha_capability.raw());
+        assert_eq!(
+            beta.index.capability_for("general").unwrap().raw(),
+            alpha_capability.raw()
+        );
+
+        alpha
+            .index
+            .set(
+                "general",
+                "report.txt".into(),
+                postcard::to_stdvec(&FileIndexEntry {
+                    content_hash: Hash::new(b"report"),
+                    size: 6,
+                    modified_unix_ms: 0,
+                    author: *alpha.router.endpoint().id().as_bytes(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let remote = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(NetEvent::RemoteIndex(entry)) = beta.events.recv().await {
+                    break entry;
+                }
+            }
+        })
+        .await
+        .expect("adopted index did not receive a remote entry");
+        assert_eq!(remote.channel, "general");
+        assert_eq!(remote.path, "report.txt");
+
         alpha.shutdown().await;
         beta.shutdown().await;
     }
