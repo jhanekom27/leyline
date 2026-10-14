@@ -1,10 +1,10 @@
 ---
 id: LEY-26.5
 title: 'Sync folder: apply remote files to the local channel folder'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-12 08:29'
-updated_date: '2026-10-14 06:13'
+updated_date: '2026-10-14 09:55'
 labels:
   - files
   - networking
@@ -25,12 +25,12 @@ Provisional until the spike lands. The receive half of two-way sync and its firs
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 `/sync on` and `/sync off` switch mirroring for the active channel on this device; it is off by default and the setting persists
-- [ ] #2 With sync on, files added or changed by other members appear in the channel folder under their relative paths, are never visible half-written, and can be fetched from any available member
-- [ ] #3 Paths received from peers are validated: absolute paths, `..` components, symlinks, and unsafe names are rejected without touching anything outside the channel folder
-- [ ] #4 A remote change never overwrites a local file that has unsynced local edits; the remote version is kept as a clearly named conflict copy instead
-- [ ] #5 Names that would collide only because of case (case-insensitive macOS versus case-sensitive Linux) never cause either file to be lost
-- [ ] #6 Files over the size limit are skipped with a notice
+- [x] #1 `/sync on` and `/sync off` switch mirroring for the active channel on this device; it is off by default and the setting persists
+- [x] #2 With sync on, files added or changed by other members appear in the channel folder under their relative paths, are never visible half-written, and can be fetched from any available member
+- [x] #3 Paths received from peers are validated: absolute paths, `..` components, symlinks, and unsafe names are rejected without touching anything outside the channel folder
+- [x] #4 A remote change never overwrites a local file that has unsynced local edits; the remote version is kept as a clearly named conflict copy instead
+- [x] #5 Names that would collide only because of case (case-insensitive macOS versus case-sensitive Linux) never cause either file to be lost
+- [x] #6 Files over the size limit are skipped with a notice
 - [x] #7 Verified manually between a macOS and a Linux machine
 <!-- AC:END -->
 
@@ -48,4 +48,12 @@ LEY-26.3 substrate decision: consume the resolved iroh-docs per-channel index fr
 Manual testing update: direct-conversation sync works, but an existing shared #general channel exchanges chat messages without replicating synced files. This indicates its devices have divergent or absent persisted docs capabilities; do not close the task until legacy group-channel capability convergence and the macOS/Linux check are verified.
 
 Manual verification: a paired macOS and Linux device synchronized files successfully over a point-to-point direct conversation, confirming the cross-platform remote-apply path (AC #7). Group-channel sync remains blocked on the legacy docs-capability migration tracked separately.
+
+Completion verification: legacy group capability migration is live and manual testing now confirms synced files cross the existing #general channel. Focused sync_apply, sync_settings, and sync_publish tests pass; full validation passed with 967 tests.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Implemented safe opt-in per-channel remote file mirroring. Sync settings persist, remote index entries are validated and atomically applied, conflicts and case collisions are protected, oversized files are skipped with notices, and synced content is available from any peer. Manual paired macOS↔Linux testing verified remote apply and group-channel replication after legacy index migration.
+<!-- SECTION:FINAL_SUMMARY:END -->
