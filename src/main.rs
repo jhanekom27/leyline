@@ -588,7 +588,9 @@ async fn run(
     // channel. No `backfill` seeding here: that store only matters for
     // gossip's history-sync flow, which point-to-point channels never use.
     for peer in direct_registry.all() {
+        let docs = direct_registry.docs_for(peer);
         let channel = net.open_direct(peer);
+        net.sync_direct(peer, docs);
         if app.background_direct_channel(channel.clone(), peer) {
             match store.load(&channel) {
                 Ok(history) => app.load_history(&channel, history),
@@ -675,6 +677,7 @@ async fn run(
                                         Err(err) => warn!(%channel, "failed to load message history: {err}"),
                                     }
                                 }
+                                net.sync_direct(peer, direct_registry.docs_for(peer));
                                 if let Some(text) = text {
                                     let message = app.compose_own_message(&text);
                                     net.send_direct(peer, message.clone());
@@ -1285,6 +1288,25 @@ async fn run(
                                 Ok(history) => app.load_history(&channel, history),
                                 Err(err) => warn!(%channel, "failed to load message history: {err}"),
                             }
+                        }
+                        net.sync_direct(peer, direct_registry.docs_for(peer));
+                    }
+                    NetEvent::DirectDocs { peer, docs } => {
+                        if peer >= net.our_id {
+                            warn!("ignoring direct docs capability from non-owner");
+                        } else if let Err(err) = direct_registry.record(peer) {
+                            warn!("failed to persist direct peer registry entry: {err}");
+                        } else if let Err(err) = direct_registry.record_docs(peer, docs.clone()) {
+                            warn!("failed to persist direct docs capability: {err}");
+                        } else {
+                            net.sync_direct(peer, Some(docs));
+                        }
+                    }
+                    NetEvent::DirectDocsReady { peer, docs } => {
+                        if let Err(err) = direct_registry.record(peer) {
+                            warn!("failed to persist direct peer registry entry: {err}");
+                        } else if let Err(err) = direct_registry.record_docs(peer, docs) {
+                            warn!("failed to persist direct docs capability: {err}");
                         }
                     }
                     // A `/send`ed file failed to import -- see

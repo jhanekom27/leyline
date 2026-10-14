@@ -126,6 +126,12 @@ pub enum NetEvent {
     /// steal focus" semantics, since the local user never asked for this
     /// conversation to appear.
     DirectJoined { channel: String, peer: [u8; 32] },
+    /// A direct peer sent the write capability for its conversation's
+    /// shared docs namespace.
+    DirectDocs { peer: [u8; 32], docs: Capability },
+    /// The local direct docs index was created or imported and is ready to
+    /// persist with the peer association.
+    DirectDocsReady { peer: [u8; 32], docs: Capability },
     /// A channel failed to join.
     JoinFailed(String, String),
     /// A peer announced its current history root hash for a channel -- see
@@ -1581,6 +1587,47 @@ impl Net {
         self.direct.open(peer)
     }
 
+    /// Creates or imports a direct conversation's docs index. The lower
+    /// endpoint id owns first creation, so both peers can never independently
+    /// create competing namespaces.
+    pub fn sync_direct(&self, peer: [u8; 32], capability: Option<Capability>) {
+        if capability.is_none() && self.our_id > peer {
+            return;
+        }
+        let channel = direct::channel_name(&peer);
+        let endpoint = self.router.endpoint().clone();
+        let sync_index = self.sync_index.clone();
+        let direct = Arc::clone(&self.direct);
+        let events_tx = self.events_tx.clone();
+        tokio::spawn(async move {
+            let remote_info = match EndpointId::from_bytes(&peer) {
+                Ok(id) => endpoint.remote_info(id).await,
+                Err(_) => None,
+            };
+            let peers = match remote_info {
+                Some(info) => {
+                    let id = info.id();
+                    vec![EndpointAddr::from_parts(
+                        id,
+                        info.into_addrs().map(|addr| addr.into_addr()),
+                    )]
+                }
+                None => Vec::new(),
+            };
+            let docs = match sync_index.join(&channel, capability, peers).await {
+                Ok(docs) => docs,
+                Err(err) => {
+                    warn!(%channel, "failed to join direct sync index: {err}");
+                    return;
+                }
+            };
+            direct.set_docs(peer, docs.clone());
+            let _ = events_tx
+                .send(NetEvent::DirectDocsReady { peer, docs })
+                .await;
+        });
+    }
+
     /// Queues `message` to be sent to `peer` over its point-to-point
     /// connection, starting one first if needed -- see `direct::Direct::send`.
     pub fn send_direct(&self, peer: [u8; 32], message: ChatMessage) {
@@ -1591,6 +1638,7 @@ impl Net {
     /// `/leave`ing a point-to-point channel. See `direct::Direct::close`.
     pub fn close_direct(&self, peer: [u8; 32]) {
         self.direct.close(peer);
+        self.sync_index.leave(&direct::channel_name(&peer));
     }
 
     /// Leaves every channel and closes the endpoint gracefully.

@@ -20,12 +20,14 @@
 //! first, and framing/decoding messages on top of raw QUIC streams.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointId};
+use iroh_docs::Capability;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -43,6 +45,12 @@ pub const DIRECT_ALPN: &[u8] = b"leyline/direct/1";
 /// stream, not a real limit on an ordinary chat message (mirrors
 /// `pairing.rs`'s `MAX_PAYLOAD_BYTES`).
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+const CONTROL_PREFIX: &[u8] = b"leyline/direct-control/1:";
+
+#[derive(Serialize, Deserialize)]
+enum Control {
+    Docs(Capability),
+}
 
 /// How many outstanding commands (sends, or inbound connection hand-offs)
 /// a peer's actor will buffer before `Direct::send` starts dropping
@@ -87,6 +95,7 @@ fn hex_prefix(bytes: &[u8; 32]) -> String {
 /// connected, or a freshly accepted inbound connection to adopt.
 enum Command {
     Send(ChatMessage),
+    ShareDocs(Capability),
     Inbound(Connection),
 }
 
@@ -109,6 +118,7 @@ pub struct Direct {
     endpoint: Endpoint,
     events_tx: mpsc::Sender<NetEvent>,
     actors: Mutex<HashMap<[u8; 32], PeerActor>>,
+    docs: Arc<Mutex<HashMap<[u8; 32], Capability>>>,
 }
 
 impl Direct {
@@ -117,6 +127,7 @@ impl Direct {
             endpoint,
             events_tx,
             actors: Mutex::new(HashMap::new()),
+            docs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -137,6 +148,7 @@ impl Direct {
             self.endpoint.clone(),
             commands_rx,
             self.events_tx.clone(),
+            Arc::clone(&self.docs),
         ));
         actors.insert(
             peer,
@@ -174,6 +186,17 @@ impl Direct {
         }
     }
 
+    pub fn set_docs(&self, peer: [u8; 32], docs: Capability) {
+        self.docs
+            .lock()
+            .expect("direct docs lock poisoned")
+            .insert(peer, docs.clone());
+        let (commands, _) = self.ensure_actor(peer);
+        if commands.try_send(Command::ShareDocs(docs)).is_err() {
+            warn!(peer = %hex_prefix(&peer), "direct docs capability will wait for reconnect");
+        }
+    }
+
     /// Stops `peer`'s actor outright -- e.g. `/leave`ing a point-to-point
     /// channel. Aborts the task directly (mirroring `net::Net::leave`'s
     /// `JoinHandle::abort()`) rather than a graceful shutdown handshake,
@@ -188,6 +211,38 @@ impl Direct {
         {
             actor.handle.abort();
         }
+        self.docs
+            .lock()
+            .expect("direct docs lock poisoned")
+            .remove(&peer);
+    }
+}
+
+async fn send_control(connection: &Connection, control: Control) {
+    let bytes = match postcard::to_stdvec(&control) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            warn!("failed to encode direct control frame: {err}");
+            return;
+        }
+    };
+    let mut send_stream = match connection.open_uni().await {
+        Ok(stream) => stream,
+        Err(err) => {
+            warn!("failed to open direct control stream: {err}");
+            return;
+        }
+    };
+    if let Err(err) = send_stream.write_all(CONTROL_PREFIX).await {
+        warn!("failed to send direct control prefix: {err}");
+        return;
+    }
+    if let Err(err) = send_stream.write_all(&bytes).await {
+        warn!("failed to send direct control frame: {err}");
+        return;
+    }
+    if let Err(err) = send_stream.finish() {
+        warn!("failed to finish direct control stream: {err}");
     }
 }
 
@@ -259,6 +314,7 @@ async fn run_actor(
     endpoint: Endpoint,
     mut commands: mpsc::Receiver<Command>,
     events_tx: mpsc::Sender<NetEvent>,
+    docs: Arc<Mutex<HashMap<[u8; 32], Capability>>>,
 ) {
     let channel = channel_name(&peer);
     let Ok(peer_id) = EndpointId::from_bytes(&peer) else {
@@ -285,6 +341,7 @@ async fn run_actor(
                 command = commands.recv() => {
                     match command {
                         Some(Command::Send(message)) => pending.push(message),
+                        Some(Command::ShareDocs(_)) => {}
                         Some(Command::Inbound(conn)) => break conn,
                         None => return,
                     }
@@ -298,6 +355,14 @@ async fn run_actor(
             .is_err()
         {
             return;
+        }
+        let capability = docs
+            .lock()
+            .expect("direct docs lock poisoned")
+            .get(&peer)
+            .cloned();
+        if let Some(capability) = capability {
+            send_control(&connection, Control::Docs(capability)).await;
         }
 
         for message in pending.drain(..) {
@@ -316,8 +381,19 @@ async fn run_actor(
                 command = commands.recv() => {
                     match command {
                         Some(Command::Send(message)) => send_one(&connection, &message).await,
+                        Some(Command::ShareDocs(capability)) => {
+                            send_control(&connection, Control::Docs(capability)).await;
+                        }
                         Some(Command::Inbound(new_connection)) => {
                             connection = new_connection;
+                            let capability = docs
+                                .lock()
+                                .expect("direct docs lock poisoned")
+                                .get(&peer)
+                                .cloned();
+                            if let Some(capability) = capability {
+                                send_control(&connection, Control::Docs(capability)).await;
+                            }
                             receiver = AbortOnDrop(tokio::spawn(receive_loop(
                                 connection.clone(),
                                 channel.clone(),
@@ -383,6 +459,7 @@ async fn send_one(connection: &Connection, message: &ChatMessage) {
 /// conversation, not logged as a warning (see `run_actor`, which reacts to
 /// the same closure via `connection.closed()` to emit `PeerLeft`).
 async fn receive_loop(connection: Connection, channel: String, events_tx: mpsc::Sender<NetEvent>) {
+    let peer = *connection.remote_id().as_bytes();
     loop {
         let mut recv_stream = match connection.accept_uni().await {
             Ok(stream) => stream,
@@ -392,6 +469,20 @@ async fn receive_loop(connection: Connection, channel: String, events_tx: mpsc::
             }
         };
         match recv_stream.read_to_end(MAX_MESSAGE_BYTES).await {
+            Ok(bytes) if bytes.starts_with(CONTROL_PREFIX) => {
+                match postcard::from_bytes::<Control>(&bytes[CONTROL_PREFIX.len()..]) {
+                    Ok(Control::Docs(docs)) => {
+                        if events_tx
+                            .send(NetEvent::DirectDocs { peer, docs })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(err) => warn!(%channel, "dropping malformed direct control frame: {err}"),
+                }
+            }
             Ok(bytes) => match ChatMessage::decode(&bytes) {
                 Ok(message) => {
                     if events_tx

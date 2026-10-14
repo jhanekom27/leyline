@@ -14,7 +14,14 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use anyhow::Context;
+use iroh_docs::Capability;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DirectRecord {
+    peer: [u8; 32],
+    docs: Option<Capability>,
+}
 
 /// Local, whole-file-rewrite-on-change store of known point-to-point peer
 /// ids.
@@ -24,7 +31,7 @@ use tracing::warn;
 /// re-encode and rewrite the whole file on every change.
 pub struct DirectRegistry {
     path: PathBuf,
-    peers: Vec<[u8; 32]>,
+    peers: Vec<DirectRecord>,
 }
 
 impl DirectRegistry {
@@ -53,7 +60,15 @@ impl DirectRegistry {
     /// attempt come back automatically, mirroring how `channel_registry.rs`
     /// rejoins gossip channels.
     pub fn all(&self) -> Vec<[u8; 32]> {
-        self.peers.clone()
+        self.peers.iter().map(|record| record.peer).collect()
+    }
+
+    /// The shared docs capability last negotiated with `peer`, if any.
+    pub fn docs_for(&self, peer: [u8; 32]) -> Option<Capability> {
+        self.peers
+            .iter()
+            .find(|record| record.peer == peer)
+            .and_then(|record| record.docs.clone())
     }
 
     /// Records `peer` as having a point-to-point conversation, if not
@@ -62,10 +77,26 @@ impl DirectRegistry {
     /// and `InputAction::OpenDirect` handling in main.rs). A no-op
     /// (including no write to disk) if already recorded.
     pub fn record(&mut self, peer: [u8; 32]) -> anyhow::Result<()> {
-        if self.peers.contains(&peer) {
+        if self.peers.iter().any(|record| record.peer == peer) {
             return Ok(());
         }
-        self.peers.push(peer);
+        self.peers.push(DirectRecord { peer, docs: None });
+        self.save()
+    }
+    /// Stores the shared docs capability after it is created or received
+    /// through the authenticated direct protocol.
+    pub fn record_docs(&mut self, peer: [u8; 32], docs: Capability) -> anyhow::Result<()> {
+        let Some(record) = self.peers.iter_mut().find(|record| record.peer == peer) else {
+            anyhow::bail!("cannot persist docs capability for unknown direct peer");
+        };
+        if record
+            .docs
+            .as_ref()
+            .is_some_and(|known| known.id() == docs.id())
+        {
+            return Ok(());
+        }
+        record.docs = Some(docs);
         self.save()
     }
 
@@ -75,7 +106,7 @@ impl DirectRegistry {
     /// `peer` isn't recorded.
     pub fn forget(&mut self, peer: [u8; 32]) -> anyhow::Result<()> {
         let before = self.peers.len();
-        self.peers.retain(|known| *known != peer);
+        self.peers.retain(|known| known.peer != peer);
         if self.peers.len() == before {
             return Ok(());
         }
@@ -96,11 +127,18 @@ impl DirectRegistry {
 
 /// Decodes the registry file's contents, tolerating corruption by logging
 /// and falling back to an empty list -- see `DirectRegistry::load`.
-fn decode(bytes: &[u8]) -> Vec<[u8; 32]> {
-    postcard::from_bytes(bytes).unwrap_or_else(|err| {
-        warn!("dropping corrupt direct-peer registry: {err}");
-        Vec::new()
-    })
+fn decode(bytes: &[u8]) -> Vec<DirectRecord> {
+    if let Ok(records) = postcard::from_bytes(bytes) {
+        return records;
+    }
+    if let Ok(peers) = postcard::from_bytes::<Vec<[u8; 32]>>(bytes) {
+        return peers
+            .into_iter()
+            .map(|peer| DirectRecord { peer, docs: None })
+            .collect();
+    }
+    warn!("dropping corrupt direct-peer registry");
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -125,6 +163,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("direct_peers"), b"not a valid registry").unwrap();
         assert!(registry_at(&dir).all().is_empty());
+    }
+    #[test]
+    fn peer_only_records_migrate_without_a_docs_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("direct_peers");
+        fs::write(&path, postcard::to_stdvec(&vec![ALICE]).unwrap()).unwrap();
+
+        let registry = DirectRegistry::load(path).unwrap();
+
+        assert_eq!(registry.all(), vec![ALICE]);
+        assert!(registry.docs_for(ALICE).is_none());
     }
 
     #[test]

@@ -192,7 +192,9 @@ impl AppState {
             | NetEvent::RemoteIndex(..)
             | NetEvent::RemoteIndexDelete { .. }
             | NetEvent::SyncFileSaved { .. }
-            | NetEvent::DirectJoined { .. } => None,
+            | NetEvent::DirectJoined { .. }
+            | NetEvent::DirectDocs { .. }
+            | NetEvent::DirectDocsReady { .. } => None,
         }
     }
 }
