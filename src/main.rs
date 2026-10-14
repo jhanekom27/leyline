@@ -49,7 +49,7 @@ use crossterm::execute;
 use iroh_tickets::Ticket;
 use tokio::sync::mpsc;
 use tokio::time::interval;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use app::{AppState, InputAction, SaveRequest};
 use autosave::{AutoSave, limit as autosave_limit, set_limit as set_autosave_limit};
@@ -151,12 +151,6 @@ async fn main() -> anyhow::Result<()> {
     )
     .await
     .context("failed to start networking")?;
-    println!("invite tickets (paste into another instance's message box with /join <ticket>):");
-    for name in &joined_channels {
-        let ticket = net.ticket_for(name, dm_registry.is_dm_channel(name));
-        info!(channel = %name, %ticket, "ready");
-        println!("  #{name}: {ticket}");
-    }
 
     let session = Session {
         net,
