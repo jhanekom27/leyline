@@ -4,7 +4,7 @@ title: 'Sync folder: apply remote files to the local channel folder'
 status: In Progress
 assignee: []
 created_date: '2026-10-12 08:29'
-updated_date: '2026-10-13 12:05'
+updated_date: '2026-10-14 06:13'
 labels:
   - files
   - networking
@@ -31,7 +31,7 @@ Provisional until the spike lands. The receive half of two-way sync and its firs
 - [ ] #4 A remote change never overwrites a local file that has unsynced local edits; the remote version is kept as a clearly named conflict copy instead
 - [ ] #5 Names that would collide only because of case (case-insensitive macOS versus case-sensitive Linux) never cause either file to be lost
 - [ ] #6 Files over the size limit are skipped with a notice
-- [ ] #7 Verified manually between a macOS and a Linux machine
+- [x] #7 Verified manually between a macOS and a Linux machine
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -44,4 +44,8 @@ Add persistent per-channel /sync receive settings, emit typed remote index entri
 
 <!-- SECTION:NOTES:BEGIN -->
 LEY-26.3 substrate decision: consume the resolved iroh-docs per-channel index from LEY-26.4 as the remote source of truth. Apply only live docs events or reconciled entries through the runtime; do not reimplement history manifests or file transfer, because iroh-docs uses the shared blob store.
+
+Manual testing update: direct-conversation sync works, but an existing shared #general channel exchanges chat messages without replicating synced files. This indicates its devices have divergent or absent persisted docs capabilities; do not close the task until legacy group-channel capability convergence and the macOS/Linux check are verified.
+
+Manual verification: a paired macOS and Linux device synchronized files successfully over a point-to-point direct conversation, confirming the cross-platform remote-apply path (AC #7). Group-channel sync remains blocked on the legacy docs-capability migration tracked separately.
 <!-- SECTION:NOTES:END -->
