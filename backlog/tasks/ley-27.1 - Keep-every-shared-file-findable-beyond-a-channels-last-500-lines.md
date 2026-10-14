@@ -1,9 +1,10 @@
 ---
 id: LEY-27.1
 title: 'Keep every shared file findable, beyond a channel''s last 500 lines'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-10-13 04:22'
+updated_date: '2026-10-14 14:07'
 labels:
   - files
   - ux
@@ -26,11 +27,29 @@ The 500-line cap bounds render and memory cost in a long-lived session (concept.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 `/files` lists every file shared in the channel, including shares older than its newest 500 transcript lines, newest first, with the same name, size, sender, date and saved marker as for a recent one
-- [ ] #2 `/save <hash-prefix>` resolves and fetches a file shared outside the window, asking at least its sender and the peers online in its channel
-- [ ] #3 A bare `/save` still saves the newest file another peer shared in the active channel, exactly as today
-- [ ] #4 `no files have been shared in this channel yet` appears only for a channel with no file shares at all, however old
-- [ ] #5 The in-memory transcript cap is unchanged: what is added to find old files holds file metadata only, never old messages
-- [ ] #6 The same files are found after a restart, and after backfill has delivered older history
-- [ ] #7 Tests cover a share older than the window being listed, resolved by `/save` and saved, the empty-channel message, and the unchanged transcript cap
+- [x] #1 `/files` lists every file shared in the channel, including shares older than its newest 500 transcript lines, newest first, with the same name, size, sender, date and saved marker as for a recent one
+- [x] #2 `/save <hash-prefix>` resolves and fetches a file shared outside the window, asking at least its sender and the peers online in its channel
+- [x] #3 A bare `/save` still saves the newest file another peer shared in the active channel, exactly as today
+- [x] #4 `no files have been shared in this channel yet` appears only for a channel with no file shares at all, however old
+- [x] #5 The in-memory transcript cap is unchanged: what is added to find old files holds file metadata only, never old messages
+- [x] #6 The same files are found after a restart, and after backfill has delivered older history
+- [x] #7 Tests cover a share older than the window being listed, resolved by `/save` and saved, the empty-channel message, and the unchanged transcript cap
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Add a persistent shared-file metadata index keyed by channel and message ID, preserving distinct shares of the same content. 2. Seed and update it from startup history, live messages, sent files, backfill, and channel leave in main.rs. 3. Refactor /files and /save helpers to query metadata instead of the capped transcript while preserving saved markers and provider behavior. 4. Add old-share, restart, backfill, empty-overlay, and cap-regression tests; run cargo fmt, cargo test, cargo clippy, and cargo build --release.
+<!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Verification: durable SharedFiles metadata is seeded from complete startup history, updated for live/sent/backfilled messages, and removed on leave. App tests cover an old share past MAX_SCROLLBACK being listed and resolved by /save, while the transcript remains capped; SharedFiles tests cover reload persistence. Existing overlay, bare-save, empty-channel, and backfill tests remain green. Validation: cargo fmt, cargo test (974 passed), cargo clippy and cargo build --release (only two pre-existing warnings), git diff --check.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Added a persistent metadata-only shared-file index so /files and /save can find attachments beyond the 500-line transcript window. The index retains file identity, name, size, sender, and timestamp per share; it is rebuilt from local history at startup and updated for live, sent, and backfilled messages. The transcript cap remains unchanged, while saved markers and provider ordering are preserved.
+<!-- SECTION:FINAL_SUMMARY:END -->

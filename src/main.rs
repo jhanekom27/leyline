@@ -21,6 +21,7 @@ mod runtime;
 mod saved_files;
 mod search;
 mod settings;
+mod shared_files;
 mod storage;
 mod sync_apply;
 #[cfg(test)]
@@ -72,6 +73,7 @@ use runtime::*;
 use saved_files::SavedFiles;
 use search::{SearchOutcome, run_on_disk_scan};
 use settings::Settings;
+use shared_files::SharedFiles;
 use storage::MessageStore;
 use sync_settings::SyncSettings;
 use term_events::TermEvents;
@@ -119,6 +121,8 @@ async fn main() -> anyhow::Result<()> {
     let size_limit = files::size_limit(&data_dir)?;
     let saved_files = SavedFiles::load(dirs.data_dir().join("saved_files"))
         .context("failed to initialize saved files")?;
+    let shared_files = SharedFiles::load(dirs.data_dir().join("shared_files"))
+        .context("failed to initialize shared-file index")?;
 
     let secret_key = identity::load_or_generate(&dirs.config_dir().join("identity"))
         .context("failed to load or generate identity")?;
@@ -172,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
         settings,
         forgotten_devices,
         saved_files,
+        shared_files,
         files_root,
         size_limit,
         data_dir,
@@ -441,6 +446,7 @@ struct Session {
     /// when a save finishes (`NetEvent::FileSaved`), read when the files
     /// overlay opens (`InputAction::CheckSavedFiles`).
     saved_files: SavedFiles,
+    shared_files: SharedFiles,
     /// Where received files go -- see `files::files_root`. Seeded into
     /// `AppState` (`load_files_root`) at startup, which holds it from then
     /// on: `/folder <path>` replaces it there.
@@ -514,6 +520,7 @@ async fn run(
         mut settings,
         mut forgotten_devices,
         mut saved_files,
+        mut shared_files,
         files_root,
         size_limit,
         data_dir,
@@ -552,6 +559,9 @@ async fn run(
         }
         match store.load(name) {
             Ok(history) => {
+                if let Err(err) = shared_files.record_messages(name, &history) {
+                    warn!(channel = %name, "failed to index shared file history: {err}");
+                }
                 if let Err(err) = backfill.record_messages(name, &history).await {
                     warn!(channel = %name, "failed to seed history backfill: {err}");
                 }
@@ -590,11 +600,17 @@ async fn run(
         }
         if app.background_direct_channel(channel.clone(), peer) {
             match store.load(&channel) {
-                Ok(history) => app.load_history(&channel, history),
+                Ok(history) => {
+                    if let Err(err) = shared_files.record_messages(&channel, &history) {
+                        warn!(%channel, "failed to index shared file history: {err}");
+                    }
+                    app.load_history(&channel, history);
+                }
                 Err(err) => warn!(%channel, "failed to load message history: {err}"),
             }
         }
     }
+    app.load_shared_files(shared_files.snapshot());
 
     // `None` if no clipboard is available (e.g. a headless SSH session) --
     // `/invite` still prints the ticket either way, this just skips the
@@ -818,6 +834,9 @@ async fn run(
                                 }
                                 if let Err(err) = store.delete(&channel) {
                                     warn!(%channel, "failed to delete channel history: {err}");
+                                }
+                                if let Err(err) = shared_files.forget_channel(&channel) {
+                                    warn!(%channel, "failed to forget shared file metadata: {err}");
                                 }
                                 backfill.forget_channel(&channel);
                                 app.remove_channel(&channel);
@@ -1117,6 +1136,7 @@ async fn run(
                             if let Err(err) = store.append(&channel, message) {
                                 warn!(%channel, "failed to persist backfilled message: {err}");
                             }
+                                record_shared_file(&mut shared_files, &mut app, &channel, message);
                         }
                         if !newly_accepted.is_empty()
                             && let Err(err) = backfill.record_messages(&channel, &newly_accepted).await
@@ -1359,6 +1379,7 @@ async fn run(
                         if let Err(err) = store.append(&channel, &message) {
                             warn!(%channel, "failed to persist sent file: {err}");
                         }
+                        record_shared_file(&mut shared_files, &mut app, &channel, &message);
                         if app.direct_peer_for(&channel).is_none()
                             && let Err(err) = backfill.record_message(&channel, &message).await
                         {
@@ -1410,6 +1431,7 @@ async fn run(
                             if let Err(err) = store.append(&channel, &message) {
                                 warn!(%channel, "failed to persist received message: {err}");
                             }
+                            record_shared_file(&mut shared_files, &mut app, &channel, &message);
                             if app.direct_peer_for(&channel).is_none()
                                 && let Err(err) = backfill.record_message(&channel, &message).await
                             {
@@ -1583,6 +1605,19 @@ fn record_direct_peer(
         app.load_direct_folder(direct::channel_name(&peer), folder);
     }
     Ok(())
+}
+
+fn record_shared_file(
+    shared_files: &mut SharedFiles,
+    app: &mut AppState,
+    channel: &str,
+    message: &ChatMessage,
+) {
+    if let Err(err) = shared_files.record_message(channel, message) {
+        warn!(%channel, "failed to index shared file: {err}");
+        return;
+    }
+    app.load_shared_files(shared_files.snapshot());
 }
 fn record_remote_sync_file(
     watcher: &mut sync_publish::Watcher,

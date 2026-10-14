@@ -63,28 +63,14 @@ impl AppState {
     /// share: what its loaded transcript carries -- history loaded at
     /// startup, backfilled and live alike, the same window `/save` resolves
     /// against (`known_attachments`). Empty while the overlay is closed.
-    pub fn channel_files(&self) -> Vec<SharedFile<'_>> {
+    pub fn channel_files(&self) -> Vec<SharedFile> {
         let Some(overlay) = &self.viewing_files else {
             return Vec::new();
         };
-        let Some(channel) = self.channels.iter().find(|c| c.name == overlay.channel) else {
-            return Vec::new();
-        };
-        channel
-            .messages
-            .iter()
-            .rev()
-            .filter_map(|line| match line {
-                TranscriptLine::Chat(message) => {
-                    message.attachment.as_ref().map(|file| SharedFile {
-                        file,
-                        sender: message.sender,
-                        ts_unix_ms: message.ts_unix_ms,
-                    })
-                }
-                TranscriptLine::System(_) => None,
-            })
-            .collect()
+        self.shared_files
+            .get(&overlay.channel)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// The files the open overlay lists, newest first: those of its channel
@@ -92,7 +78,7 @@ impl AppState {
     /// screen, never the raw id) -- contains the typed text, ignoring case.
     /// An empty query lists every file; nothing is listed while the overlay
     /// is closed.
-    pub fn files_matches(&self) -> Vec<SharedFile<'_>> {
+    pub fn files_matches(&self) -> Vec<SharedFile> {
         let Some(overlay) = &self.viewing_files else {
             return Vec::new();
         };
@@ -135,7 +121,7 @@ impl AppState {
     }
 
     /// The highlighted match -- what `Enter` and `Ctrl+O` act on.
-    pub(super) fn highlighted_file(&self) -> Option<SharedFile<'_>> {
+    pub(super) fn highlighted_file(&self) -> Option<SharedFile> {
         let position = self.files_highlight()?;
         self.files_matches().into_iter().nth(position)
     }
@@ -158,7 +144,7 @@ impl AppState {
     /// handed to the OS from here, so it is saved and that is all. Judged by
     /// the saved copy's own name, not the one it was announced under: that is
     /// the one the OS will go by.
-    pub fn file_offer(&self, shared: &SharedFile<'_>) -> FileOffer<'_> {
+    pub fn file_offer(&self, shared: &SharedFile) -> FileOffer<'_> {
         match self.saved_copy(shared.file.hash) {
             None => FileOffer::Save,
             Some(path) if runs_when_opened(path) => FileOffer::SavedOnly,

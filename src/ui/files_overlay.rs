@@ -110,7 +110,7 @@ pub(super) fn files_title(heading: &str, shown: usize, total: usize, width: usiz
 /// offer is a dead one.
 pub(super) fn files_footer(
     app: &AppState,
-    highlighted: Option<&SharedFile<'_>>,
+    highlighted: Option<&SharedFile>,
     notice: Option<FilesNotice>,
 ) -> Line<'static> {
     if let Some(notice) = notice {
@@ -146,7 +146,7 @@ pub(super) fn files_footer(
 /// picker's, so it carries no colors of its own.
 pub(super) fn files_row(
     app: &AppState,
-    shared: &SharedFile<'_>,
+    shared: &SharedFile,
     saved: bool,
     highlighted: bool,
     width: usize,

@@ -22,13 +22,24 @@ impl AppState {
             }
             NetEvent::Received(channel_name, message) => {
                 let is_active = self.active().name == channel_name;
-                let channel = self.channel_mut(&channel_name)?;
-                if !channel.remember_seen(message.id) {
-                    return None;
+                let shared = message.attachment.as_ref().map(|file| SharedFile {
+                    message_id: message.id,
+                    file: file.clone(),
+                    sender: message.sender,
+                    ts_unix_ms: message.ts_unix_ms,
+                });
+                {
+                    let channel = self.channel_mut(&channel_name)?;
+                    if !channel.remember_seen(message.id) {
+                        return None;
+                    }
+                    channel.push(TranscriptLine::Chat(message.clone()));
+                    if !is_active {
+                        channel.has_unread = true;
+                    }
                 }
-                channel.push(TranscriptLine::Chat(message.clone()));
-                if !is_active {
-                    channel.has_unread = true;
+                if let Some(shared) = shared {
+                    self.record_shared_file(&channel_name, shared);
                 }
                 Some((channel_name, message))
             }

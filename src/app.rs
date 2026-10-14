@@ -18,10 +18,11 @@ use crate::files::{
     DEFAULT_MAX_FILE_SIZE, SaveMode, SizeLimit, StagedAttachment, channel_dir, human_size,
     runs_when_opened,
 };
-use crate::message::{ChatMessage, FileAttachment, now_unix_ms};
+use crate::message::{ChatMessage, now_unix_ms};
 use crate::net::{DEVICE_SYNC_CHANNEL, NetEvent};
 use crate::picker::{FilePicker, FolderListing, Step};
 use crate::search::{self, SearchOutcome, SearchResults};
+pub use crate::shared_files::SharedFile;
 use crate::sync_state::SyncMode;
 use crate::thread::{self, ThreadView};
 use crate::ticket::PairingTicket;
@@ -227,16 +228,6 @@ pub enum FileOffer<'a> {
     SavedOnly,
 }
 
-/// One file shared in a channel, as the files overlay lists it: the
-/// attachment of a chat message, with who sent it and when. One per share --
-/// a file sent twice is listed twice, each with its own sender and date.
-#[derive(Debug, Clone, Copy)]
-pub struct SharedFile<'a> {
-    pub file: &'a FileAttachment,
-    pub sender: [u8; 32],
-    pub ts_unix_ms: u64,
-}
-
 /// One joined channel's transcript, presence, per-channel scroll state,
 /// and in-progress input draft.
 pub struct Channel {
@@ -422,19 +413,6 @@ impl Channel {
         self.messages.iter().find_map(|line| match line {
             TranscriptLine::Chat(message) if message.id == id => Some(message),
             _ => None,
-        })
-    }
-
-    /// Whether a chat message in this channel's loaded transcript carries
-    /// the file `hash` -- what makes a channel a place the file was shared,
-    /// see `AppState::providers_for`.
-    fn carries_file(&self, hash: Hash) -> bool {
-        self.messages.iter().any(|line| match line {
-            TranscriptLine::Chat(message) => message
-                .attachment
-                .as_ref()
-                .is_some_and(|file| file.hash == hash),
-            TranscriptLine::System(_) => false,
         })
     }
 
@@ -855,6 +833,7 @@ pub struct AppState {
     /// Group channels deliberately have no entry and continue to derive
     /// their folder from the immutable channel name.
     direct_folders: HashMap<String, String>,
+    shared_files: HashMap<String, Vec<SharedFile>>,
     /// Local display names given to group channels via `/rename`, keyed by
     /// the channel's stored name (its identity, which never changes) --
     /// checked by `channel_label`, the channel counterpart to `petnames`.
@@ -1000,6 +979,7 @@ impl AppState {
             dm_channels: HashMap::new(),
             direct_channels: HashMap::new(),
             direct_folders: HashMap::new(),
+            shared_files: HashMap::new(),
             renames: HashMap::new(),
             picking_reply: None,
             picking_thread: None,
@@ -1027,6 +1007,19 @@ impl AppState {
     /// joined. Intended to be called once per joined channel right after
     /// `AppState::new`, before the event loop starts.
     pub fn load_history(&mut self, channel: &str, messages: Vec<ChatMessage>) {
+        for message in &messages {
+            if let Some(file) = &message.attachment {
+                self.record_shared_file(
+                    channel,
+                    SharedFile {
+                        message_id: message.id,
+                        file: file.clone(),
+                        sender: message.sender,
+                        ts_unix_ms: message.ts_unix_ms,
+                    },
+                );
+            }
+        }
         if let Some(channel) = self.channel_mut(channel) {
             channel.seed_history(messages);
         }
@@ -1101,6 +1094,22 @@ impl AppState {
     /// already validated mapping.
     pub fn load_direct_folder(&mut self, channel: String, folder: String) {
         self.direct_folders.insert(channel, folder);
+    }
+
+    pub fn load_shared_files(&mut self, files: HashMap<String, Vec<SharedFile>>) {
+        self.shared_files = files;
+    }
+
+    pub fn record_shared_file(&mut self, channel: &str, shared: SharedFile) {
+        let files = self.shared_files.entry(channel.to_string()).or_default();
+        if files
+            .iter()
+            .any(|known| known.message_id == shared.message_id)
+        {
+            return;
+        }
+        files.push(shared);
+        files.sort_by_key(|shared| std::cmp::Reverse((shared.ts_unix_ms, shared.message_id)));
     }
 
     /// The physical folder for `channel`. Direct mappings are local-only;
@@ -1250,6 +1259,7 @@ impl AppState {
     /// caller can persist just those to storage.rs without duplicating
     /// anything already on disk.
     pub fn merge_history(&mut self, channel: &str, messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+        let channel_name = channel.to_string();
         let Some(channel) = self.channel_mut(channel) else {
             return Vec::new();
         };
@@ -1283,6 +1293,19 @@ impl AppState {
         }
 
         newly_accepted.sort_by_key(|m| (m.ts_unix_ms, m.id));
+        for message in &newly_accepted {
+            if let Some(file) = &message.attachment {
+                self.record_shared_file(
+                    &channel_name,
+                    SharedFile {
+                        message_id: message.id,
+                        file: file.clone(),
+                        sender: message.sender,
+                        ts_unix_ms: message.ts_unix_ms,
+                    },
+                );
+            }
+        }
         newly_accepted
     }
 
@@ -1935,6 +1958,7 @@ impl AppState {
         self.dm_channels.retain(|_, name| name != channel);
         self.direct_channels.retain(|_, name| name != channel);
         self.direct_folders.remove(channel);
+        self.shared_files.remove(channel);
         self.renames.remove(channel);
         self.autosave.remove(channel);
         self.outbox.remove(channel);
@@ -1965,6 +1989,17 @@ impl AppState {
     /// your own successfully sent file. A no-op if `channel` isn't
     /// currently joined.
     pub fn record_sent_message(&mut self, channel: &str, message: ChatMessage) {
+        if let Some(file) = &message.attachment {
+            self.record_shared_file(
+                channel,
+                SharedFile {
+                    message_id: message.id,
+                    file: file.clone(),
+                    sender: message.sender,
+                    ts_unix_ms: message.ts_unix_ms,
+                },
+            );
+        }
         if let Some(channel) = self.channel_mut(channel)
             && channel.remember_seen(message.id)
         {
@@ -3476,12 +3511,15 @@ impl AppState {
         let mut seen = HashSet::new();
         let mut result = Vec::new();
         for channel in &self.channels {
-            for line in &channel.messages {
-                if let TranscriptLine::Chat(message) = line
-                    && let Some(attachment) = &message.attachment
-                    && seen.insert(attachment.hash)
-                {
-                    result.push((attachment.hash, attachment.filename.clone(), message.sender));
+            if let Some(files) = self.shared_files.get(&channel.name) {
+                for shared in files {
+                    if seen.insert(shared.file.hash) {
+                        result.push((
+                            shared.file.hash,
+                            shared.file.filename.clone(),
+                            shared.sender,
+                        ));
+                    }
                 }
             }
         }
@@ -3501,16 +3539,17 @@ impl AppState {
     /// shared belongs to the channel, not to the view. Errors with a
     /// user-facing message if there is none.
     fn newest_shared_file(&self) -> Result<(Hash, String, [u8; 32]), String> {
-        self.active()
-            .messages
-            .iter()
-            .rev()
-            .find_map(|line| match line {
-                TranscriptLine::Chat(message) if message.sender != self.self_id => {
-                    let file = message.attachment.as_ref()?;
-                    Some((file.hash, file.filename.clone(), message.sender))
-                }
-                _ => None,
+        self.shared_files
+            .get(&self.active().name)
+            .into_iter()
+            .flatten()
+            .find(|shared| shared.sender != self.self_id)
+            .map(|shared| {
+                (
+                    shared.file.hash,
+                    shared.file.filename.clone(),
+                    shared.sender,
+                )
             })
             .ok_or_else(|| "no file from another peer to save in this channel".to_string())
     }
@@ -3527,16 +3566,27 @@ impl AppState {
     /// found the file in a transcript (`resolve_attachment`,
     /// `newest_shared_file`).
     fn channel_of_file(&self, hash: Hash) -> &str {
-        let active = self.active();
-        let channel = if active.carries_file(hash) {
-            active
-        } else {
-            self.channels
-                .iter()
-                .find(|channel| channel.carries_file(hash))
-                .expect("a file /save resolved was found in some channel's transcript")
-        };
-        &channel.name
+        let active = self.active().name.as_str();
+        self.channels
+            .iter()
+            .map(|channel| channel.name.as_str())
+            .filter(|channel| {
+                self.shared_files
+                    .get(*channel)
+                    .is_some_and(|files| files.iter().any(|shared| shared.file.hash == hash))
+            })
+            .find(|channel| *channel == active)
+            .or_else(|| {
+                self.channels
+                    .iter()
+                    .map(|channel| channel.name.as_str())
+                    .find(|channel| {
+                        self.shared_files.get(*channel).is_some_and(|files| {
+                            files.iter().any(|shared| shared.file.hash == hash)
+                        })
+                    })
+            })
+            .expect("a file /save resolved was found in shared-file metadata")
     }
 
     /// Who `/save` asks for the file `hash`, best bet first: its `sender`;
@@ -3559,21 +3609,31 @@ impl AppState {
         let channels: Vec<&Channel> = self
             .channels
             .iter()
-            .filter(|channel| channel.carries_file(hash))
+            .filter(|channel| {
+                self.shared_files
+                    .get(&channel.name)
+                    .is_some_and(|files| files.iter().any(|shared| shared.file.hash == hash))
+            })
             .collect();
         let online = channels
             .iter()
             .flat_map(|channel| channel.peers.iter().copied());
-        let posters = channels
-            .iter()
-            .flat_map(|channel| channel.messages.iter())
-            .filter_map(|line| match line {
+        let posters = channels.iter().flat_map(|channel| {
+            self.shared_files
+                .get(&channel.name)
+                .into_iter()
+                .flatten()
+                .map(|shared| shared.sender)
+        });
+        let live_posters = channels.iter().flat_map(|channel| {
+            channel.messages.iter().filter_map(|line| match line {
                 TranscriptLine::Chat(message) => Some(message.sender),
                 TranscriptLine::System(_) => None,
-            });
+            })
+        });
 
         let mut providers = vec![sender];
-        for id in online.chain(posters) {
+        for id in online.chain(posters).chain(live_posters) {
             if id != self.self_id && !providers.contains(&id) {
                 providers.push(id);
             }
@@ -5877,6 +5937,31 @@ mod tests {
         let mut app = app();
         app.load_history("nonexistent", vec![compose_message(PEER_ID, "hi", None)]);
         assert_eq!(app.active().messages.len(), 0);
+    }
+
+    #[test]
+    fn an_old_file_share_stays_listed_and_saveable_after_scrollback_trims_it() {
+        let mut app = app();
+        let old = file_message(1, PEER_ID, "old.pdf", b"old");
+        let hash = old.attachment.as_ref().unwrap().hash;
+        let mut history = vec![old];
+        for id in 2..=MAX_SCROLLBACK as u64 + 1 {
+            history.push(compose_message(SELF_ID, &format!("message {id}"), None));
+        }
+        app.load_history("general", history);
+
+        assert_eq!(app.active().messages.len(), MAX_SCROLLBACK);
+        open_files(&mut app);
+        assert_eq!(listed(&app), vec!["old.pdf"]);
+        app.handle_key(key(KeyCode::Esc));
+
+        let (channel, got, filename, providers, _) =
+            save_fields(submit(&mut app, &format!("/save {}", &hash.to_hex()[..8])));
+        assert_eq!(
+            (channel, got, filename),
+            ("general".into(), hash, "old.pdf".into())
+        );
+        assert_eq!(providers, vec![PEER_ID]);
     }
 
     fn dated_message(ts_unix_ms: u64, id: u64, sender: [u8; 32], text: &str) -> ChatMessage {
