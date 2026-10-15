@@ -1,0 +1,23 @@
+[book]
+authors = ["leyline contributors"]
+language = "en"
+src = "src"
+title = "leyline guide"
+description = "A practical guide to private peer-to-peer chat and safe folder sync."
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+additional-css = ["theme/leyline.css"]
+default-theme = "light"
+preferred-dark-theme = "navy"
+edit-url-template = "https://github.com/jhanekom27/leyline/edit/main/guide/{path}"
+git-repository-icon = "fab-github"
+git-repository-url = "https://github.com/jhanekom27/leyline"
+site-url = "/leyline/"
+smart-punctuation = true
+
+[output.html.search]
+enable = true

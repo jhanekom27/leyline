@@ -1,0 +1,50 @@
+:root {
+  --leyline-accent: #a64dff;
+  --leyline-accent-soft: rgba(166, 77, 255, 0.12);
+}
+
+.content main {
+  max-width: 54rem;
+}
+
+.content main > h1:first-child {
+  font-size: 2.35rem;
+  letter-spacing: -0.03em;
+  margin-bottom: 1.5rem;
+}
+
+.content h1,
+.content h2,
+.content h3 {
+  letter-spacing: -0.015em;
+}
+
+.content h2 {
+  border-bottom: 1px solid var(--table-border-color);
+  margin-top: 2.75rem;
+  padding-bottom: 0.35rem;
+}
+
+.content a {
+  color: var(--leyline-accent);
+}
+
+.content blockquote {
+  background: var(--leyline-accent-soft);
+  border-left: 0.25rem solid var(--leyline-accent);
+  border-radius: 0 0.3rem 0.3rem 0;
+  padding: 0.75rem 1rem;
+}
+
+.content table {
+  border-radius: 0.35rem;
+  overflow: hidden;
+}
+
+.menu-bar {
+  border-bottom: 1px solid var(--table-border-color);
+}
+
+.nav-chapters {
+  margin-top: 3rem;
+}

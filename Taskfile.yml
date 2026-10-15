@@ -1,0 +1,88 @@
+version: "3"
+
+vars:
+  MDBOOK_VERSION: "0.5.4"
+  MDBOOK: "{{.ROOT_DIR}}/.tools/bin/mdbook"
+  PAGES_API: "repos/{owner}/{repo}/pages"
+
+tasks:
+  docs:install:
+    desc: Install the pinned mdBook release locally
+    status:
+      - '"{{.MDBOOK}}" --version | grep -Fq "v{{.MDBOOK_VERSION}}"'
+      - '"{{.MDBOOK}}" serve --help >/dev/null'
+    cmds:
+      - >-
+        cargo install mdbook --locked --force --version "{{.MDBOOK_VERSION}}"
+        --root "{{.ROOT_DIR}}/.tools"
+
+  docs:build:
+    desc: Build the static documentation site
+    deps:
+      - docs:install
+    cmds:
+      - '"{{.MDBOOK}}" build guide'
+
+  docs:test:
+    desc: Test documentation examples
+    deps:
+      - docs:install
+    cmds:
+      - '"{{.MDBOOK}}" test guide'
+
+  docs:serve:
+    desc: Serve the guide locally with live reload
+    deps:
+      - docs:install
+    cmds:
+      - '"{{.MDBOOK}}" serve --open guide'
+
+  docs:configure:
+    desc: Configure GitHub Pages to publish the gh-pages branch
+    preconditions:
+      - sh: command -v gh >/dev/null
+        msg: "Install GitHub CLI first: brew install gh"
+      - sh: gh auth status >/dev/null
+        msg: "Authenticate GitHub CLI first: gh auth login"
+    cmds:
+      - |
+        if gh api "{{.PAGES_API}}" >/dev/null 2>&1; then
+          gh api --method PUT "{{.PAGES_API}}" \
+            -f build_type=legacy \
+            -f 'source[branch]=gh-pages' \
+            -f 'source[path]=/'
+        else
+          gh api --method POST "{{.PAGES_API}}" \
+            -f build_type=legacy \
+            -f 'source[branch]=gh-pages' \
+            -f 'source[path]=/'
+        fi
+
+  docs:publish:
+    desc: Build and manually publish the guide from a clean main checkout
+    deps:
+      - docs:build
+    preconditions:
+      - sh: test "$(git branch --show-current)" = main
+        msg: Publish only from the main branch.
+      - sh: test -z "$(git status --porcelain)"
+        msg: Commit or stash all changes before publishing documentation.
+      - sh: test -n "$(git config --get user.name)"
+        msg: Configure a Git user name before publishing documentation.
+      - sh: test -n "$(git config --get user.email)"
+        msg: Configure a Git email before publishing documentation.
+    cmds:
+      - |
+        publish_dir="$(mktemp -d)"
+        trap 'rm -rf "$publish_dir"' EXIT
+        git init --quiet --initial-branch=gh-pages "$publish_dir"
+        git -C "$publish_dir" remote add origin "$(git remote get-url origin)"
+        cp -R guide/book/. "$publish_dir/"
+        touch "$publish_dir/.nojekyll"
+        git -C "$publish_dir" add --all
+        git -C "$publish_dir" \
+          -c user.name="$(git config --get user.name)" \
+          -c user.email="$(git config --get user.email)" \
+          commit --quiet -m "docs: publish site"
+        git -C "$publish_dir" push --force origin gh-pages
+      - task: docs:configure

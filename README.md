@@ -50,6 +50,11 @@ deliberately minimal:
 
 See [Roadmap](#roadmap) below for how it got here.
 
+## Documentation
+
+The user guide covers setup and safe folder synchronization:
+[jhanekom27.github.io/leyline](https://jhanekom27.github.io/leyline/).
+
 ## Requirements
 
 - A recent stable Rust toolchain with edition 2024 support (Rust 1.91 or newer -- iroh-gossip's current MSRV)
