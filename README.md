@@ -1,54 +1,27 @@
 # leyline
 
-A peer-to-peer terminal chat app. No servers, no accounts, no central relay
-to run -- your identity is a local keypair, "channels" are private gossip
-topics (each with its own randomly-generated key, not a guessable hash of
-its name), and messages travel directly between peers using
-[iroh](https://github.com/n0-computer/iroh) + iroh-gossip, all inside a
-[ratatui](https://ratatui.rs) TUI.
+**Private chat that lives in your terminal.** leyline lets small groups and
+trusted peers talk, share files, and keep channel folders in sync without
+accounts, a central chat server, or a relay for your messages.
 
-## Status: private channels, with history backfill for offline peers
+Create a channel, share its invite with the people you choose, and keep
+working. Your identity, channels, messages, and known peers stay on your
+device; peers who were offline automatically catch up when they return.
 
-`leyline` channels are private by default: creating or first joining one
-(by name or ticket) generates a random secret that -- not the name you
-typed -- actually determines its gossip topic, so a channel is only
-reachable by someone you've handed a ticket to, and two people who happen
-to pick the same name never end up in the same swarm. `leyline` also
-backfills channel history for peers that were offline (or join a channel
-fresh): whenever a channel gains a gossip neighbor, and again periodically
-regardless of neighbor churn, every peer floods its current history's
-root hash -- an `iroh-blobs` content manifest -- to the whole channel,
-and whoever's behind automatically fetches the messages they're missing
-directly from whoever announced them, no manual command needed -- not
-just from whichever peer you happened to connect through. Combined with
-local persistence, multi-channel support (one gossip task per joined
-topic, a left-hand panel to switch between them, and a presence sidebar
-scoped to whichever channel is active), a couple of things are still
-deliberately minimal:
+## Why leyline
 
-- **Identity persists across runs** -- your keypair is generated once and
-  saved to disk, so your endpoint id stays the same every time you start
-  `leyline` (see [Build & run](#build--run) for how this affects local
-  multi-instance testing).
-- **A channel's name is just a local label, not a credential** -- what
-  actually gates entry is its random secret, carried inside its invite
-  ticket. Guessing or reusing a name -- even `#general`, which every fresh
-  install starts with its own private copy of -- never joins you to
-  someone else's channel.
-- **Channel membership and known peers persist too** -- every channel you
-  join (by name or ticket) and the addresses of peers you've talked to
-  are remembered on disk, so restarting `leyline` rejoins all of them and
-  reconnects automatically, without re-pasting an invite ticket. An
-  invite ticket itself is one-directional -- it bundles *your* current
-  address so someone else can bootstrap onto you -- so pasting your own
-  ticket back in after a restart can't reconnect you to anyone; it's
-  detected and ignored in favor of previously-known peers for that
-  channel.
-- **Backfill only covers channels you've joined** -- it rides each
-  channel's existing gossip topic, so you still need a name or ticket to
-  join a channel before its history can sync to you.
-
-See [Roadmap](#roadmap) below for how it got here.
+- **Private by default.** Channel names are local labels, not credentials.
+  Every channel has its own random secret, carried only in an invite ticket.
+- **No accounts or central chat service.** Your local keypair is your
+  identity. Messages travel peer-to-peer over
+  [iroh](https://github.com/n0-computer/iroh) and iroh-gossip inside a
+  [ratatui](https://ratatui.rs) terminal interface.
+- **Built for the work around a conversation.** Chat across group channels,
+  private messages, or direct peer connections; share files on demand; and
+  opt into safe folder sync with conflict copies and recoverable trash.
+- **Pick up where you left off.** leyline persists your identity, joined
+  channels, and local history, then backfills missed messages for channels
+  you are already allowed to join.
 
 ## Documentation
 
@@ -58,7 +31,6 @@ The user guide covers setup and safe folder synchronization:
 ## Requirements
 
 - A recent stable Rust toolchain with edition 2024 support (Rust 1.91 or newer -- iroh-gossip's current MSRV)
-- [Backlog.md](https://github.com/MrLesk/Backlog.md) for task management -- `brew install backlog-md` (see [Task management](#task-management))
 
 ## Build & run
 
@@ -226,27 +198,6 @@ rename arrives as its new path without re-transferring unchanged content.
 This repository's automated tests cover the local inventory boundary; this
 two-machine verification must be performed manually.
 
-## Roadmap
-
-Rough build order this project followed, from a `ratatui`-only prototype to
-the full peer-to-peer app -- all shipped:
-
-- [x] 1. `ratatui` chat UI against fake/local messages -- validate layout and keybindings
-- [x] 2. wire up `iroh` + `iroh-gossip` so two local instances can talk over one gossip topic
-- [x] 3. Invite ticket generation/parsing, identity persistence
-- [x] 4. Multi-channel support (one gossip task per joined topic), presence sidebar
-- [x] 5. Local message persistence + reload on start
-- [x] 6. `iroh-blobs`-based history backfill for offline peers
-- [x] 7. Room privacy: per-channel random secrets instead of name-derived topics
-
-## Task management
-
-Feature and bug work is tracked with [Backlog.md](https://github.com/MrLesk/Backlog.md),
-a markdown-native task manager -- `backlog board` paints a terminal Kanban
-board, and `backlog task list --plain` lists tasks (tasks use a `LEY-`
-prefix). Install it with `brew install backlog-md`. New, not-yet-committed
-ideas still start in [`features.md`](./features.md) before being promoted
-into a task. See [`AGENTS.md`](./AGENTS.md) for the full agent workflow.
 
 ## Architecture
 

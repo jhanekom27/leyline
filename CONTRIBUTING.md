@@ -19,18 +19,21 @@ with `backlog instructions overview`, use the matching detailed Backlog guide
 before planning or changing task state, and update tasks through the CLI rather
 than editing their Markdown directly.
 
-## Documentation demo
+## Project history
 
-The README animation is generated from committed sources:
+leyline evolved from a local `ratatui` prototype into private peer-to-peer
+chat with invite tickets, persisted identity and history, multi-channel
+navigation, and offline history backfill. User-facing behavior belongs in
+`README.md` and the published guide; architecture decisions belong in
+`concept.md` and Backlog decision records.
 
-```sh
-brew install vhs
-vhs docs/demo.tape
-```
+## Task management
 
-`docs/demo.sh` deliberately renders a deterministic visual walkthrough. This
-keeps the documentation recording reproducible without a network, persisted
-identity, or two interactive instances.
+Feature and bug work uses [Backlog.md](https://github.com/MrLesk/Backlog.md).
+Install it with `brew install backlog-md`; `backlog board` opens the terminal
+board and `backlog task list --plain` lists current `LEY-` tasks. Capture
+uncommitted ideas in [`features.md`](./features.md) before promoting them to a
+task, then follow the workflow in `AGENTS.md`.
 
 ## Manual folder-sync verification
 
