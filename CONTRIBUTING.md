@@ -35,6 +35,18 @@ board and `backlog task list --plain` lists current `LEY-` tasks. Capture
 uncommitted ideas in [`features.md`](./features.md) before promoting them to a
 task, then follow the workflow in `AGENTS.md`.
 
+## Documentation demo
+
+Regenerate the README's two-peer terminal recording with:
+
+```sh
+task docs:demo
+```
+
+The task builds the release binary, uses tmux to run isolated Alice and Bob
+instances, and renders `docs/assets/leyline-demo.gif` through VHS. It requires
+`vhs`, `tmux`, `ttyd`, and `ffmpeg` on your `PATH`.
+
 ## Manual folder-sync verification
 
 Verify sync between a macOS machine (normally case-insensitive) and a Linux

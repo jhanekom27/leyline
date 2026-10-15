@@ -7,6 +7,7 @@ accounts, a central chat server, or a relay for your messages.
 Create a channel, share its invite with the people you choose, and keep
 working. Your identity, channels, messages, and known peers stay on your
 device; peers who were offline automatically catch up when they return.
+![Alice creates a private channel, Bob joins with the invite ticket, and both exchange messages in side-by-side leyline terminals.](docs/assets/leyline-demo.gif)
 
 ## Why leyline
 
