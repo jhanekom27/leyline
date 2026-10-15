@@ -11,3 +11,10 @@ Use focused children when applicable:
 - `src/app/replies.rs` — reply-target selection and thread views.
 
 Do not add filesystem or network I/O here. Preserve inline tests in the responsibility’s current module and run `cargo test`.
+
+## Behavioral scope
+Before changing a slash command based on `ChannelKind`, especially by refusing
+or disabling it for a variant, verify the behavior's scope first. Read the
+related Backlog task tree, inspect the command's existing `ChannelKind` tests,
+and follow the runtime or network path that makes it work. A documentation
+task's wording alone is not evidence that another channel kind is unsupported.
