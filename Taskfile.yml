@@ -83,6 +83,7 @@ tasks:
         git -C "$publish_dir" \
           -c user.name="$(git config --get user.name)" \
           -c user.email="$(git config --get user.email)" \
-          commit --quiet -m "docs: publish site"
+          commit --quiet -m "docs: publish site" \
+          -m "Co-Authored-By: Warp <agent@warp.dev>"
         git -C "$publish_dir" push --force origin gh-pages
       - task: docs:configure
