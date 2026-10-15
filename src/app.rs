@@ -691,6 +691,17 @@ pub enum InputAction {
         channel: String,
         config: SyncConfig,
     },
+    /// Inspect recoverable remote deletes for the active channel. The
+    /// runtime performs the filesystem scan and reports it back.
+    ListSyncTrash(String),
+    /// Restore one relative path from the active channel's sync trash.
+    RestoreSyncTrash {
+        channel: String,
+        path: String,
+    },
+    /// Permanently delete every recoverable remote delete in the active
+    /// channel after this explicit command.
+    PurgeSyncTrash(String),
     /// Move the files root -- the folder every channel's folder lives in --
     /// to the path exactly as typed after `/folder ` (see `run_folder`). The
     /// caller (`files::set_files_root`) expands, creates and remembers it,
@@ -2336,6 +2347,7 @@ impl AppState {
             "autosave" => self.run_autosave(arg.trim()),
             "outbox" => self.run_outbox(arg.trim()),
             "sync" => self.run_sync(arg.trim()),
+            "trash" => self.run_trash(arg.trim()),
             "files" => self.run_files(),
             "paste" => self.run_paste(),
             "search" | "s" => self.run_search(arg.trim()),
@@ -2380,7 +2392,7 @@ impl AppState {
              /leave [channel], /rename [name], /who, /send [path], \
              /save [hash-prefix], /folder [path], /maxsize [size|off|default], \
              /autosave [on|off|limit <size|default>], /outbox [on|off], /files, /paste, \
-             /sync [receive-only|publish-and-receive|off|pause|resume|include <glob>|exclude <glob>|remove <include|exclude> <glob>|clear-rules], \
+             /sync [receive-only|publish-and-receive|off|pause|resume|include <glob>|exclude <glob>|remove <include|exclude> <glob>|clear-rules], /trash [restore <path>|purge], \
              /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
              ticket for a new device to redeem, /pair <ticket> redeems one (after an \
@@ -2391,6 +2403,7 @@ impl AppState {
              /maxsize shows the biggest file you can share (500 MB to begin with) and, with a size like 2GB, changes it (off lifts it, default restores it) -- \
              /autosave on saves the files your own devices and the peers you have aliased share in this channel as they arrive, up to the device-wide {autosave_limit} limit, with no command (off by default, per channel; files from before, and from anyone else, are never fetched this way); /autosave limit <size> changes that finite limit for every channel and default restores 25 MB -- \
              /sync receive-only mirrors safe remote index entries into this channel's folder, while /sync publish-and-receive also publishes stable local files (off by default, per channel); /sync include and /sync exclude add relative glob rules, with excludes taking precedence; it never propagates deletes or renames -- \
+             /trash lists this channel's recoverable remote deletes; /trash restore <path> brings one back without overwriting a local file, and /trash purge permanently removes them all (trash is never automatically purged) -- \
              /outbox on watches this channel's local send folder and shares new stable files once (off by default; existing, hidden, and temporary files are ignored) -- \
              /files lists the files shared in this channel (type to filter, \u{2191}/\u{2193} pick, \
              Enter save, Ctrl+O open one already saved (never a program or script), Esc close) -- \
@@ -3203,6 +3216,25 @@ impl AppState {
         self.sync.insert(channel.clone(), config.clone());
         self.push_system(self.sync_notice(&channel));
         Some(InputAction::SetSync { channel, config })
+    }
+
+    /// Handles `/trash [restore <path>|purge]` for the active channel.
+    fn run_trash(&mut self, arg: &str) -> Option<InputAction> {
+        let channel = self.active().name.clone();
+        match arg {
+            "" => Some(InputAction::ListSyncTrash(channel)),
+            "purge" => Some(InputAction::PurgeSyncTrash(channel)),
+            _ => match arg.strip_prefix("restore ") {
+                Some(path) if !path.trim().is_empty() => Some(InputAction::RestoreSyncTrash {
+                    channel,
+                    path: path.trim().to_string(),
+                }),
+                _ => {
+                    self.push_system("usage: /trash [restore <path>|purge]");
+                    None
+                }
+            },
+        }
     }
 
     fn sync_notice(&self, channel: &str) -> String {
@@ -11215,5 +11247,39 @@ mod tests {
         assert!(action.is_none());
         assert!(app.sync_config("general").rules.is_empty());
         assert!(as_system(app.active().messages.back().unwrap()).contains("relative glob"));
+    }
+
+    #[test]
+    fn trash_commands_target_only_the_active_channel() {
+        let mut app = AppState::new(
+            SELF_ID,
+            vec!["general".to_string(), "project".to_string()],
+            "general",
+        );
+        app.active = 1;
+
+        assert!(matches!(
+            submit(&mut app, "/trash"),
+            Some(InputAction::ListSyncTrash(channel)) if channel == "project"
+        ));
+        assert!(matches!(
+            submit(&mut app, "/trash restore old/report.txt"),
+            Some(InputAction::RestoreSyncTrash { channel, path })
+                if channel == "project" && path == "old/report.txt"
+        ));
+        assert!(matches!(
+            submit(&mut app, "/trash purge"),
+            Some(InputAction::PurgeSyncTrash(channel)) if channel == "project"
+        ));
+    }
+
+    #[test]
+    fn trash_rejects_missing_restore_path_and_unknown_arguments() {
+        let mut app = app();
+
+        assert!(submit(&mut app, "/trash restore").is_none());
+        assert!(as_system(app.active().messages.back().unwrap()).starts_with("usage:"));
+        assert!(submit(&mut app, "/trash tomorrow").is_none());
+        assert!(as_system(app.active().messages.back().unwrap()).starts_with("usage:"));
     }
 }

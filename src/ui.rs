@@ -102,6 +102,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/autosave [on|off|limit <size|default>]",
     "/outbox [on|off]",
     "/sync [receive-only|publish-and-receive|off|pause|resume|include <glob>|exclude <glob>]",
+    "/trash [restore <path>|purge]",
     "/files",
     "/paste (or Ctrl+V)",
     "/alias <hex> <name>",
@@ -3773,6 +3774,11 @@ mod tests {
         assert!(COMMAND_HINTS.contains(
             &"/sync [receive-only|publish-and-receive|off|pause|resume|include <glob>|exclude <glob>]"
         ));
+    }
+
+    #[test]
+    fn the_sync_trash_command_is_among_the_hints() {
+        assert!(COMMAND_HINTS.contains(&"/trash [restore <path>|purge]"));
     }
 
     #[test]

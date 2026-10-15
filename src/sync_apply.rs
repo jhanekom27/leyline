@@ -7,6 +7,11 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 const TRASH_DIR: &str = ".leyline-trash";
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashedFile {
+    pub relative: String,
+    pub size: u64,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Relocation {
@@ -18,6 +23,11 @@ pub enum Relocation {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Trash {
     Moved(PathBuf),
+    Missing,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum Restore {
+    Restored(PathBuf),
     Missing,
 }
 
@@ -114,6 +124,56 @@ pub fn trash(root: &Path, remote: &str) -> Result<Trash, String> {
     Ok(Trash::Moved(target))
 }
 
+/// Lists recoverable remote deletes below a channel's private trash folder.
+pub fn list_trash(root: &Path) -> Result<Vec<TrashedFile>, String> {
+    let trash = trash_root(root)?;
+    match fs::symlink_metadata(&trash) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!("sync refused symlink {}", trash.display()));
+        }
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(format!("sync refused non-directory {}", trash.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("sync couldn't inspect {}: {err}", trash.display())),
+    }
+    let mut files = Vec::new();
+    list_trash_directory(&trash, &trash, &mut files)?;
+    files.sort_by(|left, right| left.relative.cmp(&right.relative));
+    Ok(files)
+}
+
+/// Restores a validated path without overwriting any local file.
+pub fn restore(root: &Path, relative: &str) -> Result<Restore, String> {
+    let parts = validated_parts(relative)?;
+    let trash = trash_root(root)?;
+    let source = match trash_source(&trash, &parts)? {
+        Some(source) => source,
+        None => return Ok(Restore::Missing),
+    };
+    let destination = restored_destination(root, relative)?;
+    fs::rename(&source, &destination).map_err(|err| {
+        format!(
+            "sync couldn't restore {} to {}: {err}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(Restore::Restored(destination))
+}
+
+/// Permanently removes recoverable files only after the caller explicitly
+/// requests a purge. There is intentionally no automatic expiry.
+pub fn purge_trash(root: &Path) -> Result<usize, String> {
+    let files = list_trash(root)?;
+    if files.is_empty() {
+        return Ok(0);
+    }
+    let trash = trash_root(root)?;
+    fs::remove_dir_all(&trash)
+        .map_err(|err| format!("sync couldn't purge {}: {err}", trash.display()))?;
+    Ok(files.len())
+}
+
 fn exact_destination(root: &Path, remote: &str) -> Result<PathBuf, String> {
     let parts = validated_parts(remote)?;
     let mut dir = root.to_path_buf();
@@ -170,6 +230,120 @@ fn trash_destination(root: &Path, remote: &str) -> Result<PathBuf, String> {
     }
     Err(format!(
         "sync could not reserve trash under {}",
+        dir.display()
+    ))
+}
+
+fn trash_root(root: &Path) -> Result<PathBuf, String> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(format!("sync refused symlink {}", root.display()))
+        }
+        Ok(metadata) if metadata.is_dir() => Ok(root.join(TRASH_DIR)),
+        Ok(_) => Err(format!("sync refused non-directory {}", root.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(root.join(TRASH_DIR)),
+        Err(err) => Err(format!("sync couldn't inspect {}: {err}", root.display())),
+    }
+}
+
+fn list_trash_directory(
+    trash: &Path,
+    directory: &Path,
+    files: &mut Vec<TrashedFile>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(directory)
+        .map_err(|err| format!("sync couldn't read {}: {err}", directory.display()))?
+    {
+        let entry =
+            entry.map_err(|err| format!("sync couldn't read {}: {err}", directory.display()))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|err| format!("sync couldn't inspect {}: {err}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("sync refused symlink {}", path.display()));
+        }
+        if metadata.is_dir() {
+            list_trash_directory(trash, &path, files)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(format!("sync refused non-file {}", path.display()));
+        }
+        let relative = path
+            .strip_prefix(trash)
+            .expect("recursive trash path must remain below trash root")
+            .to_str()
+            .ok_or_else(|| format!("sync skipped non-UTF-8 trash path {}", path.display()))?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        validated_parts(&relative)?;
+        files.push(TrashedFile {
+            relative,
+            size: metadata.len(),
+        });
+    }
+    Ok(())
+}
+
+fn trash_source(trash: &Path, parts: &[Component<'_>]) -> Result<Option<PathBuf>, String> {
+    match fs::symlink_metadata(trash) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!("sync refused symlink {}", trash.display()));
+        }
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(format!("sync refused non-directory {}", trash.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("sync couldn't inspect {}: {err}", trash.display())),
+    }
+    let mut path = trash.to_path_buf();
+    for (index, component) in parts.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            unreachable!();
+        };
+        path.push(name);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!("sync refused symlink {}", path.display()));
+            }
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(format!("sync couldn't inspect {}: {err}", path.display()));
+            }
+        };
+        if index + 1 == parts.len() {
+            if !metadata.is_file() {
+                return Err(format!("sync refused non-file {}", path.display()));
+            }
+        } else if !metadata.is_dir() {
+            return Err(format!("sync refused non-directory {}", path.display()));
+        }
+    }
+    Ok(Some(path))
+}
+
+fn restored_destination(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let destination = exact_destination(root, relative)?;
+    if !destination.exists() {
+        return Ok(destination);
+    }
+    let dir = destination.parent().expect("destination has parent");
+    let stem = destination
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let extension = destination.extension().and_then(|name| name.to_str());
+    for number in 1..=1000 {
+        let name = match extension {
+            Some(ext) => format!("{stem} (restored {number}).{ext}"),
+            None => format!("{stem} (restored {number})"),
+        };
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "sync could not reserve a restored copy under {}",
         dir.display()
     ))
 }
@@ -298,5 +472,68 @@ mod tests {
             fs::read(root.path().join("new.txt")).unwrap(),
             b"same bytes"
         );
+    }
+
+    #[test]
+    fn trash_lists_nested_files_without_touching_them() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join(".leyline-trash/old/report.txt");
+        let second = root.path().join(".leyline-trash/notes.txt");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::write(&first, b"report").unwrap();
+        fs::write(&second, b"notes").unwrap();
+
+        assert_eq!(
+            list_trash(root.path()).unwrap(),
+            vec![
+                TrashedFile {
+                    relative: "notes.txt".into(),
+                    size: 5,
+                },
+                TrashedFile {
+                    relative: "old/report.txt".into(),
+                    size: 6,
+                },
+            ]
+        );
+        assert!(first.exists());
+        assert!(second.exists());
+    }
+
+    #[test]
+    fn restore_keeps_a_local_file_and_uses_a_distinct_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let trashed = root.path().join(".leyline-trash/nested/report.txt");
+        let local = root.path().join("nested/report.txt");
+        fs::create_dir_all(trashed.parent().unwrap()).unwrap();
+        fs::create_dir_all(local.parent().unwrap()).unwrap();
+        fs::write(&trashed, b"remote").unwrap();
+        fs::write(&local, b"local").unwrap();
+
+        let restored = restore(root.path(), "nested/report.txt").unwrap();
+
+        assert_eq!(
+            restored,
+            Restore::Restored(root.path().join("nested/report (restored 1).txt"))
+        );
+        assert_eq!(fs::read(local).unwrap(), b"local");
+        assert_eq!(
+            fs::read(root.path().join("nested/report (restored 1).txt")).unwrap(),
+            b"remote"
+        );
+        assert!(!trashed.exists());
+    }
+
+    #[test]
+    fn purge_only_removes_trash_after_an_explicit_request() {
+        let root = tempfile::tempdir().unwrap();
+        let trashed = root.path().join(".leyline-trash/report.txt");
+        fs::create_dir_all(trashed.parent().unwrap()).unwrap();
+        fs::write(&trashed, b"report").unwrap();
+
+        assert_eq!(list_trash(root.path()).unwrap().len(), 1);
+        assert!(trashed.exists(), "listing never removes recoverable files");
+        assert_eq!(purge_trash(root.path()).unwrap(), 1);
+        assert!(!trashed.exists());
     }
 }

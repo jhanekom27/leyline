@@ -475,6 +475,22 @@ struct PendingDm {
     text: Option<String>,
 }
 
+enum SyncTrashOutcome {
+    Listed {
+        channel: String,
+        result: Result<Vec<sync_apply::TrashedFile>, String>,
+    },
+    Restored {
+        channel: String,
+        path: String,
+        result: Result<sync_apply::Restore, String>,
+    },
+    Purged {
+        channel: String,
+        result: Result<usize, String>,
+    },
+}
+
 /// How often each joined channel with any recorded history re-announces its
 /// current root to the whole channel (see `net::Net::announce`), on top of
 /// the immediate re-announce whenever a channel gains a gossip neighbor.
@@ -642,6 +658,7 @@ async fn run(
     // Likewise for the file picker's folder reads (see `InputAction::
     // ReadFolder`), which are filesystem work, not network activity.
     let (browse_tx, mut browse_rx) = mpsc::channel::<FolderListing>(8);
+    let (trash_tx, mut trash_rx) = mpsc::channel::<SyncTrashOutcome>(8);
     // Outbox directory reads stay off the event loop, exactly like the file
     // picker. One scan at a time prevents a slow network volume from piling
     // up blocking jobs.
@@ -740,6 +757,40 @@ async fn run(
                                         config.label()
                                     ));
                                 }
+                            }
+                            Some(InputAction::ListSyncTrash(channel)) => {
+                                let root = app.folder_dir(&channel);
+                                let tx = trash_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let result = sync_apply::list_trash(&root);
+                                    let _ = tx.blocking_send(SyncTrashOutcome::Listed {
+                                        channel,
+                                        result,
+                                    });
+                                });
+                            }
+                            Some(InputAction::RestoreSyncTrash { channel, path }) => {
+                                let root = app.folder_dir(&channel);
+                                let tx = trash_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let result = sync_apply::restore(&root, &path);
+                                    let _ = tx.blocking_send(SyncTrashOutcome::Restored {
+                                        channel,
+                                        path,
+                                        result,
+                                    });
+                                });
+                            }
+                            Some(InputAction::PurgeSyncTrash(channel)) => {
+                                let root = app.folder_dir(&channel);
+                                let tx = trash_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let result = sync_apply::purge_trash(&root);
+                                    let _ = tx.blocking_send(SyncTrashOutcome::Purged {
+                                        channel,
+                                        result,
+                                    });
+                                });
                             }
                             Some(InputAction::Join(arg)) => {
                                 if let Some(message) = net.join(arg) {
@@ -1493,6 +1544,10 @@ async fn run(
                 app.apply_folder_listing(listing);
                 dirty = true;
             }
+            Some(outcome) = trash_rx.recv() => {
+                report_sync_trash(&mut app, outcome);
+                dirty = true;
+            }
             Some(results) = outbox_rx.recv() => {
                 outbox_scan_in_flight = false;
                 let mut candidates = Vec::new();
@@ -1600,6 +1655,76 @@ async fn run(
     net.shutdown().await?;
 
     Ok(app.restart_with_ticket)
+}
+fn report_sync_trash(app: &mut AppState, outcome: SyncTrashOutcome) {
+    match outcome {
+        SyncTrashOutcome::Listed {
+            channel,
+            result: Ok(files),
+        } if files.is_empty() => app.push_system_to(
+            &channel,
+            format!(
+                "sync trash for {} is empty -- recoverable remote deletes stay until /trash purge",
+                app.channel_heading(&channel)
+            ),
+        ),
+        SyncTrashOutcome::Listed {
+            channel,
+            result: Ok(files),
+        } => {
+            app.push_system_to(
+                &channel,
+                format!(
+                    "sync trash for {} ({} recoverable file(s), kept until /trash purge):",
+                    app.channel_heading(&channel),
+                    files.len()
+                ),
+            );
+            for file in files {
+                app.push_system_to(
+                    &channel,
+                    format!("  {} ({})", file.relative, files::human_size(file.size)),
+                );
+            }
+        }
+        SyncTrashOutcome::Restored {
+            channel,
+            path,
+            result: Ok(sync_apply::Restore::Restored(destination)),
+        } => app.push_system_to(
+            &channel,
+            format!("restored {path} to {}", destination.display()),
+        ),
+        SyncTrashOutcome::Restored {
+            channel,
+            path,
+            result: Ok(sync_apply::Restore::Missing),
+        } => app.push_system_to(&channel, format!("no recoverable sync file named {path}")),
+        SyncTrashOutcome::Purged {
+            channel,
+            result: Ok(0),
+        } => app.push_system_to(&channel, "sync trash was already empty"),
+        SyncTrashOutcome::Purged {
+            channel,
+            result: Ok(count),
+        } => app.push_system_to(
+            &channel,
+            format!("permanently purged {count} recoverable sync file(s)"),
+        ),
+        SyncTrashOutcome::Listed {
+            channel,
+            result: Err(error),
+        }
+        | SyncTrashOutcome::Restored {
+            channel,
+            result: Err(error),
+            ..
+        }
+        | SyncTrashOutcome::Purged {
+            channel,
+            result: Err(error),
+        } => app.push_system_to(&channel, format!("sync trash failed: {error}")),
+    }
 }
 
 fn record_direct_peer(
