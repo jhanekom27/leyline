@@ -135,8 +135,8 @@ channel folder.
 
 ## Troubleshoot deliberately
 
-1. Confirm both people are in the same invited **group** channel, not two
-   same-named private channels.
+1. Confirm both people are in the same conversation: the same invited
+   **group** channel, or the same `/msg` or `/dm` pair.
 2. Run `/sync` on both instances and check for `P`, `C`, or `!`.
 3. Run `/activity` to see the latest local outcome for each affected path.
 4. Ensure the file is not hidden, temporary, oversized, or beneath `send/`.
