@@ -52,7 +52,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, warn};
 
-use app::{AppState, InputAction, SaveRequest};
+use app::{AppState, ConflictResolution, InputAction, SaveRequest, SyncConflict};
 use autosave::{AutoSave, limit as autosave_limit, set_limit as set_autosave_limit};
 use backfill::BackfillStore;
 use channel_registry::ChannelRegistry;
@@ -491,6 +491,14 @@ enum SyncTrashOutcome {
     },
 }
 
+enum SyncConflictOutcome {
+    Resolved {
+        channel: String,
+        conflict: SyncConflict,
+        result: Result<(), String>,
+    },
+}
+
 /// How often each joined channel with any recorded history re-announces its
 /// current root to the whole channel (see `net::Net::announce`), on top of
 /// the immediate re-announce whenever a channel gains a gossip neighbor.
@@ -659,6 +667,7 @@ async fn run(
     // ReadFolder`), which are filesystem work, not network activity.
     let (browse_tx, mut browse_rx) = mpsc::channel::<FolderListing>(8);
     let (trash_tx, mut trash_rx) = mpsc::channel::<SyncTrashOutcome>(8);
+    let (conflict_tx, mut conflict_rx) = mpsc::channel::<SyncConflictOutcome>(8);
     // Outbox directory reads stay off the event loop, exactly like the file
     // picker. One scan at a time prevents a slow network volume from piling
     // up blocking jobs.
@@ -788,6 +797,38 @@ async fn run(
                                     let result = sync_apply::purge_trash(&root);
                                     let _ = tx.blocking_send(SyncTrashOutcome::Purged {
                                         channel,
+                                        result,
+                                    });
+                                });
+                            }
+                            Some(InputAction::ResolveSyncConflict {
+                                channel,
+                                conflict,
+                                resolution,
+                            }) => {
+                                let root = app.folder_dir(&channel);
+                                let tx = conflict_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let resolution = match resolution {
+                                        ConflictResolution::Local => {
+                                            sync_apply::ConflictResolution::Local
+                                        }
+                                        ConflictResolution::Remote => {
+                                            sync_apply::ConflictResolution::Remote
+                                        }
+                                        ConflictResolution::Both => {
+                                            sync_apply::ConflictResolution::Both
+                                        }
+                                    };
+                                    let result = sync_apply::resolve_conflict(
+                                        &root,
+                                        &conflict.local_path,
+                                        conflict.remote_copy_path.as_deref(),
+                                        resolution,
+                                    );
+                                    let _ = tx.blocking_send(SyncConflictOutcome::Resolved {
+                                        channel,
+                                        conflict,
                                         result,
                                     });
                                 });
@@ -1270,11 +1311,25 @@ async fn run(
                                     Some(Ok((_, sync_apply::Relocation::Unavailable))) | None => match sync_apply::reserve(&root, &remote.path) {
                                     Ok(destination) => {
                                         if !destination.ends_with(&remote.path) {
-                                            app.sync_conflict(
-                                                &remote.channel,
-                                                remote.path.clone(),
-                                                destination.display().to_string(),
-                                            );
+                                            let local = root.join(&remote.path);
+                                            let local_modified_unix_ms = std::fs::metadata(&local)
+                                                .ok()
+                                                .and_then(|metadata| metadata.modified().ok())
+                                                .and_then(|modified| modified.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                                                .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX));
+                                            let remote_copy_path = destination
+                                                .strip_prefix(&root)
+                                                .ok()
+                                                .and_then(|path| path.to_str())
+                                                .map(|path| path.replace(std::path::MAIN_SEPARATOR, "/"));
+                                            app.sync_conflict(&remote.channel, SyncConflict {
+                                                local_path: remote.path.clone(),
+                                                remote_path: remote.path.clone(),
+                                                remote_copy_path,
+                                                local_modified_unix_ms,
+                                                remote_modified_unix_ms: Some(remote.entry.modified_unix_ms),
+                                                author: Some(remote.entry.author),
+                                            });
                                         }
                                         app.sync_pending(&remote.channel, remote.path.clone());
                                         net.save_synced_file(
@@ -1304,6 +1359,27 @@ async fn run(
                             && app.sync_allows_path(&channel, &path)
                         {
                             if !sync_publish_watcher.may_remove_remote(&channel, &path) {
+                                let root = app.folder_dir(&channel);
+                                let local_modified_unix_ms = std::fs::metadata(root.join(&path))
+                                    .ok()
+                                    .and_then(|metadata| metadata.modified().ok())
+                                    .and_then(|modified| {
+                                        modified.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()
+                                    })
+                                    .map(|duration| {
+                                        duration.as_millis().try_into().unwrap_or(u64::MAX)
+                                    });
+                                app.sync_conflict(
+                                    &channel,
+                                    SyncConflict {
+                                        local_path: path.clone(),
+                                        remote_path: path.clone(),
+                                        remote_copy_path: None,
+                                        local_modified_unix_ms,
+                                        remote_modified_unix_ms: None,
+                                        author: None,
+                                    },
+                                );
                                 app.push_system_to(
                                     &channel,
                                     format!("sync kept locally changed {path} after a remote delete"),
@@ -1546,6 +1622,19 @@ async fn run(
             }
             Some(outcome) = trash_rx.recv() => {
                 report_sync_trash(&mut app, outcome);
+                dirty = true;
+            }
+            Some(SyncConflictOutcome::Resolved { channel, conflict, result }) = conflict_rx.recv() => {
+                match result {
+                    Ok(()) => {
+                        app.sync_conflict_resolved(&channel, &conflict);
+                        app.push_system_to(&channel, format!("resolved sync conflict for {}", conflict.local_path));
+                    }
+                    Err(error) => app.push_system_to(
+                        &channel,
+                        format!("couldn't resolve sync conflict for {}: {error}", conflict.local_path),
+                    ),
+                }
                 dirty = true;
             }
             Some(results) = outbox_rx.recv() => {

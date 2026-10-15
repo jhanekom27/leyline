@@ -31,6 +31,13 @@ pub enum Restore {
     Missing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictResolution {
+    Local,
+    Remote,
+    Both,
+}
+
 pub fn reserve(root: &Path, remote: &str) -> Result<PathBuf, String> {
     let destination = exact_destination(root, remote)?;
     if !destination.exists() {
@@ -172,6 +179,44 @@ pub fn purge_trash(root: &Path) -> Result<usize, String> {
     fs::remove_dir_all(&trash)
         .map_err(|err| format!("sync couldn't purge {}: {err}", trash.display()))?;
     Ok(files.len())
+}
+
+pub fn resolve_conflict(
+    root: &Path,
+    local: &str,
+    remote_copy: Option<&str>,
+    resolution: ConflictResolution,
+) -> Result<(), String> {
+    validated_parts(local)?;
+    if let Some(remote_copy) = remote_copy {
+        validated_parts(remote_copy)?;
+    }
+    match resolution {
+        ConflictResolution::Both => Ok(()),
+        ConflictResolution::Local => {
+            let remote_copy = remote_copy
+                .ok_or_else(|| "remote delete has no copy to keep locally".to_string())?;
+            match trash(root, remote_copy)? {
+                Trash::Moved(_) => Ok(()),
+                Trash::Missing => Err(format!("sync conflict copy {remote_copy:?} is missing")),
+            }
+        }
+        ConflictResolution::Remote => {
+            match trash(root, local)? {
+                Trash::Moved(_) | Trash::Missing => {}
+            }
+            let Some(remote_copy) = remote_copy else {
+                return Ok(());
+            };
+            let source = root.join(remote_copy);
+            match relocate(root, &source, local)? {
+                Relocation::Moved(_) | Relocation::AlreadyThere => Ok(()),
+                Relocation::Unavailable => Err(format!(
+                    "sync couldn't move conflict copy {remote_copy:?} into {local:?}"
+                )),
+            }
+        }
+    }
 }
 
 fn exact_destination(root: &Path, remote: &str) -> Result<PathBuf, String> {
@@ -535,5 +580,55 @@ mod tests {
         assert!(trashed.exists(), "listing never removes recoverable files");
         assert_eq!(purge_trash(root.path()).unwrap(), 1);
         assert!(!trashed.exists());
+    }
+
+    #[test]
+    fn keeping_remote_moves_local_to_trash_before_replacing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("report.txt");
+        let remote = root.path().join("report (remote conflict 1).txt");
+        fs::write(&local, b"local").unwrap();
+        fs::write(&remote, b"remote").unwrap();
+
+        resolve_conflict(
+            root.path(),
+            "report.txt",
+            Some("report (remote conflict 1).txt"),
+            ConflictResolution::Remote,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&local).unwrap(), b"remote");
+        assert_eq!(
+            fs::read(root.path().join(".leyline-trash/report.txt")).unwrap(),
+            b"local"
+        );
+    }
+
+    #[test]
+    fn keeping_local_moves_the_remote_copy_to_trash() {
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("report.txt");
+        let remote = root.path().join("report (remote conflict 1).txt");
+        fs::write(&local, b"local").unwrap();
+        fs::write(&remote, b"remote").unwrap();
+
+        resolve_conflict(
+            root.path(),
+            "report.txt",
+            Some("report (remote conflict 1).txt"),
+            ConflictResolution::Local,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&local).unwrap(), b"local");
+        assert_eq!(
+            fs::read(
+                root.path()
+                    .join(".leyline-trash/report (remote conflict 1).txt")
+            )
+            .unwrap(),
+            b"remote"
+        );
     }
 }

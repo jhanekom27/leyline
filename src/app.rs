@@ -48,12 +48,29 @@ pub enum TranscriptLine {
 
 /// Runtime observations for one channel's sync, kept in app state so the UI
 /// and `/sync` report one pure snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflict {
+    pub local_path: String,
+    pub remote_path: String,
+    pub remote_copy_path: Option<String>,
+    pub local_modified_unix_ms: Option<u64>,
+    pub remote_modified_unix_ms: Option<u64>,
+    pub author: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictResolution {
+    Local,
+    Remote,
+    Both,
+}
+
 #[derive(Debug, Default)]
 pub struct SyncStatus {
     pending: HashSet<String>,
     last_success_unix_ms: Option<u64>,
     errors: Vec<(String, String)>,
-    conflicts: Vec<(String, String)>,
+    conflicts: Vec<SyncConflict>,
 }
 
 impl SyncStatus {
@@ -73,13 +90,11 @@ impl SyncStatus {
         self.errors.push((path, error));
     }
 
-    fn conflict(&mut self, remote: String, local: String) {
-        if !self
-            .conflicts
-            .iter()
-            .any(|(known_remote, known_local)| known_remote == &remote && known_local == &local)
-        {
-            self.conflicts.push((remote, local));
+    fn conflict(&mut self, conflict: SyncConflict) {
+        if !self.conflicts.iter().any(|known| {
+            known.local_path == conflict.local_path && known.remote_path == conflict.remote_path
+        }) {
+            self.conflicts.push(conflict);
         }
     }
 
@@ -93,6 +108,10 @@ impl SyncStatus {
 
     pub fn conflict_count(&self) -> usize {
         self.conflicts.len()
+    }
+
+    pub fn conflicts(&self) -> &[SyncConflict] {
+        &self.conflicts
     }
 }
 
@@ -702,6 +721,11 @@ pub enum InputAction {
     /// Permanently delete every recoverable remote delete in the active
     /// channel after this explicit command.
     PurgeSyncTrash(String),
+    ResolveSyncConflict {
+        channel: String,
+        conflict: SyncConflict,
+        resolution: ConflictResolution,
+    },
     /// Move the files root -- the folder every channel's folder lives in --
     /// to the path exactly as typed after `/folder ` (see `run_folder`). The
     /// caller (`files::set_files_root`) expands, creates and remembers it,
@@ -1204,11 +1228,21 @@ impl AppState {
             .failed(path, error);
     }
 
-    pub fn sync_conflict(&mut self, channel: &str, remote: String, local: String) {
+    pub fn sync_conflict(&mut self, channel: &str, conflict: SyncConflict) {
         self.sync_status
             .entry(channel.to_string())
             .or_default()
-            .conflict(remote, local);
+            .conflict(conflict);
+    }
+    pub fn sync_conflicts(&self, channel: &str) -> Vec<SyncConflict> {
+        self.sync_status(channel)
+            .map(|status| status.conflicts().to_vec())
+            .unwrap_or_default()
+    }
+    pub fn sync_conflict_resolved(&mut self, channel: &str, conflict: &SyncConflict) {
+        if let Some(status) = self.sync_status.get_mut(channel) {
+            status.conflicts.retain(|known| known != conflict);
+        }
     }
 
     pub fn sync_marker(&self, channel: &str) -> Option<char> {
@@ -2347,6 +2381,7 @@ impl AppState {
             "autosave" => self.run_autosave(arg.trim()),
             "outbox" => self.run_outbox(arg.trim()),
             "sync" => self.run_sync(arg.trim()),
+            "conflicts" => self.run_conflicts(arg.trim()),
             "trash" => self.run_trash(arg.trim()),
             "files" => self.run_files(),
             "paste" => self.run_paste(),
@@ -2392,7 +2427,7 @@ impl AppState {
              /leave [channel], /rename [name], /who, /send [path], \
              /save [hash-prefix], /folder [path], /maxsize [size|off|default], \
              /autosave [on|off|limit <size|default>], /outbox [on|off], /files, /paste, \
-             /sync [receive-only|publish-and-receive|off|pause|resume|include <glob>|exclude <glob>|remove <include|exclude> <glob>|clear-rules], /trash [restore <path>|purge], \
+             /sync [receive-only|publish-and-receive|off|pause|resume|include <glob>|exclude <glob>|remove <include|exclude> <glob>|clear-rules], /conflicts [local|remote|both <path>], /trash [restore <path>|purge], \
              /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
              ticket for a new device to redeem, /pair <ticket> redeems one (after an \
@@ -2403,6 +2438,7 @@ impl AppState {
              /maxsize shows the biggest file you can share (500 MB to begin with) and, with a size like 2GB, changes it (off lifts it, default restores it) -- \
              /autosave on saves the files your own devices and the peers you have aliased share in this channel as they arrive, up to the device-wide {autosave_limit} limit, with no command (off by default, per channel; files from before, and from anyone else, are never fetched this way); /autosave limit <size> changes that finite limit for every channel and default restores 25 MB -- \
              /sync receive-only mirrors safe remote index entries into this channel's folder, while /sync publish-and-receive also publishes stable local files (off by default, per channel); /sync include and /sync exclude add relative glob rules, with excludes taking precedence; it never propagates deletes or renames -- \
+             /conflicts lists unresolved sync collisions in this channel; /conflicts local|remote|both <path> resolves one by keeping the chosen copy (or both) and moving any displaced copy to recoverable sync trash -- \
              /trash lists this channel's recoverable remote deletes; /trash restore <path> brings one back without overwriting a local file, and /trash purge permanently removes them all (trash is never automatically purged) -- \
              /outbox on watches this channel's local send folder and shares new stable files once (off by default; existing, hidden, and temporary files are ignored) -- \
              /files lists the files shared in this channel (type to filter, \u{2191}/\u{2193} pick, \
@@ -3237,6 +3273,57 @@ impl AppState {
         }
     }
 
+    fn run_conflicts(&mut self, arg: &str) -> Option<InputAction> {
+        let channel = self.active().name.clone();
+        let conflicts = self.sync_conflicts(&channel);
+        if arg.is_empty() {
+            if conflicts.is_empty() {
+                self.push_system(format!(
+                    "no unresolved sync conflicts in {}",
+                    self.channel_heading(&channel)
+                ));
+            } else {
+                self.push_system(format!(
+                    "unresolved sync conflicts in {} ({}):",
+                    self.channel_heading(&channel),
+                    conflicts.len()
+                ));
+                for conflict in &conflicts {
+                    self.push_system(self.conflict_notice(conflict));
+                }
+                self.push_system(
+                    "resolve with /conflicts local|remote|both <local path> -- displaced copies go to sync trash",
+                );
+            }
+            return None;
+        }
+        let Some((choice, path)) = arg.split_once(' ') else {
+            self.push_system("usage: /conflicts [local|remote|both <local path>]");
+            return None;
+        };
+        let resolution = match choice {
+            "local" => ConflictResolution::Local,
+            "remote" => ConflictResolution::Remote,
+            "both" => ConflictResolution::Both,
+            _ => {
+                self.push_system("usage: /conflicts [local|remote|both <local path>]");
+                return None;
+            }
+        };
+        let path = path.trim();
+        let Some(conflict) = conflicts
+            .into_iter()
+            .find(|conflict| conflict.local_path == path)
+        else {
+            self.push_system(format!("no unresolved sync conflict for {path:?}"));
+            return None;
+        };
+        Some(InputAction::ResolveSyncConflict {
+            channel,
+            conflict,
+            resolution,
+        })
+    }
     fn sync_notice(&self, channel: &str) -> String {
         let heading = self.channel_heading(channel);
         let folder = self.folder_dir(channel);
@@ -3255,14 +3342,35 @@ impl AppState {
             self.sync_rule_notice(channel),
         );
         if let Some(status) = status {
-            for (remote, local) in &status.conflicts {
-                report.push_str(&format!("; conflict: {remote} -> {local}"));
+            for conflict in &status.conflicts {
+                report.push_str(&format!("; conflict: {}", self.conflict_notice(conflict)));
             }
             for (path, error) in &status.errors {
                 report.push_str(&format!("; error: {path}: {error}"));
             }
         }
         report
+    }
+
+    fn conflict_notice(&self, conflict: &SyncConflict) -> String {
+        let local_time = conflict
+            .local_modified_unix_ms
+            .map_or_else(|| "unknown".to_string(), |time| time.to_string());
+        let remote_time = conflict
+            .remote_modified_unix_ms
+            .map_or_else(|| "unknown".to_string(), |time| time.to_string());
+        let author = conflict
+            .author
+            .map(|id| self.display_name(&id))
+            .unwrap_or_else(|| "unknown".to_string());
+        let remote_copy = conflict
+            .remote_copy_path
+            .as_deref()
+            .unwrap_or("remote delete");
+        format!(
+            "local {} (modified {local_time}) vs remote {} ({remote_copy}, modified {remote_time}, author {author})",
+            conflict.local_path, conflict.remote_path
+        )
     }
 
     fn sync_rule_notice(&self, channel: &str) -> String {
@@ -11281,5 +11389,40 @@ mod tests {
         assert!(as_system(app.active().messages.back().unwrap()).starts_with("usage:"));
         assert!(submit(&mut app, "/trash tomorrow").is_none());
         assert!(as_system(app.active().messages.back().unwrap()).starts_with("usage:"));
+    }
+
+    #[test]
+    fn conflicts_list_provenance_and_clear_only_after_resolution() {
+        let mut app = app();
+        submit(&mut app, "/sync on");
+        let conflict = SyncConflict {
+            local_path: "report.txt".into(),
+            remote_path: "report.txt".into(),
+            remote_copy_path: Some("report (remote conflict 1).txt".into()),
+            local_modified_unix_ms: Some(10),
+            remote_modified_unix_ms: Some(20),
+            author: Some(PEER_ID),
+        };
+        app.sync_conflict("general", conflict.clone());
+        assert_eq!(app.sync_marker("general"), Some('C'));
+
+        submit(&mut app, "/conflicts");
+        let report = as_system(app.active().messages.back().unwrap());
+        assert!(report.contains("/conflicts local|remote|both"));
+        assert!(
+            app.sync_status("general")
+                .is_some_and(|status| status.conflict_count() == 1)
+        );
+
+        assert!(matches!(
+            submit(&mut app, "/conflicts remote report.txt"),
+            Some(InputAction::ResolveSyncConflict {
+                resolution: ConflictResolution::Remote,
+                ..
+            })
+        ));
+        assert_eq!(app.sync_marker("general"), Some('C'));
+        app.sync_conflict_resolved("general", &conflict);
+        assert_eq!(app.sync_marker("general"), Some('S'));
     }
 }
