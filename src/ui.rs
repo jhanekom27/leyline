@@ -101,7 +101,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/maxsize [size|off]",
     "/autosave [on|off|limit <size|default>]",
     "/outbox [on|off]",
-    "/sync [on|off|pause|resume]",
+    "/sync [receive-only|publish-and-receive|off|pause|resume|include <glob>|exclude <glob>]",
     "/files",
     "/paste (or Ctrl+V)",
     "/alias <hex> <name>",
@@ -3766,6 +3766,13 @@ mod tests {
     #[test]
     fn the_outbox_command_is_among_the_hints() {
         assert!(COMMAND_HINTS.contains(&"/outbox [on|off]"));
+    }
+
+    #[test]
+    fn the_sync_policy_command_is_among_the_hints() {
+        assert!(COMMAND_HINTS.contains(
+            &"/sync [receive-only|publish-and-receive|off|pause|resume|include <glob>|exclude <glob>]"
+        ));
     }
 
     #[test]

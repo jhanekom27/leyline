@@ -222,7 +222,7 @@ fn replay_paused_sync_events(
     tx: &mpsc::Sender<NetEvent>,
 ) {
     for (channel, events) in queued.iter_mut() {
-        if !app.sync_active(channel) {
+        if !app.sync_receives(channel) {
             continue;
         }
         while let Some(event) = events.pop_front() {
@@ -533,7 +533,7 @@ async fn run(
     app.load_autosave(autosave.channels());
     app.load_autosave_limit(autosave_limit);
     app.load_outbox(outbox.channels());
-    app.load_sync(sync_settings.modes());
+    app.load_sync(sync_settings.configs());
     app.load_settings(settings.bell_enabled());
     app.load_dm_registry(dm_registry.all());
     app.load_forgotten_devices(forgotten_devices.all());
@@ -732,12 +732,12 @@ async fn run(
                                     )),
                                 }
                             }
-                            Some(InputAction::SetSync { channel, mode }) => {
-                                if let Err(err) = sync_settings.set(&channel, mode) {
+                            Some(InputAction::SetSync { channel, config }) => {
+                                if let Err(err) = sync_settings.set(&channel, config.clone()) {
                                     warn!(%channel, "failed to persist sync setting: {err}");
                                     app.push_system(format!(
                                         "couldn't remember that sync is {}: {err}",
-                                        mode.label()
+                                        config.label()
                                     ));
                                 }
                             }
@@ -1005,7 +1005,7 @@ async fn run(
                 }
             }
             _ = sync_publish_tick.tick(), if !sync_publish_scan_in_flight => {
-                let channels = sync_settings.active_channels();
+                let channels = sync_settings.publishing_channels();
                 if !channels.is_empty() {
                     let folders: Vec<_> = channels
                         .into_iter()
@@ -1180,7 +1180,9 @@ async fn run(
                                 remote.channel.clone(),
                                 NetEvent::RemoteIndex(remote),
                             );
-                        } else if app.sync_active(&remote.channel) {
+                        } else if app.sync_receives(&remote.channel)
+                            && app.sync_allows_path(&remote.channel, &remote.path)
+                        {
                             if remote.entry.size > files::DEFAULT_MAX_FILE_SIZE {
                                 app.push_system_to(&remote.channel, format!(
                                     "sync skipped {}: {} exceeds the {} limit",
@@ -1247,7 +1249,9 @@ async fn run(
                                 channel.clone(),
                                 NetEvent::RemoteIndexDelete { channel, path },
                             );
-                        } else if app.sync_active(&channel) {
+                        } else if app.sync_receives(&channel)
+                            && app.sync_allows_path(&channel, &path)
+                        {
                             if !sync_publish_watcher.may_remove_remote(&channel, &path) {
                                 app.push_system_to(
                                     &channel,
@@ -1536,6 +1540,9 @@ async fn run(
                     sync_publish::Change::Present(candidate) => Some(candidate),
                     sync_publish::Change::Absent { .. } => None,
                 }) {
+                    if !sync_settings.allows_path(&candidate.channel, &candidate.relative) {
+                        continue;
+                    }
                     if candidate.size > files::DEFAULT_MAX_FILE_SIZE {
                         app.push_system_to(
                             &candidate.channel,
@@ -1564,7 +1571,9 @@ async fn run(
                     );
                 }
                 for change in changes {
-                    if let sync_publish::Change::Absent { channel, relative } = change {
+                    if let sync_publish::Change::Absent { channel, relative } = change
+                        && sync_settings.allows_path(&channel, &relative)
+                    {
                         net.publish_index_delete(channel, relative);
                     }
                 }

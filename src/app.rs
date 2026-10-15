@@ -23,7 +23,7 @@ use crate::net::{DEVICE_SYNC_CHANNEL, NetEvent};
 use crate::picker::{FilePicker, FolderListing, Step};
 use crate::search::{self, SearchOutcome, SearchResults};
 pub use crate::shared_files::SharedFile;
-use crate::sync_state::SyncMode;
+use crate::sync_state::{SyncConfig, SyncPolicy, SyncRule};
 use crate::thread::{self, ThreadView};
 use crate::ticket::PairingTicket;
 use crate::version;
@@ -689,7 +689,7 @@ pub enum InputAction {
     /// and publication of stable local files remain runtime-owned.
     SetSync {
         channel: String,
-        mode: SyncMode,
+        config: SyncConfig,
     },
     /// Move the files root -- the folder every channel's folder lives in --
     /// to the path exactly as typed after `/folder ` (see `run_folder`). The
@@ -898,10 +898,9 @@ pub struct AppState {
     /// files. `outbox.rs` owns durable settings and de-duplication; app
     /// state only exposes this enabled set to `/outbox`.
     outbox: HashSet<String>,
-    /// Channels whose remote iroh-docs entries may be mirrored into their
-    /// local channel folder.  This is receive-only; app state never watches
-    /// or publishes local paths.
-    sync: HashMap<String, SyncMode>,
+    /// Persisted per-channel sync policy and path rules. App state only
+    /// exposes the configuration; runtime owns filesystem and network work.
+    sync: HashMap<String, SyncConfig>,
     /// Runtime-owned sync observations supplied through explicit events.
     /// This state never reads the filesystem or network itself.
     sync_status: HashMap<String, SyncStatus>,
@@ -1147,19 +1146,21 @@ impl AppState {
         self.outbox = channels;
     }
 
-    pub fn load_sync(&mut self, modes: HashMap<String, SyncMode>) {
-        self.sync = modes;
+    pub fn load_sync(&mut self, configs: HashMap<String, SyncConfig>) {
+        self.sync = configs;
     }
 
-    pub fn sync_active(&self, channel: &str) -> bool {
-        self.sync_mode(channel).is_active()
+    pub fn sync_config(&self, channel: &str) -> SyncConfig {
+        self.sync.get(channel).cloned().unwrap_or_default()
+    }
+    pub fn sync_receives(&self, channel: &str) -> bool {
+        self.sync_config(channel).receives()
     }
     pub fn sync_paused(&self, channel: &str) -> bool {
-        self.sync_mode(channel) == SyncMode::Paused
+        self.sync_config(channel).is_paused()
     }
-
-    pub fn sync_mode(&self, channel: &str) -> SyncMode {
-        self.sync.get(channel).copied().unwrap_or_default()
+    pub fn sync_allows_path(&self, channel: &str, path: &str) -> bool {
+        self.sync_config(channel).allows_path(path)
     }
 
     pub fn sync_status(&self, channel: &str) -> Option<&SyncStatus> {
@@ -1200,31 +1201,28 @@ impl AppState {
     }
 
     pub fn sync_marker(&self, channel: &str) -> Option<char> {
-        match self.sync_mode(channel) {
-            SyncMode::Off => None,
-            SyncMode::Paused => Some('P'),
-            SyncMode::Active
-                if self
-                    .sync_status(channel)
-                    .is_some_and(|status| status.error_count() > 0) =>
-            {
-                Some('!')
-            }
-            SyncMode::Active
-                if self
-                    .sync_status(channel)
-                    .is_some_and(|status| status.conflict_count() > 0) =>
-            {
-                Some('C')
-            }
-            SyncMode::Active
-                if self
-                    .sync_status(channel)
-                    .is_some_and(|status| status.pending_count() > 0) =>
-            {
-                Some('~')
-            }
-            SyncMode::Active => Some('S'),
+        let config = self.sync_config(channel);
+        if config.policy == SyncPolicy::Off {
+            None
+        } else if config.is_paused() {
+            Some('P')
+        } else if self
+            .sync_status(channel)
+            .is_some_and(|status| status.error_count() > 0)
+        {
+            Some('!')
+        } else if self
+            .sync_status(channel)
+            .is_some_and(|status| status.conflict_count() > 0)
+        {
+            Some('C')
+        } else if self
+            .sync_status(channel)
+            .is_some_and(|status| status.pending_count() > 0)
+        {
+            Some('~')
+        } else {
+            Some('S')
         }
     }
 
@@ -2382,7 +2380,7 @@ impl AppState {
              /leave [channel], /rename [name], /who, /send [path], \
              /save [hash-prefix], /folder [path], /maxsize [size|off|default], \
              /autosave [on|off|limit <size|default>], /outbox [on|off], /files, /paste, \
-             /sync [on|off|pause|resume], \
+             /sync [receive-only|publish-and-receive|off|pause|resume|include <glob>|exclude <glob>|remove <include|exclude> <glob>|clear-rules], \
              /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
              /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
              ticket for a new device to redeem, /pair <ticket> redeems one (after an \
@@ -2392,7 +2390,7 @@ impl AppState {
              /folder shows where and, with a path, moves them all -- \
              /maxsize shows the biggest file you can share (500 MB to begin with) and, with a size like 2GB, changes it (off lifts it, default restores it) -- \
              /autosave on saves the files your own devices and the peers you have aliased share in this channel as they arrive, up to the device-wide {autosave_limit} limit, with no command (off by default, per channel; files from before, and from anyone else, are never fetched this way); /autosave limit <size> changes that finite limit for every channel and default restores 25 MB -- \
-             /sync on mirrors safe remote index entries into this channel's folder and publishes stable local files (off by default, per channel); it never propagates deletes or renames -- \\
+             /sync receive-only mirrors safe remote index entries into this channel's folder, while /sync publish-and-receive also publishes stable local files (off by default, per channel); /sync include and /sync exclude add relative glob rules, with excludes taking precedence; it never propagates deletes or renames -- \
              /outbox on watches this channel's local send folder and shares new stable files once (off by default; existing, hidden, and temporary files are ignored) -- \
              /files lists the files shared in this channel (type to filter, \u{2191}/\u{2193} pick, \
              Enter save, Ctrl+O open one already saved (never a program or script), Esc close) -- \
@@ -3131,26 +3129,80 @@ impl AppState {
         Some(InputAction::SetOutbox { channel, on })
     }
 
-    /// Handles `/sync [on|off|pause|resume]` for the active channel.
+    /// Handles per-channel `/sync` policy and path-rule configuration.
     fn run_sync(&mut self, arg: &str) -> Option<InputAction> {
         let channel = self.active().name.clone();
-        let mode = match arg {
+        let mut config = self.sync_config(&channel);
+        let changed = match arg {
             "" => {
                 self.push_system(self.sync_notice(&channel));
                 return None;
             }
-            "on" | "resume" => SyncMode::Active,
-            "off" => SyncMode::Off,
-            "pause" => SyncMode::Paused,
-            _ => {
-                self.push_system("usage: /sync [on|off|pause|resume]");
+            "on" | "publish-and-receive" => {
+                config.policy = SyncPolicy::PublishAndReceive;
+                config.paused = false;
+                true
+            }
+            "receive-only" => {
+                config.policy = SyncPolicy::ReceiveOnly;
+                config.paused = false;
+                true
+            }
+            "off" => {
+                config.policy = SyncPolicy::Off;
+                config.paused = false;
+                true
+            }
+            "pause" if config.policy != SyncPolicy::Off => {
+                config.paused = true;
+                true
+            }
+            "resume" if config.policy != SyncPolicy::Off => {
+                config.paused = false;
+                true
+            }
+            "pause" | "resume" => {
+                self.push_system("sync is off -- select receive-only or publish-and-receive first");
                 return None;
             }
+            "clear-rules" => config.clear_rules(),
+            _ => {
+                let (operation, pattern) = if let Some(pattern) = arg.strip_prefix("include ") {
+                    ("include", pattern)
+                } else if let Some(pattern) = arg.strip_prefix("exclude ") {
+                    ("exclude", pattern)
+                } else if let Some(rule) = arg.strip_prefix("remove include ") {
+                    ("remove include", rule)
+                } else if let Some(rule) = arg.strip_prefix("remove exclude ") {
+                    ("remove exclude", rule)
+                } else {
+                    self.push_system(
+                        "usage: /sync [receive-only|publish-and-receive|off|pause|resume|include <glob>|exclude <glob>|remove <include|exclude> <glob>|clear-rules]",
+                    );
+                    return None;
+                };
+                let rule = match operation {
+                    "include" | "remove include" => SyncRule::include(pattern),
+                    "exclude" | "remove exclude" => SyncRule::exclude(pattern),
+                    _ => unreachable!(),
+                };
+                match rule {
+                    Ok(rule) if operation.starts_with("remove") => config.remove_rule(&rule),
+                    Ok(rule) => config.add_rule(rule),
+                    Err(error) => {
+                        self.push_system(error);
+                        return None;
+                    }
+                }
+            }
         };
-        let changed = self.sync_mode(&channel) != mode;
-        self.sync.insert(channel.clone(), mode);
+        if !changed || self.sync_config(&channel) == config {
+            self.push_system(self.sync_notice(&channel));
+            return None;
+        }
+        self.sync.insert(channel.clone(), config.clone());
         self.push_system(self.sync_notice(&channel));
-        changed.then_some(InputAction::SetSync { channel, mode })
+        Some(InputAction::SetSync { channel, config })
     }
 
     fn sync_notice(&self, channel: &str) -> String {
@@ -3165,9 +3217,10 @@ impl AppState {
             .map(|timestamp| format!("last success: {timestamp}"))
             .unwrap_or_else(|| "last success: never".to_string());
         let mut report = format!(
-            "sync is {} for {heading} -- folder: {}; {pending} pending; {conflicts} conflict(s); {errors} error(s); {last_success}",
-            self.sync_mode(channel).label(),
+            "sync is {} for {heading} -- folder: {}; rules: {}; {pending} pending; {conflicts} conflict(s); {errors} error(s); {last_success}",
+            self.sync_config(channel).label(),
             folder.display(),
+            self.sync_rule_notice(channel),
         );
         if let Some(status) = status {
             for (remote, local) in &status.conflicts {
@@ -3178,6 +3231,19 @@ impl AppState {
             }
         }
         report
+    }
+
+    fn sync_rule_notice(&self, channel: &str) -> String {
+        let rules = &self.sync_config(channel).rules;
+        if rules.is_empty() {
+            "all paths".to_string()
+        } else {
+            rules
+                .iter()
+                .map(|rule| format!("{} {}", rule.label(), rule.pattern()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
     }
 
     /// What `/outbox` says about the active channel's local one-way folder.
@@ -11076,5 +11142,78 @@ mod tests {
             file_message(2, PEER_ID, "report.pdf", b"report"),
         );
         assert!(request.is_some(), "no stale entry may block it");
+    }
+
+    #[test]
+    fn sync_policies_are_independent_per_channel() {
+        let mut app = AppState::new(
+            SELF_ID,
+            vec!["general".to_string(), "project".to_string()],
+            "general",
+        );
+
+        let action = submit(&mut app, "/sync receive-only").unwrap();
+        let InputAction::SetSync { channel, config } = action else {
+            panic!("expected sync persistence action");
+        };
+        assert_eq!(channel, "general");
+        assert_eq!(config.policy, SyncPolicy::ReceiveOnly);
+        assert!(app.sync_receives("general"));
+
+        app.active = 1;
+        let action = submit(&mut app, "/sync publish-and-receive").unwrap();
+        let InputAction::SetSync { channel, config } = action else {
+            panic!("expected sync persistence action");
+        };
+        assert_eq!(channel, "project");
+        assert_eq!(config.policy, SyncPolicy::PublishAndReceive);
+        assert_eq!(app.sync_config("general").policy, SyncPolicy::ReceiveOnly);
+    }
+
+    #[test]
+    fn sync_rules_are_persisted_actions_and_visible_in_status() {
+        let mut app = app();
+
+        let action = submit(&mut app, "/sync include docs/**").unwrap();
+        let InputAction::SetSync { config, .. } = action else {
+            panic!("expected sync persistence action");
+        };
+        assert_eq!(config.rules, vec![SyncRule::include("docs/**").unwrap()]);
+        assert!(app.sync_allows_path("general", "docs/plan.md"));
+        assert!(!app.sync_allows_path("general", "images/logo.png"));
+
+        submit(&mut app, "/sync exclude docs/private/**");
+        submit(&mut app, "/sync");
+        let status = as_system(app.active().messages.back().unwrap());
+        assert!(status.contains("include docs/**"), "{status}");
+        assert!(status.contains("exclude docs/private/**"), "{status}");
+        assert!(!app.sync_allows_path("general", "docs/private/plan.md"));
+    }
+
+    #[test]
+    fn sync_pause_resumes_the_selected_policy() {
+        let mut app = app();
+        submit(&mut app, "/sync receive-only");
+        submit(&mut app, "/sync pause");
+        assert!(app.sync_paused("general"));
+        assert!(!app.sync_receives("general"));
+
+        let action = submit(&mut app, "/sync resume").unwrap();
+        let InputAction::SetSync { config, .. } = action else {
+            panic!("expected sync persistence action");
+        };
+        assert_eq!(config.policy, SyncPolicy::ReceiveOnly);
+        assert!(!config.paused);
+    }
+
+    #[test]
+    fn sync_rejects_an_invalid_rule_without_changing_configuration() {
+        let mut app = app();
+
+        let action = submit(&mut app, "/sync include ../outside");
+
+        assert!(action.is_none());
+        assert!(app.sync_config("general").rules.is_empty());
+        assert!(as_system(app.active().messages.back().unwrap()).contains("relative glob"));
     }
 }
