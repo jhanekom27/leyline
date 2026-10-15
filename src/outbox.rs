@@ -247,4 +247,43 @@ mod tests {
         assert_eq!(stable.len(), 1);
         assert_eq!(stable[0].name, "new.txt");
     }
+
+    #[test]
+    fn a_marked_file_is_not_released_after_restart_or_later_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("send");
+        fs::create_dir_all(&folder).unwrap();
+        let path = dir.path().join("outbox");
+        let mut outbox = Outbox::load(path.clone()).unwrap();
+        outbox.enable("general", &folder).unwrap();
+        let file = folder.join("report.txt");
+        fs::write(&file, b"first").unwrap();
+        let mut watcher = Watcher::default();
+        assert!(
+            watcher
+                .stable(scan("general".into(), folder.clone()).unwrap(), &outbox)
+                .is_empty()
+        );
+        assert_eq!(
+            watcher
+                .stable(scan("general".into(), folder.clone()).unwrap(), &outbox)
+                .len(),
+            1
+        );
+        outbox.mark_seen("general", "report.txt".into()).unwrap();
+
+        fs::write(&file, b"edited").unwrap();
+        let mut restarted = Watcher::default();
+        assert!(
+            restarted
+                .stable(scan("general".into(), folder.clone()).unwrap(), &outbox)
+                .is_empty()
+        );
+        assert!(
+            restarted
+                .stable(scan("general".into(), folder).unwrap(), &outbox)
+                .is_empty()
+        );
+        assert!(Outbox::load(path).unwrap().seen("general", "report.txt"));
+    }
 }
