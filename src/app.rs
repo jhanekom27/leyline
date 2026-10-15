@@ -13,7 +13,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use iroh_blobs::Hash;
 use iroh_tickets::Ticket;
 
-use crate::autosave::{AutoSaveLimit, DEFAULT_AUTOSAVE_LIMIT};
+use crate::autosave::AutoSaveLimit;
+#[cfg(test)]
+use crate::autosave::DEFAULT_AUTOSAVE_LIMIT;
 use crate::files::{
     DEFAULT_MAX_FILE_SIZE, SaveMode, SizeLimit, StagedAttachment, channel_dir, human_size,
     runs_when_opened,
@@ -697,7 +699,10 @@ pub enum InputAction {
         channel: String,
         on: bool,
     },
-    SetAutoSaveLimit(AutoSaveLimit),
+    SetChannelAutoSaveLimit {
+        channel: String,
+        limit: Option<AutoSaveLimit>,
+    },
     /// Create or remove the active channel's one-way outbox setting. The
     /// runtime creates and snapshots the folder before applying this state.
     SetOutbox {
@@ -921,6 +926,7 @@ pub struct AppState {
     /// drop, the clipboard -- answers to the same one.
     size_limit: SizeLimit,
     autosave_limit: AutoSaveLimit,
+    autosave_limits: HashMap<String, AutoSaveLimit>,
     /// The channels, by stored name, with auto-save on (`/autosave`) --
     /// seeded at startup from what was remembered across restarts
     /// (`load_autosave`) and changed by `/autosave on|off`. A channel not in
@@ -1028,6 +1034,7 @@ impl AppState {
             files_root: PathBuf::from(std::path::MAIN_SEPARATOR_STR),
             size_limit: SizeLimit::Default,
             autosave_limit: AutoSaveLimit::Default,
+            autosave_limits: HashMap::new(),
             autosave: HashSet::new(),
             outbox: HashSet::new(),
             sync: HashMap::new(),
@@ -1167,6 +1174,15 @@ impl AppState {
 
     pub fn load_autosave_limit(&mut self, limit: AutoSaveLimit) {
         self.autosave_limit = limit;
+    }
+    pub fn load_autosave_limits(&mut self, limits: HashMap<String, AutoSaveLimit>) {
+        self.autosave_limits = limits;
+    }
+    fn autosave_limit_for(&self, channel: &str) -> AutoSaveLimit {
+        self.autosave_limits
+            .get(channel)
+            .copied()
+            .unwrap_or(self.autosave_limit)
     }
 
     /// Seeds the channels with auto-save on (see `autosave::AutoSave`, which
@@ -2005,6 +2021,7 @@ impl AppState {
         self.shared_files.remove(channel);
         self.renames.remove(channel);
         self.autosave.remove(channel);
+        self.autosave_limits.remove(channel);
         self.outbox.remove(channel);
         self.auto_saving.retain(|(name, _)| name != channel);
         self.channels.remove(index);
@@ -2438,7 +2455,7 @@ impl AppState {
              unlike /msg -- /save keeps each channel's files in a folder of its own, \
              /folder shows where and, with a path, moves them all -- \
              /maxsize shows the biggest file you can share (500 MB to begin with) and, with a size like 2GB, changes it (off lifts it, default restores it) -- \
-             /autosave on saves the files your own devices and the peers you have aliased share in this channel as they arrive, up to the device-wide {autosave_limit} limit, with no command (off by default, per channel; files from before, and from anyone else, are never fetched this way); /autosave limit <size> changes that finite limit for every channel and default restores 25 MB -- \
+             /autosave on saves trusted peers' files in this channel as they arrive, up to its limit (the device-wide {autosave_limit} default unless this channel overrides it); /autosave limit <size> sets this channel's finite override and default restores its device-wide fallback -- \
              /sync receive-only mirrors safe remote index entries into this channel's folder, while /sync publish-and-receive also publishes stable local files (off by default, per channel); /sync include and /sync exclude add relative glob rules, with excludes taking precedence; it never propagates deletes or renames -- \
              /conflicts lists unresolved sync collisions in this channel; /conflicts local|remote|both <path> resolves one by keeping the chosen copy (or both) and moving any displaced copy to recoverable sync trash -- \
              /trash lists this channel's recoverable remote deletes; /trash restore <path> brings one back without overwriting a local file, and /trash purge permanently removes them all (trash is never automatically purged) -- \
@@ -3010,7 +3027,7 @@ impl AppState {
             );
             return None;
         }
-        let max_bytes = self.autosave_limit.max_bytes();
+        let max_bytes = self.autosave_limit_for(channel).max_bytes();
         if file.size > max_bytes {
             self.push_system_to(
                 channel,
@@ -3125,9 +3142,24 @@ impl AppState {
         if let Some(size) = arg.strip_prefix("limit ") {
             return match AutoSaveLimit::parse(size) {
                 Ok(limit) => {
-                    self.autosave_limit = limit;
+                    let channel = self.active().name.clone();
+                    let override_limit = match limit {
+                        AutoSaveLimit::Default => None,
+                        limit => Some(limit),
+                    };
+                    match override_limit {
+                        Some(limit) => {
+                            self.autosave_limits.insert(channel.clone(), limit);
+                        }
+                        None => {
+                            self.autosave_limits.remove(&channel);
+                        }
+                    }
                     self.push_system(self.autosave_limit_notice());
-                    Some(InputAction::SetAutoSaveLimit(limit))
+                    Some(InputAction::SetChannelAutoSaveLimit {
+                        channel,
+                        limit: override_limit,
+                    })
                 }
                 Err(message) => {
                     self.push_system(message);
@@ -3410,7 +3442,7 @@ impl AppState {
     /// words for asking and for having just switched it.
     fn autosave_notice(&self, channel: &str) -> String {
         let heading = self.channel_heading(channel);
-        let limit = human_size(self.autosave_limit.max_bytes());
+        let limit = human_size(self.autosave_limit_for(channel).max_bytes());
         let folder = channel_dir(&self.files_root, channel);
         let folder = folder.display();
         if self.autosave.contains(channel) {
@@ -3425,14 +3457,15 @@ impl AppState {
     }
 
     fn autosave_limit_notice(&self) -> String {
-        let default = human_size(DEFAULT_AUTOSAVE_LIMIT);
-        match self.autosave_limit {
-            AutoSaveLimit::Default => format!(
-                "automatic downloads are limited to {default} (the default) -- /autosave limit <size> changes it for every channel"
+        let channel = &self.active().name;
+        match self.autosave_limits.get(channel) {
+            Some(limit) => format!(
+                "automatic downloads in this channel are limited to {} -- /autosave limit default restores the device-wide fallback",
+                human_size(limit.max_bytes())
             ),
-            AutoSaveLimit::Bytes(bytes) => format!(
-                "automatic downloads are limited to {} for every channel -- /autosave limit <size> changes it, /autosave limit default restores the {default} default",
-                human_size(bytes)
+            None => format!(
+                "automatic downloads in this channel use the device-wide {} limit -- /autosave limit <size> sets an override",
+                human_size(self.autosave_limit.max_bytes())
             ),
         }
     }
@@ -7250,7 +7283,10 @@ mod tests {
         app.load_contacts(alice());
 
         match submit(&mut app, "/autosave limit 1KB") {
-            Some(InputAction::SetAutoSaveLimit(AutoSaveLimit::Bytes(1024))) => {}
+            Some(InputAction::SetChannelAutoSaveLimit {
+                channel,
+                limit: Some(AutoSaveLimit::Bytes(1024)),
+            }) if channel == "general" => {}
             _ => panic!("expected an auto-save limit action"),
         }
         assert!(
@@ -10784,13 +10820,8 @@ mod tests {
             last.contains("/autosave [on|off|limit <size|default>]"),
             "got: {last}"
         );
-        assert!(
-            last.contains(&format!(
-                "up to the device-wide {}",
-                human_size(DEFAULT_AUTOSAVE_LIMIT)
-            )),
-            "got: {last}"
-        );
+        assert!(last.contains("device-wide"), "got: {last}");
+        assert!(last.contains("channel overrides it"), "got: {last}");
     }
 
     #[test]
@@ -11284,6 +11315,29 @@ mod tests {
             file_message(2, PEER_ID, "report.pdf", b"report"),
         );
         assert!(request.is_some(), "no stale entry may block it");
+    }
+
+    #[test]
+    fn channel_auto_save_limit_overrides_device_limit_and_is_forgotten_on_leave() {
+        let mut app = app_for_the_switcher();
+        app.load_autosave_limit(AutoSaveLimit::Bytes(1024));
+        app.load_autosave_limits(HashMap::from([(
+            "project-x".into(),
+            AutoSaveLimit::Bytes(2048),
+        )]));
+        app.load_autosave(HashSet::from(["project-x".to_string()]));
+        app.load_contacts(alice());
+
+        assert!(
+            arrive(
+                &mut app,
+                "project-x",
+                file_message_of_size(1, PEER_ID, "large.bin", 1500)
+            )
+            .is_some()
+        );
+        app.remove_channel("project-x");
+        assert!(!app.autosave_limits.contains_key("project-x"));
     }
 
     #[test]

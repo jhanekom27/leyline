@@ -54,7 +54,7 @@ use tokio::time::interval;
 use tracing::{debug, warn};
 
 use app::{AppState, ConflictResolution, InputAction, SaveRequest, SyncConflict};
-use autosave::{AutoSave, limit as autosave_limit, set_limit as set_autosave_limit};
+use autosave::{AutoSave, limit as autosave_limit};
 use backfill::BackfillStore;
 use channel_registry::ChannelRegistry;
 use channel_renames::ChannelRenames;
@@ -562,6 +562,7 @@ async fn run(
     app.load_contacts(contacts.all());
     app.load_renames(channel_renames.all());
     app.load_autosave(autosave.channels());
+    app.load_autosave_limits(autosave.limits());
     app.load_autosave_limit(autosave_limit);
     app.load_outbox(outbox.channels());
     app.load_sync(sync_settings.configs());
@@ -1002,9 +1003,9 @@ async fn run(
                                     });
                                 }
                             }
-                            Some(InputAction::SetAutoSaveLimit(limit)) => {
-                                if let Err(message) = set_autosave_limit(&data_dir, limit) {
-                                    app.push_system(message);
+                            Some(InputAction::SetChannelAutoSaveLimit { channel, limit }) => {
+                                if let Err(err) = autosave.set_channel_limit(&channel, limit) {
+                                    app.push_system(format!("couldn't remember the channel auto-save limit: {err}"));
                                 }
                             }
                             // `/folder <path>`: only the filesystem can say

@@ -13,18 +13,19 @@
 //! Mirrors `channel_renames.rs`'s persisted-postcard-file pattern: tiny and
 //! rarely changed, so the whole file is simply rewritten on every change.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 const LIMIT_FILE: &str = "autosave_limit";
 pub const DEFAULT_AUTOSAVE_LIMIT: u64 = 25 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AutoSaveLimit {
     Default,
     Bytes(u64),
@@ -89,6 +90,7 @@ pub fn limit(data_dir: &std::path::Path) -> anyhow::Result<AutoSaveLimit> {
     }))
 }
 
+#[allow(dead_code)]
 pub fn set_limit(data_dir: &std::path::Path, limit: AutoSaveLimit) -> Result<(), String> {
     let path = data_dir.join(LIMIT_FILE);
     let recorded = match limit {
@@ -107,6 +109,7 @@ pub struct AutoSave {
     path: PathBuf,
     /// Stored channel names, each once.
     channels: Vec<String>,
+    limits: HashMap<String, AutoSaveLimit>,
 }
 
 impl AutoSave {
@@ -119,14 +122,18 @@ impl AutoSave {
     /// where nobody asked. Only a genuine I/O error (e.g. permission denied)
     /// is returned as `Err`.
     pub fn load(path: PathBuf) -> anyhow::Result<Self> {
-        let channels = match fs::read(&path) {
+        let (channels, limits) = match fs::read(&path) {
             Ok(bytes) => decode(&bytes),
-            Err(err) if err.kind() == ErrorKind::NotFound => Vec::new(),
+            Err(err) if err.kind() == ErrorKind::NotFound => (Vec::new(), HashMap::new()),
             Err(err) => {
                 return Err(err).with_context(|| format!("failed to read {}", path.display()));
             }
         };
-        Ok(Self { path, channels })
+        Ok(Self {
+            path,
+            channels,
+            limits,
+        })
     }
 
     /// The stored names of the channels with auto-save on -- seeded into
@@ -139,13 +146,35 @@ impl AutoSave {
     /// to disk) if it is already as asked, so turning it off for a channel
     /// that never had it -- as leaving every channel does -- costs nothing.
     pub fn set(&mut self, channel: &str, on: bool) -> anyhow::Result<()> {
-        if self.channels.iter().any(|known| known == channel) == on {
+        if self.channels.iter().any(|known| known == channel) == on
+            && (on || !self.limits.contains_key(channel))
+        {
             return Ok(());
         }
         if on {
             self.channels.push(channel.to_string());
         } else {
             self.channels.retain(|known| known != channel);
+            self.limits.remove(channel);
+        }
+        self.save()
+    }
+
+    pub fn limits(&self) -> HashMap<String, AutoSaveLimit> {
+        self.limits.clone()
+    }
+    pub fn set_channel_limit(
+        &mut self,
+        channel: &str,
+        limit: Option<AutoSaveLimit>,
+    ) -> anyhow::Result<()> {
+        match limit {
+            Some(limit) => {
+                self.limits.insert(channel.into(), limit);
+            }
+            None => {
+                self.limits.remove(channel);
+            }
         }
         self.save()
     }
@@ -156,7 +185,8 @@ impl AutoSave {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let bytes = postcard::to_stdvec(&self.channels).context("failed to encode auto-save")?;
+        let bytes = postcard::to_stdvec(&(self.channels.clone(), self.limits.clone()))
+            .context("failed to encode auto-save")?;
         fs::write(&self.path, bytes)
             .with_context(|| format!("failed to write auto-save to {}", self.path.display()))
     }
@@ -164,11 +194,15 @@ impl AutoSave {
 
 /// Decodes the file's contents, tolerating corruption by logging and falling
 /// back to an empty list -- see `AutoSave::load`.
-fn decode(bytes: &[u8]) -> Vec<String> {
-    postcard::from_bytes(bytes).unwrap_or_else(|err| {
-        warn!("dropping corrupt auto-save file: {err}");
-        Vec::new()
-    })
+fn decode(bytes: &[u8]) -> (Vec<String>, HashMap<String, AutoSaveLimit>) {
+    postcard::from_bytes(bytes)
+        .or_else(|_| {
+            postcard::from_bytes::<Vec<String>>(bytes).map(|channels| (channels, HashMap::new()))
+        })
+        .unwrap_or_else(|err| {
+            warn!("dropping corrupt auto-save file: {err}");
+            (Vec::new(), HashMap::new())
+        })
 }
 
 #[cfg(test)]
@@ -301,5 +335,23 @@ mod tests {
         );
         assert_eq!(AutoSaveLimit::parse("default"), Ok(AutoSaveLimit::Default));
         assert!(AutoSaveLimit::parse("off").is_err());
+    }
+
+    #[test]
+    fn channel_limits_persist_independently_and_clear_with_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autosave");
+        let mut autosave = AutoSave::load(path.clone()).unwrap();
+        autosave
+            .set_channel_limit("general", Some(AutoSaveLimit::Bytes(1 << 20)))
+            .unwrap();
+        autosave
+            .set_channel_limit("project", Some(AutoSaveLimit::Bytes(2 << 20)))
+            .unwrap();
+        autosave.set("general", false).unwrap();
+
+        let limits = AutoSave::load(path).unwrap().limits();
+        assert_eq!(limits.get("project"), Some(&AutoSaveLimit::Bytes(2 << 20)));
+        assert!(!limits.contains_key("general"));
     }
 }
