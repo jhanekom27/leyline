@@ -3358,7 +3358,16 @@ impl AppState {
             resolution,
         })
     }
+    /// What a bare `/sync` reports for `channel`: its persisted policy,
+    /// folder, rules and runtime status, once sync has actually been
+    /// configured here -- or, the first time anyone asks, a short setup
+    /// notice instead (`sync_onboarding_notice`), so exploring the command
+    /// on a brand-new channel doesn't read like sync is already on and
+    /// idle.
     fn sync_notice(&self, channel: &str) -> String {
+        if !self.sync.contains_key(channel) {
+            return self.sync_onboarding_notice(channel);
+        }
         let heading = self.channel_heading(channel);
         let folder = self.folder_dir(channel);
         let status = self.sync_status(channel);
@@ -3383,7 +3392,36 @@ impl AppState {
                 report.push_str(&format!("; error: {path}: {error}"));
             }
         }
+        if conflicts > 0 {
+            report.push_str(
+                " -- resolve with /conflicts local|remote|both <local path> -- displaced copies go to sync trash",
+            );
+        }
+        if pending > 0 {
+            report.push_str(
+                " -- pending files need their peer online; check who's reachable with /who",
+            );
+        }
         report
+    }
+
+    /// First-use `/sync` guidance for a channel whose sync has never been
+    /// configured: where its folder will be, and what the other side needs
+    /// to do too -- the detail a bare status report has no room for. A
+    /// group channel needs an invite first; a DM or point-to-point chat
+    /// already has its one peer, so it only needs turning on both sides.
+    fn sync_onboarding_notice(&self, channel: &str) -> String {
+        let heading = self.channel_heading(channel);
+        let folder = self.folder_dir(channel);
+        let folder = folder.display();
+        match self.channel_kind(channel) {
+            ChannelKind::Group => format!(
+                "sync is off for {heading} -- its folder will be {folder} once enabled; invite someone into this group channel with /invite, have them /join, then run /sync publish-and-receive here and on their side (or /sync receive-only to only receive)"
+            ),
+            ChannelKind::GossipDm { .. } | ChannelKind::Direct { .. } => format!(
+                "sync is off for {heading} -- its folder will be {folder} once enabled; run /sync publish-and-receive here and ask them to do the same on their side (or /sync receive-only to only receive)"
+            ),
+        }
     }
 
     fn conflict_notice(&self, conflict: &SyncConflict) -> String {
@@ -7194,6 +7232,7 @@ mod tests {
         app.load_files_root(PathBuf::from("/files"));
         app.load_direct_folder("p2p-08080808".into(), "dm-bob-08080808".into());
         app.active = 3;
+        submit(&mut app, "/sync on");
 
         submit(&mut app, "/sync");
 
@@ -11338,6 +11377,113 @@ mod tests {
         );
         app.remove_channel("project-x");
         assert!(!app.autosave_limits.contains_key("project-x"));
+    }
+
+    #[test]
+    fn sync_works_on_a_msg_dm_channel() {
+        let mut app = app_with_dm("dm-Alice", PEER_ID);
+        app.active = 1;
+
+        let action = submit(&mut app, "/sync publish-and-receive").unwrap();
+
+        let InputAction::SetSync { channel, config } = action else {
+            panic!("expected sync persistence action");
+        };
+        assert_eq!(channel, "dm-Alice");
+        assert_eq!(config.policy, SyncPolicy::PublishAndReceive);
+    }
+
+    #[test]
+    fn sync_works_on_a_point_to_point_channel() {
+        let mut app = app();
+        app.activate_direct_channel("p2p-alice".to_string(), PEER_ID);
+
+        let action = submit(&mut app, "/sync on").unwrap();
+
+        let InputAction::SetSync { channel, config } = action else {
+            panic!("expected sync persistence action");
+        };
+        assert_eq!(channel, "p2p-alice");
+        assert_eq!(config.policy, SyncPolicy::PublishAndReceive);
+    }
+
+    #[test]
+    fn a_bare_sync_explains_setup_before_anything_is_configured() {
+        let mut app = app();
+
+        submit(&mut app, "/sync");
+
+        let notice = as_system(app.active().messages.back().unwrap());
+        assert!(notice.contains("/invite"), "got: {notice}");
+        assert!(notice.contains("/join"), "got: {notice}");
+        assert!(
+            !notice.contains("pending"),
+            "an unconfigured channel should not look like an active status report: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_bare_sync_explains_setup_differently_for_a_point_to_point_chat() {
+        // Already has its one peer, so there is no invited group to join.
+        let mut app = app();
+        app.activate_direct_channel("p2p-alice".to_string(), PEER_ID);
+
+        submit(&mut app, "/sync");
+
+        let notice = as_system(app.active().messages.back().unwrap());
+        assert!(
+            !notice.contains("/invite"),
+            "a point-to-point chat has no invite step: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_bare_sync_reports_status_once_sync_has_been_configured() {
+        let mut app = app();
+        submit(&mut app, "/sync receive-only");
+
+        submit(&mut app, "/sync");
+
+        let notice = as_system(app.active().messages.back().unwrap());
+        assert!(notice.contains("pending"), "got: {notice}");
+        assert!(!notice.contains("/invite"), "got: {notice}");
+    }
+
+    #[test]
+    fn a_sync_report_with_conflicts_points_to_how_to_resolve_them() {
+        let mut app = app();
+        submit(&mut app, "/sync on");
+        app.sync_conflict(
+            "general",
+            SyncConflict {
+                local_path: "report.txt".into(),
+                remote_path: "report.txt".into(),
+                remote_copy_path: Some("report (remote conflict 1).txt".into()),
+                local_modified_unix_ms: None,
+                remote_modified_unix_ms: None,
+                author: None,
+            },
+        );
+
+        submit(&mut app, "/sync");
+
+        let notice = as_system(app.active().messages.back().unwrap());
+        assert!(
+            notice.contains("/conflicts local|remote|both"),
+            "got: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_sync_report_with_pending_files_points_to_who() {
+        let mut app = app();
+        submit(&mut app, "/sync on");
+        app.sync_pending("general", "report.txt".to_string());
+
+        submit(&mut app, "/sync");
+
+        let notice = as_system(app.active().messages.back().unwrap());
+        assert!(notice.contains("/who"), "got: {notice}");
     }
 
     #[test]

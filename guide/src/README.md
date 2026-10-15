@@ -10,7 +10,7 @@ the capability that lets another person join.
 2. In one instance, run `/invite` to show a channel ticket.
 3. In another instance, paste that ticket with `/join <ticket>`.
 4. Chat normally, or continue to [Folder sync](folder-sync.md) to share a
-   group channel's working folder safely.
+   channel's working folder safely.
 
 > **Tip:** Two local test instances need separate homes. Run one with
 > `HOME=/tmp/leyline-a cargo run` and the other with
@@ -22,13 +22,13 @@ the capability that lets another person join.
 The channel list separates ordinary group channels from one-to-one
 conversations:
 
-- `#` is an invited group channel. It can use folder sync.
+- `#` is an invited group channel.
 - `@` is a private message channel.
 - `⚡` is a direct point-to-point conversation.
 
-Folder sync is intentionally available only on group channels today. Direct
-message and point-to-point conversation sync are planned separately; do not
-use them as a substitute for a shared working folder.
+All three channel kinds can use folder sync. A group channel needs an invite
+ticket before someone else can join it; a `/msg` or `/dm` conversation already
+has its one peer, so each person only needs to enable sync in that conversation.
 
 ## Find your way around
 
@@ -37,7 +37,7 @@ use them as a substitute for a shared working folder.
   the shared files root for every channel on this device.
 - `/files` shows files shared in the active conversation and lets you save
   them manually.
-- `/sync` reports the active group channel's sync policy, status, and any
+- `/sync` reports the active channel's sync policy, status, and any
   current conflicts.
 
 This guide grows with leyline. Use the GitHub link in the header to report a

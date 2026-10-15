@@ -41,5 +41,6 @@ after it stops changing. Confirm files present before enabling sync and written
 while the app was stopped are picked up after two scans. Repeat with hidden,
 temporary/editor, `send/`, oversized, and in-progress files; none should
 publish. Confirm a received file is not echoed back as a fresh index write,
-`/sync off` stops new applications and publications, and deletes and renames
-are not propagated.
+`/sync off` stops new applications and publications, a remote delete moves
+the local copy into recoverable sync trash instead of erasing it, and a
+rename arrives as its new path without re-transferring unchanged content.

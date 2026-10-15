@@ -1,23 +1,25 @@
 # Folder sync
 
-Folder sync keeps the regular files in an **invited group channel's** local
+Folder sync keeps the regular files in a **channel's** local
 folder aligned between its members. It is designed for a small shared working
 set, not as an unattended backup service.
 
-> **Supported today:** group channels (`#`). Direct-message (`@`) and
-> point-to-point (`⚡`) conversation folders do not sync yet.
+> **Supported today:** group channels (`#`), private-message channels (`@`),
+> and point-to-point conversations (`⚡`). Every participant enables sync on
+> their own local copy of the conversation.
 
-## Set up two invited instances
+## Set up two instances
 
 Use two devices, or two local instances with distinct `HOME` directories.
 Each instance needs leyline running.
 
-1. On the first instance, open or create the group channel to share.
-2. Run `/invite`, then send the displayed ticket to the second person through
-   a trusted channel.
-3. On the second instance, paste it with `/join <ticket>`. Both instances now
-   show the same group channel with a `#` badge.
-4. On each instance, select that group channel and run:
+1. Choose the channel to share.
+   - For a group channel, run `/invite` on the first instance, send the ticket
+     through a trusted channel, then paste it on the second instance with
+     `/join <ticket>`.
+   - For a `/msg` or `/dm` conversation, start or open that conversation on
+     both instances first. No separate folder-sync invite is needed.
+2. On each instance, select the same channel and run:
 
    ```text
    /sync publish-and-receive
@@ -25,10 +27,10 @@ Each instance needs leyline running.
 
    This publishes eligible local changes and receives eligible changes from
    peers. `/sync on` is an alias for the same policy.
-5. Run `/folder` on either instance to see that channel's local folder. The
+3. Run `/folder` on either instance to see that channel's local folder. The
    default root is `Downloads/leyline`; each channel gets its own safe folder.
    Change the root for this device with `/folder <path>` if needed.
-6. Add or edit a small file in one channel folder. leyline waits until a file
+4. Add or edit a small file in one channel folder. leyline waits until a file
    is unchanged for two scans before publishing it, then the other instance
    downloads it into its matching channel folder.
 

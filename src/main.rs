@@ -1303,7 +1303,7 @@ async fn run(
                             if remote.entry.size > files::DEFAULT_MAX_FILE_SIZE {
                                 let _ = sync_activity.record(Activity { channel: remote.channel.clone(), path: remote.path.clone(), action: "download".into(), outcome: "skipped: too large".into(), at_unix_ms: message::now_unix_ms() });
                                 app.push_system_to(&remote.channel, format!(
-                                    "sync skipped {}: {} exceeds the {} limit",
+                                    "sync skipped {}: {} exceeds the {} sync limit (fixed, independent of /maxsize)",
                                     remote.path, files::human_size(remote.entry.size),
                                     files::human_size(files::DEFAULT_MAX_FILE_SIZE)
                                 ));
@@ -1368,9 +1368,15 @@ async fn run(
                                             files::DEFAULT_MAX_FILE_SIZE,
                                         );
                                     }
-                                    Err(reason) => app.push_system_to(&remote.channel, reason),
+                                    Err(reason) => app.push_system_to(
+                                        &remote.channel,
+                                        format!("{reason} -- check the folder's permissions and free disk space"),
+                                    ),
                                     },
-                                    Some(Err(reason)) => app.push_system_to(&remote.channel, reason),
+                                    Some(Err(reason)) => app.push_system_to(
+                                        &remote.channel,
+                                        format!("{reason} -- check the folder's permissions and free disk space"),
+                                    ),
                                 }
                             }
                         }
@@ -1430,7 +1436,10 @@ async fn run(
                                     Ok(sync_apply::Trash::Missing) => {
                                         sync_publish_watcher.removed_remote(&channel, &path);
                                     }
-                                    Err(reason) => app.push_system_to(&channel, reason),
+                                    Err(reason) => app.push_system_to(
+                                        &channel,
+                                        format!("{reason} -- check the folder's permissions and free disk space"),
+                                    ),
                                 }
                             }
                         }
@@ -1731,7 +1740,7 @@ async fn run(
                         app.push_system_to(
                             &candidate.channel,
                             format!(
-                                "sync skipped {}: {} exceeds the {} limit",
+                                "sync skipped {}: {} exceeds the {} sync limit (fixed, independent of /maxsize)",
                                 candidate.relative,
                                 files::human_size(candidate.size),
                                 files::human_size(files::DEFAULT_MAX_FILE_SIZE)

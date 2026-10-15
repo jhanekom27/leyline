@@ -188,7 +188,7 @@ Typed into the message box and submitted with `Enter`:
 | `/autosave limit <size>` | Set the largest file automatic saves fetch for the active channel. Sizes use the same `B` through `TB` syntax as `/maxsize`; `/autosave limit default` removes this channel's override and restores its device-wide fallback. Overrides persist across restart and are removed when leaving the channel. `off` is refused: unattended downloads always retain a finite ceiling. |
 | `/outbox` | Say whether the active channel watches its local `send/` folder. The folder is `<channel folder>/send/`, alongside received files (see `/folder`), and is off by default. It is one-way only: nothing is synced into or back from it. |
 | `/outbox on` / `/outbox off` | Turn the one-way outbox on or off for the active channel. Enabling creates its `send/` folder, treats files already there as already shared, and remembers the setting across restarts. New regular files are shared only after two unchanged scans, so a copy in progress is not sent half-written; hidden files and common temporary names (`.DS_Store`, `*.part`, `*.crdownload`, `~$*`) are ignored. A name is shared at most once, even if edited or after restart. Files that cannot be read or exceed `/maxsize` are reported in the channel transcript. |
-| `/sync` | Report the active channel's persisted policy (`off`, `receive-only`, `publish-and-receive`, or paused), configured path rules, folder path, pending count, conflicts, errors (with file names), and last successful sync. Conflict entries name both the remote path and its local conflict copy. |
+| `/sync` | Report the active channel's persisted policy (`off`, `receive-only`, `publish-and-receive`, or paused), configured path rules, folder path, pending count, conflicts, errors (with file names), and last successful sync -- or, before it has ever been configured here, where its folder will be and how to enable it. Group channels explain their `/invite` and `/join` prerequisite; `/msg` and `/dm` conversations tell both people to enable their existing shared conversation. Conflict entries name both the remote path and its local conflict copy; a report with pending files points to `/who` to check who's currently reachable |
 | `/sync receive-only` / `/sync publish-and-receive` / `/sync off` | Persist the active channel's policy independently of every other channel. Receive-only mirrors verified remote files without publishing local ones; publish-and-receive does both. `/sync on` remains an alias for publish-and-receive. |
 | `/sync pause` / `/sync resume` | Temporarily stop or restore the active channel's selected policy while retaining its current status and rules. A resumed receive-only channel stays receive-only. |
 | `/sync include <glob>` / `/sync exclude <glob>` | Add a relative-path glob rule for the active channel. With include rules, only matching paths sync; excludes always win. Rules apply to both startup scans and live local/remote changes. Use `/sync remove include <glob>`, `/sync remove exclude <glob>`, or `/sync clear-rules` to edit them. |
@@ -220,9 +220,11 @@ stops changing. Confirm files present before enabling sync and written while
 the app was stopped are picked up after two scans. Repeat with hidden,
 temporary/editor, `send/`, oversized, and in-progress files; none should
 publish. Confirm a received file is not echoed back as a fresh index write,
-`/sync off` stops new applications and publications, and deletes and renames
-are not propagated. This repository's automated tests cover the local
-inventory boundary; this two-machine verification must be performed manually.
+`/sync off` stops new applications and publications, a remote delete moves
+the local copy into recoverable sync trash instead of erasing it, and a
+rename arrives as its new path without re-transferring unchanged content.
+This repository's automated tests cover the local inventory boundary; this
+two-machine verification must be performed manually.
 
 ## Roadmap
 
