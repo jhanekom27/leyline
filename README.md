@@ -28,6 +28,10 @@ device; peers who were offline automatically catch up when they return.
 
 The user guide covers setup and safe folder synchronization:
 [jhanekom27.github.io/leyline](https://jhanekom27.github.io/leyline/).
+## 60-second quickstart
+
+Start two local peers and exchange your first message with the
+[quickstart guide](https://jhanekom27.github.io/leyline/quickstart.html).
 
 ## Requirements
 
@@ -44,20 +48,11 @@ Run `cargo run -- --version` (or `-V`) to print the build's version and
 git commit and exit immediately, without touching disk or the network.
 
 On startup, `leyline` prints an invite ticket for each channel it joined
-(before the TUI takes over -- just "#general" by default, and private to
+(before the TUI takes over -- just `#general` by default, and private to
 this instance alone until you share it) and shows your endpoint id in the
-TUI header (`you: <hex id>`). To have a second instance join the same
-channel and talk to the first, run it the same way in another terminal:
-
-```sh
-cargo run
-```
-
-then paste that printed ticket into its message box:
-
-```
-/join <ticket printed by the first instance>
-```
+TUI header (`you: <hex id>`). For a working two-instance walkthrough, use
+the [60-second quickstart](#60-second-quickstart): it creates a new shared
+channel, then uses `/invite` and `/join` to connect the peers.
 
 The ticket bundles the channel's name, its private room secret, and the
 sharer's address (including relay/direct-address hints), so pasting it is
@@ -96,8 +91,8 @@ HOME=/tmp/leyline-a cargo run
 HOME=/tmp/leyline-b cargo run
 ```
 
-...then `/join` the first instance's printed `#general` ticket from the
-second, as above.
+...then follow the [60-second quickstart](#60-second-quickstart) to create
+and share a `#demo` channel between them.
 
 Each fake `$HOME` also redirects Cargo's own cache, so the first build under
 a new one re-fetches and rebuilds every dependency. To avoid that, capture
