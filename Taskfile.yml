@@ -65,8 +65,8 @@ tasks:
     preconditions:
       - sh: test "$(git branch --show-current)" = main
         msg: Publish only from the main branch.
-      - sh: test -z "$(git status --porcelain)"
-        msg: Commit or stash all changes before publishing documentation.
+      - sh: git diff --quiet && git diff --cached --quiet && test -z "$(git ls-files --others --exclude-standard -- guide)"
+        msg: Commit or stash tracked changes and untracked guide files before publishing documentation.
       - sh: test -n "$(git config --get user.name)"
         msg: Configure a Git user name before publishing documentation.
       - sh: test -n "$(git config --get user.email)"
