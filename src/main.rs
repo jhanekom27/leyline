@@ -23,6 +23,7 @@ mod search;
 mod settings;
 mod shared_files;
 mod storage;
+mod sync_activity;
 mod sync_apply;
 #[cfg(test)]
 mod sync_docs;
@@ -75,6 +76,7 @@ use search::{SearchOutcome, run_on_disk_scan};
 use settings::Settings;
 use shared_files::SharedFiles;
 use storage::MessageStore;
+use sync_activity::{Activity, SyncActivity};
 use sync_settings::SyncSettings;
 use term_events::TermEvents;
 
@@ -109,6 +111,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize outbox settings")?;
     let sync_settings = SyncSettings::load(dirs.data_dir().join("sync"))
         .context("failed to initialize sync settings")?;
+    let sync_activity = SyncActivity::load(dirs.data_dir().join("sync_activity"))
+        .context("failed to initialize sync activity")?;
     let dm_registry = DmRegistry::load(dirs.data_dir().join("dms"))
         .context("failed to initialize DM registry")?;
     let direct_registry = DirectRegistry::load(dirs.data_dir().join("direct_peers"))
@@ -171,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
         autosave_limit,
         outbox,
         sync_settings,
+        sync_activity,
         dm_registry,
         direct_registry,
         settings,
@@ -438,6 +443,7 @@ struct Session {
     outbox: Outbox,
     /// Enabled receive-only channel-folder mirrors.
     sync_settings: SyncSettings,
+    sync_activity: SyncActivity,
     dm_registry: DmRegistry,
     direct_registry: DirectRegistry,
     settings: Settings,
@@ -539,6 +545,7 @@ async fn run(
         autosave_limit,
         mut outbox,
         mut sync_settings,
+        mut sync_activity,
         mut dm_registry,
         mut direct_registry,
         mut settings,
@@ -778,6 +785,20 @@ async fn run(
                                     });
                                 });
                             }
+                            Some(InputAction::ListSyncActivity(channel)) => {
+                                let entries = sync_activity.recent(&channel);
+                                if entries.is_empty() {
+                                    app.push_system_to(&channel, "no sync activity recorded yet");
+                                } else {
+                                    app.push_system_to(&channel, format!("recent sync activity ({}):", entries.len()));
+                                    for entry in entries {
+                                        app.push_system_to(&channel, format!(
+                                            "{} {}: {} ({})",
+                                            entry.at_unix_ms, entry.action, entry.path, entry.outcome
+                                        ));
+                                    }
+                                }
+                            }
                             Some(InputAction::RestoreSyncTrash { channel, path }) => {
                                 let root = app.folder_dir(&channel);
                                 let tx = trash_tx.clone();
@@ -905,6 +926,9 @@ async fn run(
                                 }
                                 if let Err(err) = sync_settings.forget(&channel) {
                                     warn!(%channel, "failed to forget the sync setting: {err}");
+                                }
+                                if let Err(err) = sync_activity.forget(&channel) {
+                                    warn!(%channel, "failed to forget sync activity: {err}");
                                 }
                                 match app.direct_peer_for(&channel) {
                                     Some(peer) => {
@@ -1276,6 +1300,7 @@ async fn run(
                             && app.sync_allows_path(&remote.channel, &remote.path)
                         {
                             if remote.entry.size > files::DEFAULT_MAX_FILE_SIZE {
+                                let _ = sync_activity.record(Activity { channel: remote.channel.clone(), path: remote.path.clone(), action: "download".into(), outcome: "skipped: too large".into(), at_unix_ms: message::now_unix_ms() });
                                 app.push_system_to(&remote.channel, format!(
                                     "sync skipped {}: {} exceeds the {} limit",
                                     remote.path, files::human_size(remote.entry.size),
@@ -1330,6 +1355,7 @@ async fn run(
                                                 remote_modified_unix_ms: Some(remote.entry.modified_unix_ms),
                                                 author: Some(remote.entry.author),
                                             });
+                                            let _ = sync_activity.record(Activity { channel: remote.channel.clone(), path: remote.path.clone(), action: "download".into(), outcome: "conflict".into(), at_unix_ms: message::now_unix_ms() });
                                         }
                                         app.sync_pending(&remote.channel, remote.path.clone());
                                         net.save_synced_file(
@@ -1359,6 +1385,7 @@ async fn run(
                             && app.sync_allows_path(&channel, &path)
                         {
                             if !sync_publish_watcher.may_remove_remote(&channel, &path) {
+                                let _ = sync_activity.record(Activity { channel: channel.clone(), path: path.clone(), action: "delete".into(), outcome: "conflict: local edit kept".into(), at_unix_ms: message::now_unix_ms() });
                                 let root = app.folder_dir(&channel);
                                 let local_modified_unix_ms = std::fs::metadata(root.join(&path))
                                     .ok()
@@ -1388,6 +1415,7 @@ async fn run(
                                 let root = app.folder_dir(&channel);
                                 match sync_apply::trash(&root, &path) {
                                     Ok(sync_apply::Trash::Moved(trash)) => {
+                                        let _ = sync_activity.record(Activity { channel: channel.clone(), path: path.clone(), action: "delete".into(), outcome: "moved to trash".into(), at_unix_ms: message::now_unix_ms() });
                                         let source = root.join(&path);
                                         if let Err(err) = saved_files.move_path(&channel, &source, &trash) {
                                             warn!(%channel, "failed to update trashed sync file: {err}");
@@ -1412,6 +1440,13 @@ async fn run(
                         filename,
                         path,
                     } => {
+                        let _ = sync_activity.record(Activity {
+                            channel: channel.clone(),
+                            path: filename.clone(),
+                            action: "download".into(),
+                            outcome: "applied".into(),
+                            at_unix_ms: message::now_unix_ms(),
+                        });
                         app.sync_succeeded(&channel, &filename, message::now_unix_ms());
                         let root = app.folder_dir(&channel);
                         match path.strip_prefix(&root).ok().and_then(|path| path.to_str()) {
@@ -1676,7 +1711,10 @@ async fn run(
                 for (channel, result) in results {
                     match result {
                         Ok(found) => candidates.extend(found),
-                        Err(error) => app.push_system_to(&channel, error),
+                        Err(error) => {
+                            let _ = sync_activity.record(Activity { channel: channel.clone(), path: "<folder>".into(), action: "publish".into(), outcome: format!("failed: {error}"), at_unix_ms: message::now_unix_ms() });
+                            app.push_system_to(&channel, error)
+                        }
                     }
                 }
                 let changes = sync_publish_watcher.stable(candidates);
@@ -1688,6 +1726,7 @@ async fn run(
                         continue;
                     }
                     if candidate.size > files::DEFAULT_MAX_FILE_SIZE {
+                        let _ = sync_activity.record(Activity { channel: candidate.channel.clone(), path: candidate.relative.clone(), action: "publish".into(), outcome: "skipped: too large".into(), at_unix_ms: message::now_unix_ms() });
                         app.push_system_to(
                             &candidate.channel,
                             format!(
@@ -1713,12 +1752,14 @@ async fn run(
                         candidate.size,
                         modified_unix_ms,
                     );
+                    let _ = sync_activity.record(Activity { channel: candidate.channel.clone(), path: candidate.relative.clone(), action: "publish".into(), outcome: "queued".into(), at_unix_ms: message::now_unix_ms() });
                 }
                 for change in changes {
                     if let sync_publish::Change::Absent { channel, relative } = change
                         && sync_settings.allows_path(&channel, &relative)
                     {
-                        net.publish_index_delete(channel, relative);
+                        net.publish_index_delete(channel.clone(), relative.clone());
+                        let _ = sync_activity.record(Activity { channel, path: relative, action: "delete".into(), outcome: "queued".into(), at_unix_ms: message::now_unix_ms() });
                     }
                 }
                 dirty = true;

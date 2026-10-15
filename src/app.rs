@@ -721,6 +721,7 @@ pub enum InputAction {
     /// Permanently delete every recoverable remote delete in the active
     /// channel after this explicit command.
     PurgeSyncTrash(String),
+    ListSyncActivity(String),
     ResolveSyncConflict {
         channel: String,
         conflict: SyncConflict,
@@ -2381,6 +2382,7 @@ impl AppState {
             "autosave" => self.run_autosave(arg.trim()),
             "outbox" => self.run_outbox(arg.trim()),
             "sync" => self.run_sync(arg.trim()),
+            "activity" => Some(InputAction::ListSyncActivity(self.active().name.clone())),
             "conflicts" => self.run_conflicts(arg.trim()),
             "trash" => self.run_trash(arg.trim()),
             "files" => self.run_files(),

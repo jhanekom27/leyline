@@ -102,6 +102,7 @@ const COMMAND_HINTS: &[&str] = &[
     "/autosave [on|off|limit <size|default>]",
     "/outbox [on|off]",
     "/sync [receive-only|publish-and-receive|off|pause|resume|include <glob>|exclude <glob>]",
+    "/activity",
     "/conflicts [local|remote|both <path>]",
     "/trash [restore <path>|purge]",
     "/files",
