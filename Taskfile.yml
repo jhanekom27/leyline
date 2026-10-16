@@ -219,7 +219,7 @@ tasks:
     cmds:
       - |
         test "$(gh release view "{{.RELEASE_TAG}}" --json isDraft --jq .isDraft)" = true
-        assets="$(gh api "repos/{owner}/{repo}/releases/tags/{{.RELEASE_TAG}}" --jq '.assets[].name')"
+        assets="$(gh api "repos/{owner}/{repo}/releases" --paginate --jq '.[] | select(.tag_name == "{{.RELEASE_TAG}}") | .assets[].name')"
         for asset in \
           "leyline-aarch64-apple-darwin.tar.xz" \
           "leyline-aarch64-apple-darwin.tar.xz.sha256" \
