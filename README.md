@@ -32,12 +32,16 @@ The user guide covers setup and safe folder synchronization:
 
 Start two local peers and exchange your first message with the
 [quickstart guide](https://jhanekom27.github.io/leyline/quickstart.html).
+## Install leyline
 
-## Requirements
+Download a prebuilt binary or install from a pinned Git tag with Cargo. The
+[installation guide](https://jhanekom27.github.io/leyline/installation.html)
+covers each supported end-user path, including checksum verification.
 
-- A recent stable Rust toolchain with edition 2024 support (Rust 1.91 or newer -- iroh-gossip's current MSRV)
+## Contributor build & run
 
-## Build & run
+Contributors need a recent stable Rust toolchain with edition 2024 support
+(Rust 1.91 or newer -- iroh-gossip's current MSRV).
 
 ```sh
 cargo build --release

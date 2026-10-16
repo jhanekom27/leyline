@@ -1,9 +1,10 @@
 ---
 id: LEY-30
 title: Publish painless leyline installation paths
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-15 01:43'
+updated_date: '2026-10-16 06:39'
 labels: []
 dependencies: []
 type: feature
@@ -19,6 +20,12 @@ Make leyline practical to install for people who are not contributors. Add autom
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [ ] #1 GitHub Releases can publish prebuilt binaries for supported platforms through an automated release workflow
-- [ ] #2 README documents supported cargo install paths without requiring Backlog.md
-- [ ] #3 Distribution documentation clearly distinguishes end-user installation from contributor tooling
+- [x] #2 README documents supported cargo install paths without requiring Backlog.md
+- [x] #3 Distribution documentation clearly distinguishes end-user installation from contributor tooling
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implemented a local-only cargo-dist v0.32.0 release configuration and a single guarded task release workflow. Verified cargo-dist planning and all four archives/checksums with task release:build; cargo fmt --check, cargo test (1,007 passed), cargo clippy, task docs:build, and task docs:test pass. Acceptance criterion 1 remains unchecked until the workflow creates and publishes a real GitHub Release from a clean, pushed release commit; no release was created during implementation.
+<!-- SECTION:NOTES:END -->

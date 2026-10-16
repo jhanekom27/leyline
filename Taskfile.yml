@@ -4,6 +4,11 @@ vars:
   MDBOOK_VERSION: "0.5.4"
   MDBOOK: "{{.ROOT_DIR}}/.tools/bin/mdbook"
   PAGES_API: "repos/{owner}/{repo}/pages"
+  CARGO_DIST_VERSION: "0.32.0"
+  PACKAGE_VERSION:
+    sh: 'package_id="$(cargo pkgid)"; printf "%s" "${package_id##*#}"'
+  RELEASE_TAG: "v{{.PACKAGE_VERSION}}"
+  DIST_DIR: "{{.ROOT_DIR}}/target/distrib"
 
 tasks:
   docs:install:
@@ -97,3 +102,152 @@ tasks:
           -m "Co-Authored-By: Warp <agent@warp.dev>"
         git -C "$publish_dir" push --force origin gh-pages
       - task: docs:configure
+
+  release:preflight:
+    internal: true
+    desc: Verify that the local checkout and release tools are ready
+    preconditions:
+      - sh: command -v dist >/dev/null
+        msg: "Install cargo-dist {{.CARGO_DIST_VERSION}} first: cargo install cargo-dist --version {{.CARGO_DIST_VERSION}} --locked"
+      - sh: 'test "$(dist --version)" = "cargo-dist {{.CARGO_DIST_VERSION}}"'
+        msg: "Install cargo-dist {{.CARGO_DIST_VERSION}} to match dist-workspace.toml."
+      - sh: command -v zig >/dev/null
+        msg: "Install Zig first: https://ziglang.org/download/"
+      - sh: command -v cargo-zigbuild >/dev/null
+        msg: "Install cargo-zigbuild first: cargo install cargo-zigbuild --locked"
+      - sh: command -v cargo-xwin >/dev/null
+        msg: "Install cargo-xwin first: cargo install cargo-xwin --locked"
+      - sh: command -v gh >/dev/null
+        msg: "Install GitHub CLI first: https://cli.github.com/"
+      - sh: gh auth status >/dev/null
+        msg: "Authenticate GitHub CLI first: gh auth login"
+      - sh: 'test "$(git branch --show-current)" = main'
+        msg: "Release only from the main branch."
+      - sh: 'test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"'
+        msg: "Push the current main commit before releasing."
+      - sh: 'git diff --quiet && git diff --cached --quiet && test -z "$(git ls-files --others --exclude-standard)"'
+        msg: "Commit or stash all changes before releasing."
+      - sh: '! git rev-parse -q --verify "refs/tags/{{.RELEASE_TAG}}" >/dev/null'
+        msg: "The local tag {{.RELEASE_TAG}} already exists."
+      - sh: '! git ls-remote --exit-code --tags origin "refs/tags/{{.RELEASE_TAG}}" >/dev/null 2>&1'
+        msg: "The remote tag {{.RELEASE_TAG}} already exists."
+      - sh: '! gh release view "{{.RELEASE_TAG}}" >/dev/null 2>&1'
+        msg: "The GitHub Release {{.RELEASE_TAG}} already exists."
+
+  release:plan:
+    internal: true
+    desc: Validate the planned release artifacts
+    cmds:
+      - dist plan --tag "{{.RELEASE_TAG}}"
+
+  release:verify:
+    internal: true
+    desc: Verify release archives and checksums
+    cmds:
+      - |
+        for asset in \
+          "{{.DIST_DIR}}/leyline-aarch64-apple-darwin.tar.xz" \
+          "{{.DIST_DIR}}/leyline-aarch64-apple-darwin.tar.xz.sha256" \
+          "{{.DIST_DIR}}/leyline-x86_64-apple-darwin.tar.xz" \
+          "{{.DIST_DIR}}/leyline-x86_64-apple-darwin.tar.xz.sha256" \
+          "{{.DIST_DIR}}/leyline-x86_64-unknown-linux-gnu.tar.xz" \
+          "{{.DIST_DIR}}/leyline-x86_64-unknown-linux-gnu.tar.xz.sha256" \
+          "{{.DIST_DIR}}/leyline-x86_64-pc-windows-msvc.zip" \
+          "{{.DIST_DIR}}/leyline-x86_64-pc-windows-msvc.zip.sha256" \
+          "{{.DIST_DIR}}/sha256.sum"
+        do
+          test -f "$asset"
+        done
+      - |
+        for checksum in \
+          "{{.DIST_DIR}}/leyline-aarch64-apple-darwin.tar.xz.sha256" \
+          "{{.DIST_DIR}}/leyline-x86_64-apple-darwin.tar.xz.sha256" \
+          "{{.DIST_DIR}}/leyline-x86_64-unknown-linux-gnu.tar.xz.sha256" \
+          "{{.DIST_DIR}}/leyline-x86_64-pc-windows-msvc.zip.sha256"
+        do
+          archive="${checksum%.sha256}"
+          IFS=' ' read -r expected _ < "$checksum"
+          actual="$(shasum -a 256 "$archive")"
+          actual="${actual%% *}"
+          test "$actual" = "$expected"
+        done
+
+  release:smoke:
+    internal: true
+    desc: Run the native shippable build and verify its version
+    cmds:
+      - |
+        actual="$(cargo run --quiet --profile dist -- --version)"
+        case "$actual" in
+          "leyline {{.PACKAGE_VERSION}} "*) ;;
+          *)
+            printf 'expected Leyline {{.PACKAGE_VERSION}}, got: %s\n' "$actual"
+            exit 1
+            ;;
+        esac
+
+  release:build:
+    desc: Build and verify release artifacts without publishing
+    cmds:
+      - dist build --artifacts=local --tag "{{.RELEASE_TAG}}"
+      - dist build --artifacts=global --tag "{{.RELEASE_TAG}}"
+      - task: release:verify
+      - task: release:smoke
+
+  release:draft:
+    internal: true
+    desc: Create the draft GitHub Release and upload verified assets
+    cmds:
+      - task: release:preflight
+      - task: release:verify
+      - >-
+        gh release create "{{.RELEASE_TAG}}" --draft --generate-notes
+        --target "$(git rev-parse HEAD)"
+        "{{.DIST_DIR}}/leyline-aarch64-apple-darwin.tar.xz"
+        "{{.DIST_DIR}}/leyline-aarch64-apple-darwin.tar.xz.sha256"
+        "{{.DIST_DIR}}/leyline-x86_64-apple-darwin.tar.xz"
+        "{{.DIST_DIR}}/leyline-x86_64-apple-darwin.tar.xz.sha256"
+        "{{.DIST_DIR}}/leyline-x86_64-unknown-linux-gnu.tar.xz"
+        "{{.DIST_DIR}}/leyline-x86_64-unknown-linux-gnu.tar.xz.sha256"
+        "{{.DIST_DIR}}/leyline-x86_64-pc-windows-msvc.zip"
+        "{{.DIST_DIR}}/leyline-x86_64-pc-windows-msvc.zip.sha256"
+        "{{.DIST_DIR}}/sha256.sum"
+      - 'git fetch --quiet origin "refs/tags/{{.RELEASE_TAG}}:refs/tags/{{.RELEASE_TAG}}"'
+
+  release:publish:
+    internal: true
+    desc: Publish a complete draft GitHub Release
+    cmds:
+      - |
+        test "$(gh release view "{{.RELEASE_TAG}}" --json isDraft --jq .isDraft)" = true
+        assets="$(gh api "repos/{owner}/{repo}/releases/tags/{{.RELEASE_TAG}}" --jq '.assets[].name')"
+        for asset in \
+          "leyline-aarch64-apple-darwin.tar.xz" \
+          "leyline-aarch64-apple-darwin.tar.xz.sha256" \
+          "leyline-x86_64-apple-darwin.tar.xz" \
+          "leyline-x86_64-apple-darwin.tar.xz.sha256" \
+          "leyline-x86_64-unknown-linux-gnu.tar.xz" \
+          "leyline-x86_64-unknown-linux-gnu.tar.xz.sha256" \
+          "leyline-x86_64-pc-windows-msvc.zip" \
+          "leyline-x86_64-pc-windows-msvc.zip.sha256" \
+          "sha256.sum"
+        do
+          case "$assets" in
+            *"$asset"*) ;;
+            *)
+              printf 'draft release is missing asset: %s\n' "$asset"
+              exit 1
+              ;;
+          esac
+        done
+      - gh release edit "{{.RELEASE_TAG}}" --draft=false
+
+  release:
+    desc: Build, upload, and publish the current Leyline version
+    prompt: "Publish Leyline {{.PACKAGE_VERSION}}? Confirm that Windows and Linux smoke tests have passed."
+    cmds:
+      - task: release:preflight
+      - task: release:plan
+      - task: release:build
+      - task: release:draft
+      - task: release:publish

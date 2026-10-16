@@ -1,0 +1,13 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The cargo-dist version used to build release artifacts.
+cargo-dist-version = "0.32.0"
+# Build archives and checksums locally; release publication is handled by Taskfile.
+installers = []
+# GitHub already provides source archives, so only upload Leyline's binary artifacts.
+source-tarball = false
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
