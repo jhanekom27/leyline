@@ -212,7 +212,6 @@ tasks:
         "{{.DIST_DIR}}/leyline-x86_64-pc-windows-msvc.zip"
         "{{.DIST_DIR}}/leyline-x86_64-pc-windows-msvc.zip.sha256"
         "{{.DIST_DIR}}/sha256.sum"
-      - 'git fetch --quiet origin "refs/tags/{{.RELEASE_TAG}}:refs/tags/{{.RELEASE_TAG}}"'
 
   release:publish:
     internal: true
