@@ -73,10 +73,8 @@ joins their swarm directly.
 
 Every joined channel is listed in the panel down the left, in two
 sections: **CHANNELS** for group channels (`#`) and **PEOPLE** for your 1:1
-conversations (`@` for a `/msg` DM, `⚡` for a `/dm` point-to-point chat),
-each in the order you joined them. The active one is highlighted, and a `*`
-marks another with unread messages. Sync-enabled channels show `S`, `~`,
-`C`, `!`, or `P` for idle, pending, conflict, error, or paused sync; the
+conversations (`@` for a `/msg` DM, `⚡` for a `/dm` point-to-point chat), each in the order you joined them. The active one is highlighted, and another
+with unread messages shows its count. Sync-enabled channels show `S`, `~`, `C`, `!`, or `P` for idle, pending, conflict, error, or paused sync; the
 panel scrolls once the list is
 taller than the terminal. Switch between channels with `Tab` / `Shift+Tab`,
 which step down / up the panel and wrap around, or press `Ctrl+P` to jump

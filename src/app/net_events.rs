@@ -35,7 +35,10 @@ impl AppState {
                     }
                     channel.push(TranscriptLine::Chat(message.clone()));
                     if !is_active {
-                        channel.has_unread = true;
+                        if channel.unread_count == 0 {
+                            channel.first_unread = Some(message.id);
+                        }
+                        channel.unread_count += 1;
                     }
                 }
                 if let Some(shared) = shared {

@@ -59,9 +59,6 @@ const NAV_GLYPH_WIDTH: usize = 2;
 /// Where a label starts within a navigation row: a leading space, the
 /// glyph column, and a separating space.
 const NAV_LABEL_OFFSET: usize = 1 + NAV_GLYPH_WIDTH + 1;
-/// Cells held back at a row's right edge for the unread marker (the `*`
-/// itself plus a blank before it), so a long label never runs into it.
-const NAV_MARKER_WIDTH: usize = 2;
 
 /// Width of the jump-to overlay (`render_switcher`), borders included.
 const SWITCHER_WIDTH: u16 = 44;
@@ -238,7 +235,7 @@ fn render_body(frame: &mut Frame, area: Rect, app: &AppState) {
 /// its kind's glyph (`ChannelKind::glyph`) and named by its current label
 /// (`AppState::channel_label`). The active channel's row is highlighted
 /// across the panel's width, and any other channel with unseen activity
-/// ends in a `*`. Both section headers are always drawn, even over an
+/// ends in its unread count. Both section headers are always drawn, even over an
 /// empty section, so the panel's shape doesn't jump as conversations come
 /// and go.
 ///
@@ -294,19 +291,29 @@ fn nav_section_header(title: &str) -> ListItem<'static> {
 /// One channel's row, `width` cells wide: a space, the kind glyph padded
 /// to `NAV_GLYPH_WIDTH` cells (measured rather than assumed, since the
 /// point-to-point bolt is double-width), the label truncated to leave
-/// `NAV_MARKER_WIDTH` cells free, and -- right-aligned -- a `*` when the
-/// channel has unseen activity. A `highlighted` row -- the active channel
-/// in the navigation panel, the selected match in the switcher -- is shown
-/// black on cyan across the whole row and carries no `*`: it's the channel
-/// you're on, or about to be.
+/// enough cells for its right-aligned status or unread count. A
+/// `highlighted` row -- the active channel in the navigation panel, the
+/// selected match in the switcher -- is shown black on cyan across the
+/// whole row and carries no marker: it's the channel you're on, or about
+/// to be.
 fn nav_entry(app: &AppState, index: usize, width: usize, highlighted: bool) -> ListItem<'static> {
     let channel = &app.channels[index];
 
     let glyph = Span::raw(app.channel_kind(&channel.name).glyph());
     let padding = " ".repeat(NAV_GLYPH_WIDTH.saturating_sub(glyph.width()) + 1);
+    let marker = (!highlighted)
+        .then(|| {
+            app.sync_marker(&channel.name)
+                .map(|marker| marker.to_string())
+                .or_else(|| (channel.unread_count > 0).then(|| channel.unread_count.to_string()))
+        })
+        .flatten();
+    let marker_width = marker
+        .as_ref()
+        .map_or(0, |marker| marker.chars().count() + 1);
     let label = truncate_chars(
         &app.channel_label(&channel.name),
-        width.saturating_sub(NAV_LABEL_OFFSET + NAV_MARKER_WIDTH),
+        width.saturating_sub(NAV_LABEL_OFFSET + marker_width),
     );
     let mut line = Line::from(vec![
         Span::raw(" "),
@@ -323,20 +330,11 @@ fn nav_entry(app: &AppState, index: usize, width: usize, highlighted: bool) -> L
                 .add_modifier(Modifier::BOLD),
         );
     }
-    if let Some(marker) = app.sync_marker(&channel.name) {
-        let gap = width.saturating_sub(line.width() + 1);
+    if let Some(marker) = marker {
+        let gap = width.saturating_sub(line.width() + marker.chars().count());
         line.push_span(Span::raw(" ".repeat(gap)));
         line.push_span(Span::styled(
-            marker.to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    } else if channel.has_unread {
-        let gap = width.saturating_sub(line.width() + 1);
-        line.push_span(Span::raw(" ".repeat(gap)));
-        line.push_span(Span::styled(
-            "*",
+            marker,
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -802,7 +800,7 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
     // below has to work in rows to stay accurate. `picked_row` is the
     // header row of whichever message matches `app.picking_reply`, if
     // any -- see the window adjustment below.
-    let (mut rows, picked_row) = build_message_rows(app, channel, inner_width);
+    let (mut rows, picked_row, unread_row) = build_message_rows(app, channel, inner_width);
     let total = rows.len();
     // `channel.scroll` grows unboundedly while `Up` is held (see
     // `AppState::handle_key`) since it has no way to know how many rows
@@ -814,6 +812,10 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
     let scroll = channel.scroll.min(max_scroll);
     let mut end = total.saturating_sub(scroll);
     let mut start = end.saturating_sub(visible_rows);
+    if let Some(unread) = unread_row {
+        start = unread;
+        end = (start + visible_rows).min(total);
+    }
     // While picking a reply target, the highlighted message always wins
     // over `channel.scroll` -- widen/shift the window (local variables
     // only; `channel.scroll` itself is never touched, since ui.rs stays
@@ -932,17 +934,20 @@ fn build_message_rows(
     app: &AppState,
     channel: &Channel,
     inner_width: usize,
-) -> (Vec<Line<'static>>, Option<usize>) {
+) -> (Vec<Line<'static>>, Option<usize>, Option<usize>) {
     if let Some(thread) = &channel.thread {
-        return build_thread_rows(app, thread, inner_width);
+        let (rows, picked_row) = build_thread_rows(app, thread, inner_width);
+        return (rows, picked_row, None);
     }
     if let Some(search) = &channel.search {
-        return build_search_rows(app, search, inner_width);
+        let (rows, picked_row) = build_search_rows(app, search, inner_width);
+        return (rows, picked_row, None);
     }
 
     let layout = row_layout(inner_width);
     let mut rows = Vec::new();
     let mut picked_row = None;
+    let mut unread_row = None;
     let mut last_chat_sender: Option<[u8; 32]> = None;
     for line in &channel.messages {
         match line {
@@ -960,6 +965,9 @@ fn build_message_rows(
                     app.picking_reply == Some(message.id) || app.picking_thread == Some(message.id);
                 if is_picked {
                     picked_row = Some(rows.len());
+                }
+                if channel.unread_anchor == Some(message.id) {
+                    unread_row = Some(rows.len());
                 }
                 push_chat_rows(
                     &mut rows,
@@ -990,7 +998,7 @@ fn build_message_rows(
             }
         }
     }
-    (rows, picked_row)
+    (rows, picked_row, unread_row)
 }
 
 /// Renders a channel's active `/search` results in place of its normal
@@ -2221,6 +2229,23 @@ mod tests {
             "the picked row must be rendered reversed"
         );
     }
+    #[test]
+    fn build_message_rows_returns_the_first_unread_messages_row_as_the_viewport_anchor() {
+        let mut app = AppState::new([9; 32], vec!["general".to_string()], "general");
+        app.load_history(
+            "general",
+            vec![
+                text_message(1, [1; 32], "already read"),
+                text_message(2, [1; 32], "first unread"),
+                text_message(3, [1; 32], "also unread"),
+            ],
+        );
+        app.active_mut().unread_anchor = Some(2);
+
+        let (_, _, unread_row) = build_message_rows(&app, app.active(), 80);
+
+        assert_eq!(unread_row, Some(1));
+    }
 
     use std::collections::HashMap;
 
@@ -2492,37 +2517,38 @@ mod tests {
     }
 
     #[test]
-    fn an_unread_channel_ends_in_a_marker_but_the_active_one_never_does() {
+    fn an_unread_channel_ends_in_its_count_but_the_active_one_never_does() {
         let mut app = app_with_every_kind();
-        app.channels[2].has_unread = true; // project-x, inactive
-        app.channels[0].has_unread = true; // general, active: the flag is moot
+        app.channels[2].unread_count = 12; // project-x, inactive
+        app.channels[0].unread_count = 1; // general, active: the count is moot
 
         let buffer = render_to_buffer(&app, 100, 20);
 
         let unread = nav_row(&buffer, "#", "project-x");
         let active = nav_row(&buffer, "#", "general");
         let read = nav_row(&buffer, "@", "07070707");
-        assert_eq!(buffer[(NAV_MARKER_X, unread)].symbol(), "*");
+        assert_eq!(buffer[(NAV_MARKER_X - 1, unread)].symbol(), "1");
+        assert_eq!(buffer[(NAV_MARKER_X, unread)].symbol(), "2");
         assert_eq!(buffer[(NAV_MARKER_X, active)].symbol(), " ");
         assert_eq!(buffer[(NAV_MARKER_X, read)].symbol(), " ");
     }
 
     #[test]
-    fn a_long_label_is_cut_short_of_the_unread_marker() {
+    fn a_long_label_is_cut_short_of_the_unread_count() {
         let long = "a-channel-name-far-too-long-for-the-panel";
         let mut app = AppState::new(
             [9; 32],
             vec!["general".to_string(), long.to_string()],
             "general",
         );
-        app.channels[1].has_unread = true;
+        app.channels[1].unread_count = 12;
 
         let buffer = render_to_buffer(&app, 100, 20);
 
-        // 15 characters and an ellipsis, a blank, then the marker.
-        let row = nav_row(&buffer, "#", "a-channel-name-…");
-        assert_eq!(buffer[(NAV_MARKER_X - 1, row)].symbol(), " ");
-        assert_eq!(buffer[(NAV_MARKER_X, row)].symbol(), "*");
+        let row = nav_row(&buffer, "#", "a-channel-name…");
+        assert_eq!(buffer[(NAV_MARKER_X - 2, row)].symbol(), " ");
+        assert_eq!(buffer[(NAV_MARKER_X - 1, row)].symbol(), "1");
+        assert_eq!(buffer[(NAV_MARKER_X, row)].symbol(), "2");
     }
 
     #[test]
@@ -2740,9 +2766,9 @@ mod tests {
     }
 
     #[test]
-    fn an_unread_channel_keeps_its_marker_in_the_switcher() {
+    fn an_unread_channel_keeps_its_count_in_the_switcher() {
         let mut app = app_with_every_kind();
-        app.channels[2].has_unread = true; // project-x
+        app.channels[2].unread_count = 12; // project-x
         open_switcher(&mut app);
 
         let buffer = render_to_buffer(&app, 100, 20);
@@ -2750,7 +2776,8 @@ mod tests {
         let area = switcher_area(screen(), 4);
         let unread = entry_row(&buffer, area.x, "#", "project-x");
         let read = entry_row(&buffer, area.x, "@", "07070707");
-        assert_eq!(buffer[(area.right() - 2, unread)].symbol(), "*");
+        assert_eq!(buffer[(area.right() - 3, unread)].symbol(), "1");
+        assert_eq!(buffer[(area.right() - 2, unread)].symbol(), "2");
         assert_eq!(buffer[(area.right() - 2, read)].symbol(), " ");
     }
 

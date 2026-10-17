@@ -478,9 +478,17 @@ pub struct Channel {
     pub messages: VecDeque<TranscriptLine>,
     pub peers: Vec<[u8; 32]>,
     pub scroll: usize,
-    /// Whether this channel has unseen activity, shown in the navigation
-    /// panel -- cleared when it becomes the active channel.
-    pub has_unread: bool,
+    /// Number of newly received live messages not yet viewed. This is
+    /// transient, like `scroll`: startup history and backfill establish the
+    /// transcript but never produce an unread badge.
+    pub unread_count: usize,
+    /// The oldest message contributing to `unread_count`, so activation can
+    /// show it first even though wrapped-row layout belongs to `ui`.
+    pub first_unread: Option<u64>,
+    /// The first unread message to show after this channel becomes active.
+    /// `ui` resolves it against the current terminal-width-specific rows;
+    /// an explicit scroll clears it.
+    pub unread_anchor: Option<u64>,
     /// Every message id seen so far in this channel (live gossip or
     /// backfill), for dedupe. Deliberately unbounded -- capping this by
     /// recency used to be the cause of a real duplication bug:
@@ -541,7 +549,9 @@ impl Channel {
             messages: VecDeque::new(),
             peers: Vec::new(),
             scroll: 0,
-            has_unread: false,
+            unread_count: 0,
+            first_unread: None,
+            unread_anchor: None,
             seen_ids: HashSet::new(),
             search: None,
             thread: None,
@@ -1648,13 +1658,16 @@ impl AppState {
         self.channels.iter_mut().find(|c| c.name == name)
     }
 
-    /// Clears the newly-active channel's unread flag and any in-progress
-    /// reply pick or armed reply -- both are only meaningful against the
-    /// channel they were made in. The shared tail end of every place that
-    /// changes `active`: `switch_channel` (`Tab`/`Shift+Tab`),
+    /// Clears the newly-active channel's unread state, retaining its oldest
+    /// unread message as the renderer's viewport anchor, and clears any
+    /// in-progress reply pick or armed reply -- both are only meaningful
+    /// against the channel they were made in. The shared tail end of every
+    /// place that changes `active`: `switch_channel` (`Tab`/`Shift+Tab`),
     /// `activate_existing_channel`, and `activate_or_create_channel`.
     fn finish_activating_channel(&mut self) {
-        self.active_mut().has_unread = false;
+        let channel = self.active_mut();
+        channel.unread_anchor = channel.first_unread.take();
+        channel.unread_count = 0;
         self.picking_reply = None;
         self.picking_thread = None;
         self.replying_to = None;
@@ -1946,10 +1959,12 @@ impl AppState {
             KeyCode::Right => self.active_mut().move_right(),
             KeyCode::Up => {
                 let channel = self.active_mut();
+                channel.unread_anchor = None;
                 channel.scroll = channel.scroll.saturating_add(1);
             }
             KeyCode::Down => {
                 let channel = self.active_mut();
+                channel.unread_anchor = None;
                 channel.scroll = channel.scroll.saturating_sub(1);
             }
             KeyCode::Tab => self.switch_channel(1),
@@ -2552,7 +2567,7 @@ impl AppState {
     /// Moves `active` forward (`step = 1`) or backward (`step = -1`)
     /// through the channels in the order the navigation panel draws them
     /// (`nav_order`), wrapping, and clears the new active channel's unread
-    /// flag. Stepping in drawn order rather than join order keeps the
+    /// state. Stepping in drawn order rather than join order keeps the
     /// panel's highlight moving top to bottom instead of hopping between
     /// its sections when group channels and conversations were joined
     /// interleaved; with only group channels the two orders are the same.
@@ -5545,26 +5560,37 @@ mod tests {
     }
 
     #[test]
-    fn switching_into_a_channel_clears_its_unread_flag() {
+    fn switching_into_a_channel_clears_its_unread_count_and_sets_an_anchor() {
         let mut app = multi_channel_app();
         app.active = 1; // on "random"
-        app.channels[0].has_unread = true; // "general" has unread activity
+        app.channels[0].unread_count = 2; // "general" has unread activity
+        app.channels[0].first_unread = Some(7);
 
         app.handle_key(key(KeyCode::Tab)); // wraps to "general"
         assert_eq!(app.active, 0);
-        assert!(!app.active().has_unread);
+        assert_eq!(app.active().unread_count, 0);
+        assert_eq!(app.active().first_unread, None);
+        assert_eq!(app.active().unread_anchor, Some(7));
     }
 
     #[test]
-    fn received_message_on_inactive_channel_marks_unread_not_active() {
+    fn received_messages_on_an_inactive_channel_increment_unread_count_from_the_first() {
         let mut app = multi_channel_app();
         app.active = 1; // "random" is active; "general" is not
+        let first = compose_message(PEER_ID, "hello", None);
+        let first_id = first.id;
+        app.handle_net_event(NetEvent::Received("general".to_string(), first));
+        app.handle_net_event(NetEvent::Received(
+            "general".to_string(),
+            compose_message(PEER_ID, "again", None),
+        ));
 
-        let message = compose_message(PEER_ID, "hello", None);
-        app.handle_net_event(NetEvent::Received("general".to_string(), message));
-
-        assert!(app.channels[0].has_unread, "inactive channel gets flagged");
-        assert!(!app.channels[1].has_unread, "active channel is untouched");
+        assert_eq!(app.channels[0].unread_count, 2);
+        assert_eq!(app.channels[0].first_unread, Some(first_id));
+        assert_eq!(
+            app.channels[1].unread_count, 0,
+            "active channel is untouched"
+        );
     }
 
     #[test]
@@ -5572,7 +5598,33 @@ mod tests {
         let mut app = app();
         let message = compose_message(PEER_ID, "hello", None);
         app.handle_net_event(NetEvent::Received("general".to_string(), message));
-        assert!(!app.active().has_unread);
+        assert_eq!(app.active().unread_count, 0);
+        assert_eq!(app.active().first_unread, None);
+    }
+
+    #[test]
+    fn duplicate_messages_do_not_increment_an_unread_count() {
+        let mut app = multi_channel_app();
+        app.active = 1; // on "random"
+        let message = compose_message(PEER_ID, "hello", None);
+
+        app.handle_net_event(NetEvent::Received("general".to_string(), message.clone()));
+        app.handle_net_event(NetEvent::Received("general".to_string(), message));
+
+        assert_eq!(app.channels[0].unread_count, 1);
+    }
+
+    #[test]
+    fn scrolling_after_switching_discards_the_unread_anchor() {
+        let mut app = multi_channel_app();
+        app.active = 1; // on "random"
+        app.channels[0].unread_count = 1;
+        app.channels[0].first_unread = Some(7);
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Up));
+
+        assert_eq!(app.active().unread_anchor, None);
     }
 
     #[test]
@@ -7921,7 +7973,7 @@ mod tests {
 
         assert_eq!(as_chat(app.channels[0].messages.back().unwrap()), &message);
         assert!(
-            !app.channels[0].has_unread,
+            app.channels[0].unread_count == 0,
             "a self-sent file shouldn't flag its channel unread"
         );
     }
@@ -9579,14 +9631,16 @@ mod tests {
     #[test]
     fn switching_through_the_switcher_clears_unread_and_an_armed_reply() {
         let mut app = app_for_the_switcher();
-        app.channels[3].has_unread = true;
+        app.channels[3].unread_count = 1;
+        app.channels[3].first_unread = Some(7);
         app.replying_to = Some(7);
         ctrl_p(&mut app);
         type_text(&mut app, "bob");
 
         app.handle_key(key(KeyCode::Enter));
 
-        assert!(!app.active().has_unread);
+        assert_eq!(app.active().unread_count, 0);
+        assert_eq!(app.active().unread_anchor, Some(7));
         assert!(app.replying_to.is_none());
     }
 
