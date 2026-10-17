@@ -103,14 +103,61 @@ const USER_PALETTE: [Color; 8] = [
     Color::Rgb(0x9c, 0xa8, 0xf0),
 ];
 
-pub fn render(frame: &mut Frame, app: &AppState) {
-    let [header, body, staged, input] = Layout::vertical([
+fn frame_areas(area: Rect, app: &AppState) -> [Rect; 4] {
+    Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(staged_strip_height(app.active().staged.len())),
         Constraint::Length(input_box_height(&app.active().input)),
     ])
-    .areas(frame.area());
+    .areas(area)
+}
+
+fn body_areas(area: Rect) -> [Rect; 3] {
+    Layout::horizontal([
+        Constraint::Length(NAV_WIDTH),
+        Constraint::Min(20),
+        Constraint::Length(22),
+    ])
+    .areas(area)
+}
+
+fn sidebar_areas(area: Rect) -> [Rect; 2] {
+    Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(command_catalog().len() as u16 + 2),
+    ])
+    .areas(area)
+}
+
+/// Uses exactly the renderer's layout, excluding borders, hidden rows,
+/// and modal views. Returns the row and its clipped terminal-cell count.
+pub fn command_hint_at(
+    area: Rect,
+    app: &AppState,
+    column: u16,
+    row: u16,
+) -> Option<(usize, usize)> {
+    if !app.can_hover_hints() {
+        return None;
+    }
+    let [_, body, _, _] = frame_areas(area, app);
+    let [_, _, sidebar] = body_areas(body);
+    let [_, hints] = sidebar_areas(sidebar);
+    let inner = Block::bordered().inner(hints);
+    if !inner.contains((column, row).into()) || inner.width == 0 {
+        return None;
+    }
+    let index = (row - inner.y) as usize;
+    let hint = command_catalog().get(index)?.syntax;
+    let overflow = Line::from(hint)
+        .width()
+        .saturating_sub(inner.width as usize);
+    (overflow > 0).then_some((index, overflow))
+}
+
+pub fn render(frame: &mut Frame, app: &AppState) {
+    let [header, body, staged, input] = frame_areas(frame.area(), app);
 
     render_header(frame, header, app);
     render_body(frame, body, app);
@@ -178,12 +225,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn render_body(frame: &mut Frame, area: Rect, app: &AppState) {
-    let [nav, messages, sidebar] = Layout::horizontal([
-        Constraint::Length(NAV_WIDTH),
-        Constraint::Min(20),
-        Constraint::Length(22),
-    ])
-    .areas(area);
+    let [nav, messages, sidebar] = body_areas(area);
 
     render_nav(frame, nav, app);
     render_messages(frame, messages, app);
@@ -744,11 +786,9 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &AppState) {
         render_peers(frame, area, app);
         return;
     }
-    let hints_height = command_catalog().len() as u16 + 2; // +2 for the block's borders
-    let [peers, hints] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(hints_height)]).areas(area);
+    let [peers, hints] = sidebar_areas(area);
     render_peers(frame, peers, app);
-    render_hints(frame, hints);
+    render_hints(frame, hints, app);
 }
 
 fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -1428,10 +1468,20 @@ fn peer_item(app: &AppState, id: &[u8; 32]) -> ListItem<'static> {
 /// Renders the sidebar's command reference panel: one row per catalog entry,
 /// showing just the bare usage -- full
 /// descriptions still live in `/help`'s system notice and the README.
-fn render_hints(frame: &mut Frame, area: Rect) {
+fn render_hints(frame: &mut Frame, area: Rect, app: &AppState) {
     let items: Vec<ListItem> = command_catalog()
         .iter()
-        .map(|command| ListItem::new(command.syntax))
+        .enumerate()
+        // Usages are ASCII, so each character is exactly one terminal cell.
+        .map(|(row, command)| {
+            ListItem::new(
+                command
+                    .syntax
+                    .chars()
+                    .skip(app.hint_scroll(row))
+                    .collect::<String>(),
+            )
+        })
         .collect();
     let list = List::new(items).block(
         Block::bordered()
@@ -3847,6 +3897,86 @@ mod tests {
         assert!(title.chars().count() <= 60 - 2, "got: {title}");
         assert!(title.contains('…'), "got: {title}");
         assert!(title.ends_with(" · 2 of 5 "), "got: {title}");
+    }
+
+    fn hints_inner(area: Rect, app: &AppState) -> Rect {
+        let [_, body, _, _] = frame_areas(area, app);
+        let [_, _, sidebar] = body_areas(body);
+        Block::bordered().inner(sidebar_areas(sidebar)[1])
+    }
+
+    #[test]
+    fn hover_scroll_reveals_the_full_usage_and_leaves_other_rows_alone() {
+        let mut app = AppState::new([1; 32], vec!["general".into()], "general");
+        let area = Rect::new(0, 0, 100, 40);
+        let inner = hints_inner(area, &app);
+        let index = command_catalog()
+            .iter()
+            .position(|command| command.syntax.starts_with("/maxsize "))
+            .unwrap();
+        let target = command_hint_at(area, &app, inner.x, inner.y + index as u16).unwrap();
+        app.set_hint_hover(Some(target));
+        let initial = render_to_buffer(&app, area.width, area.height);
+        let mut seen = String::new();
+        for _ in 0..(target.1 + 4) {
+            let buffer = render_to_buffer(&app, area.width, area.height);
+            let row = cells(&buffer, inner.y + index as u16, inner.x, inner.width);
+            seen.push_str(&row);
+            assert_eq!(
+                cells(&buffer, inner.y + 1, inner.x, inner.width),
+                cells(&initial, inner.y + 1, inner.x, inner.width)
+            );
+            app.tick_hint_hover();
+        }
+        assert!(
+            seen.contains("off|default]"),
+            "the formerly clipped end must be readable"
+        );
+        app.set_hint_hover(None);
+        assert_eq!(render_to_buffer(&app, area.width, area.height), initial);
+    }
+
+    #[test]
+    fn hint_hit_testing_excludes_borders_short_rows_and_overlays() {
+        let mut app = AppState::new([1; 32], vec!["general".into()], "general");
+        let area = Rect::new(0, 0, 100, 40);
+        let inner = hints_inner(area, &app);
+        assert!(command_hint_at(area, &app, inner.x, inner.y + 3).is_some());
+        assert_eq!(command_hint_at(area, &app, inner.x, inner.y + 1), None); // /invite fits
+        assert_eq!(command_hint_at(area, &app, inner.x - 1, inner.y + 3), None);
+        assert_eq!(
+            command_hint_at(area, &app, inner.right(), inner.y + 3),
+            None
+        );
+        assert_eq!(command_hint_at(area, &app, inner.x, inner.y - 1), None);
+        assert_eq!(command_hint_at(area, &app, inner.x, inner.bottom()), None);
+        open_switcher(&mut app);
+        assert_eq!(command_hint_at(area, &app, inner.x, inner.y + 3), None);
+    }
+
+    #[test]
+    fn hint_hit_testing_tracks_small_screens_and_multiline_composition() {
+        let mut app = AppState::new([1; 32], vec!["general".into()], "general");
+        for input in ["", "one\ntwo\nthree"] {
+            app.active_mut().input = input.into();
+            for width in [1, 20, 40, 80, 120] {
+                for height in [1, 5, 12, 24, 40] {
+                    let area = Rect::new(0, 0, width, height);
+                    let inner = hints_inner(area, &app);
+                    let buffer = render_to_buffer(&app, width, height);
+                    for row in 0..height {
+                        if let Some((index, overflow)) = command_hint_at(area, &app, inner.x, row) {
+                            assert!(overflow > 0);
+                            assert_eq!(row, inner.y + index as u16);
+                            assert!(
+                                cells(&buffer, row, inner.x, inner.width)
+                                    .starts_with(&command_catalog()[index].syntax[..1])
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

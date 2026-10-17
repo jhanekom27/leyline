@@ -46,7 +46,11 @@ use std::time::Duration;
 
 use anyhow::Context;
 use arboard::Clipboard;
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseEventKind,
+};
 use crossterm::execute;
 use iroh_tickets::Ticket;
 use tokio::sync::mpsc;
@@ -188,6 +192,13 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut terminal = ratatui::init();
+    // ratatui's hook restores raw/alternate-screen modes. Stop mouse
+    // reporting first, so a panic cannot leave the shell capturing input.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = write_mouse_reporting(&mut std::io::stdout(), false);
+        previous_hook(info);
+    }));
     // Bracketed paste lets a terminal paste arrive as one `Event::Paste`
     // instead of a burst of individual key events -- see
     // `AppState::paste_text` for why that matters. Best-effort: if the
@@ -206,6 +217,50 @@ async fn main() -> anyhow::Result<()> {
         Ok(Some(ticket)) => restart_for_pairing(&dirs, &ticket),
         Ok(None) => Ok(()),
         Err(err) => Err(err),
+    }
+}
+
+/// Mouse reporting follows the hints panel and is restored on every
+/// return path (including draw or event-stream errors).
+struct MouseReporting<W: Write> {
+    writer: W,
+    enabled: bool,
+}
+
+fn write_mouse_reporting(writer: &mut impl Write, enabled: bool) -> std::io::Result<()> {
+    if enabled {
+        execute!(writer, EnableMouseCapture, EnableFocusChange)
+    } else {
+        execute!(writer, DisableFocusChange, DisableMouseCapture)
+    }
+}
+
+impl<W: Write> MouseReporting<W> {
+    fn new(writer: W) -> Self {
+        Self {
+            writer,
+            enabled: false,
+        }
+    }
+
+    fn update(&mut self, enabled: bool) -> std::io::Result<()> {
+        if self.enabled != enabled {
+            // Set before writing so Drop also cleans up a partial enable.
+            if enabled {
+                self.enabled = true;
+            }
+            write_mouse_reporting(&mut self.writer, enabled)?;
+            self.enabled = enabled;
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> Drop for MouseReporting<W> {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = write_mouse_reporting(&mut self.writer, false);
+        }
     }
 }
 
@@ -665,6 +720,7 @@ async fn run(
 
     let mut term_events = TermEvents::new();
     let mut tick = interval(Duration::from_millis(250));
+    let mut hint_tick = interval(Duration::from_millis(174));
     let mut history_heartbeat = interval(HISTORY_ANNOUNCE_INTERVAL);
     // Reports for `/search`'s background on-disk scans (see search.rs and
     // `InputAction::Search`) -- kept separate from `net_rx`/`NetEvent`
@@ -690,9 +746,17 @@ async fn run(
     let mut sync_publish_scan_in_flight = false;
     let mut sync_publish_tick = interval(Duration::from_secs(1));
     let mut dirty = true;
+    let mut mouse_reporting = MouseReporting::new(std::io::stdout());
+    let mut mouse_position = None;
 
     while !app.should_quit {
+        mouse_reporting.update(app.show_hints)?;
         if dirty {
+            let size = terminal.size()?;
+            let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+            let target = mouse_position
+                .and_then(|(column, row)| ui::command_hint_at(area, &app, column, row));
+            app.set_hint_hover(target);
             terminal.draw(|frame| ui::render(frame, &app))?;
             dirty = false;
         }
@@ -1091,6 +1155,26 @@ async fn run(
                             None => {}
                         }
                         dirty = true;
+                    }
+                    Event::Mouse(mouse) => {
+                        mouse_position = Some((mouse.column, mouse.row));
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                                let code = if mouse.kind == MouseEventKind::ScrollUp { KeyCode::Up } else { KeyCode::Down };
+                                app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+                                dirty = true;
+                            }
+                            MouseEventKind::Moved => {
+                                let size = terminal.size()?;
+                                let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+                                dirty |= app.set_hint_hover(ui::command_hint_at(area, &app, mouse.column, mouse.row));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Event::FocusLost => {
+                        mouse_position = None;
+                        dirty |= app.set_hint_hover(None);
                     }
                     Event::Resize(_, _) => dirty = true,
                     Event::Paste(text) => {
@@ -1774,6 +1858,9 @@ async fn run(
                 }
                 dirty = true;
             }
+            _ = hint_tick.tick() => {
+                dirty |= app.tick_hint_hover();
+            }
             _ = tick.tick() => {
                 replay_paused_sync_events(&mut paused_sync_events, &app, &replay_tx);
             }
@@ -1918,6 +2005,35 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
+
+    #[test]
+    fn mouse_reporting_is_disabled_when_its_owner_returns() {
+        let mut bytes = Vec::new();
+        {
+            let mut mode = MouseReporting::new(&mut bytes);
+            mode.update(true).unwrap();
+            mode.update(true).unwrap(); // redraws must not re-enable modes
+        }
+        let mut expected = Vec::new();
+        write_mouse_reporting(&mut expected, true).unwrap();
+        write_mouse_reporting(&mut expected, false).unwrap();
+        assert_eq!(bytes, expected);
+        assert!(String::from_utf8(bytes).unwrap().ends_with("\x1b[?1000l"));
+    }
+
+    #[test]
+    fn hiding_hints_disables_reporting_without_waiting_for_exit() {
+        let mut bytes = Vec::new();
+        {
+            let mut mode = MouseReporting::new(&mut bytes);
+            mode.update(true).unwrap();
+            mode.update(false).unwrap();
+        }
+        let mut expected = Vec::new();
+        write_mouse_reporting(&mut expected, true).unwrap();
+        write_mouse_reporting(&mut expected, false).unwrap();
+        assert_eq!(bytes, expected);
+    }
 
     #[test]
     fn remove_path_deletes_an_existing_file() {

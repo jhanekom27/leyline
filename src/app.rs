@@ -34,6 +34,22 @@ mod files_overlay;
 mod net_events;
 mod replies;
 
+/// A clipped command row and its timer-driven horizontal scroll position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HintHover {
+    row: usize,
+    overflow: usize,
+    tick: usize,
+}
+
+impl HintHover {
+    fn offset(self) -> usize {
+        // Start on the next 174 ms tick, then advance one cell per tick,
+        // followed by a 1.2 s pause at the end before repeating.
+        self.tick.min(self.overflow)
+    }
+}
+
 /// Cap on in-memory scrollback per channel, per concept.md's guidance on
 /// bounding render/memory cost in a long-lived session.
 const MAX_SCROLLBACK: usize = 500;
@@ -210,7 +226,7 @@ const COMMANDS: &[CommandDefinition] = &[
         syntax: "/hints",
         input: "/hints",
         aliases: &[],
-        description: "Toggle the command hints panel",
+        description: "Toggle command hints and hover reporting",
     },
     CommandDefinition {
         syntax: "/bell",
@@ -1010,6 +1026,7 @@ pub struct AppState {
     /// teaches new users; in-memory only, like `scroll`, not persisted
     /// across restarts.
     pub show_hints: bool,
+    hint_hover: Option<HintHover>,
     /// Whether an incoming message rings the terminal bell -- toggled via
     /// `/bell` (`run_bell`). Unlike `show_hints`, this preference is
     /// persisted across restarts (see `crate::settings::Settings`);
@@ -1212,6 +1229,7 @@ impl AppState {
             active,
             should_quit: false,
             show_hints: true,
+            hint_hover: None,
             bell_enabled: true,
             petnames: HashMap::new(),
             nicknames: HashMap::new(),
@@ -2764,9 +2782,56 @@ impl AppState {
              first: Enter sends it, Backspace on an empty input unstages, Esc clears), \
              Ctrl+R reply (\u{2191}/\u{2193} pick, \
              Enter confirm), Ctrl+T thread (\u{2191}/\u{2193} pick, Enter confirm), \
-             Up/Down scroll, Esc/Ctrl+C quit"
+             Up/Down scroll, Esc/Ctrl+C quit -- hover clipped command hints to read them; \
+             /hints also toggles mouse reporting (hold Shift, or Option in iTerm2, to select text)"
         ));
         None
+    }
+
+    /// Mouse hover is suppressed while another view owns input.
+    pub fn can_hover_hints(&self) -> bool {
+        self.show_hints
+            && self.command_picker.is_none()
+            && self.switching.is_none()
+            && self.picking_file.is_none()
+            && self.viewing_files.is_none()
+            && self.pending_redeem.is_none()
+            && self.picking_reply.is_none()
+            && self.picking_thread.is_none()
+    }
+
+    /// Applies the row and overflow measured by the read-only UI layout.
+    /// Moving within the same row keeps the animation running.
+    pub fn set_hint_hover(&mut self, target: Option<(usize, usize)>) -> bool {
+        let target = target.filter(|(_, overflow)| *overflow > 0 && self.can_hover_hints());
+        if self.hint_hover.map(|hover| (hover.row, hover.overflow)) == target {
+            return false;
+        }
+        self.hint_hover = target.map(|(row, overflow)| HintHover {
+            row,
+            overflow,
+            tick: 0,
+        });
+        true
+    }
+
+    pub fn hint_scroll(&self, row: usize) -> usize {
+        self.hint_hover
+            .filter(|hover| hover.row == row)
+            .map_or(0, HintHover::offset)
+    }
+
+    /// Advances only an active marquee; returns whether the frame changed.
+    pub fn tick_hint_hover(&mut self) -> bool {
+        if !self.can_hover_hints() {
+            return self.set_hint_hover(None);
+        }
+        let Some(hover) = &mut self.hint_hover else {
+            return false;
+        };
+        let previous = hover.offset();
+        hover.tick = (hover.tick + 1) % (hover.overflow + 8);
+        previous != hover.offset()
     }
 
     /// Handles `/hints`: toggles the sidebar's command hints panel (see
@@ -2775,6 +2840,7 @@ impl AppState {
     /// commands that require the caller to do network I/O.
     fn run_hints(&mut self) -> Option<InputAction> {
         self.show_hints = !self.show_hints;
+        self.set_hint_hover(None);
         let state = if self.show_hints { "shown" } else { "hidden" };
         self.push_system(format!("command hints {state}"));
         None
@@ -5587,6 +5653,72 @@ mod tests {
         let last = as_system(app.active().messages.back().unwrap());
         assert!(last.contains("/files"), "got: {last}");
         assert!(last.contains("Ctrl+O"), "got: {last}");
+    }
+
+    #[test]
+    fn hint_hover_pauses_scrolls_to_the_end_and_repeats() {
+        let mut app = app();
+        assert!(app.set_hint_hover(Some((12, 4))));
+        assert_eq!(app.hint_scroll(12), 0);
+        for offset in 1..=4 {
+            assert!(app.tick_hint_hover());
+            assert_eq!(app.hint_scroll(12), offset);
+            assert_eq!(app.hint_scroll(11), 0);
+        }
+        for _ in 0..7 {
+            assert!(!app.tick_hint_hover());
+            assert_eq!(app.hint_scroll(12), 4);
+        }
+        assert!(app.tick_hint_hover());
+        assert_eq!(app.hint_scroll(12), 0);
+    }
+
+    #[test]
+    fn hint_hover_resets_only_when_the_target_or_width_changes() {
+        let mut app = app();
+        app.set_hint_hover(Some((12, 40)));
+        for _ in 0..8 {
+            app.tick_hint_hover();
+        }
+        assert!(!app.set_hint_hover(Some((12, 40))));
+        assert_eq!(app.hint_scroll(12), 8);
+        assert!(app.set_hint_hover(Some((12, 20))));
+        assert_eq!(app.hint_scroll(12), 0);
+        for _ in 0..8 {
+            app.tick_hint_hover();
+        }
+        assert!(app.set_hint_hover(Some((10, 20))));
+        assert_eq!(app.hint_scroll(12), 0);
+        assert!(app.set_hint_hover(None));
+        assert!(!app.tick_hint_hover());
+        assert!(!app.set_hint_hover(Some((1, 0))));
+    }
+
+    #[test]
+    fn hiding_hints_and_opening_an_overlay_cancel_hover() {
+        let mut app = app();
+        app.set_hint_hover(Some((12, 40)));
+        submit(&mut app, "/hints");
+        assert!(!app.can_hover_hints());
+        assert!(app.hint_hover.is_none());
+        assert!(!app.set_hint_hover(Some((12, 40))));
+        submit(&mut app, "/hints");
+        app.set_hint_hover(Some((12, 40)));
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(!app.can_hover_hints());
+        assert!(app.tick_hint_hover());
+        assert!(app.hint_hover.is_none());
+    }
+
+    #[test]
+    fn opening_the_command_picker_cancels_hint_hover() {
+        let mut app = app();
+        app.set_hint_hover(Some((12, 40)));
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert!(app.command_picker.is_some());
+        assert!(!app.can_hover_hints());
+        assert!(app.tick_hint_hover());
+        assert!(app.hint_hover.is_none());
     }
 
     #[test]
