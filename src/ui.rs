@@ -15,7 +15,9 @@ use ratatui::widgets::{
 };
 use textwrap::wrap;
 
-use crate::app::{AppState, Channel, FileOffer, FilesNotice, SharedFile, TranscriptLine, hex_id};
+use crate::app::{
+    AppState, Channel, FileOffer, FilesNotice, SharedFile, TranscriptLine, command_catalog, hex_id,
+};
 use crate::files::{StagedAttachment, human_size};
 use crate::hyperlink;
 use crate::markdown;
@@ -65,6 +67,10 @@ const NAV_MARKER_WIDTH: usize = 2;
 const SWITCHER_WIDTH: u16 = 44;
 /// Most matches the jump-to overlay shows at once before it scrolls.
 const SWITCHER_MAX_ROWS: usize = 10;
+/// Width of the command picker overlay, borders included.
+const COMMAND_PICKER_WIDTH: u16 = 78;
+/// Most command-picker rows shown before it scrolls.
+const COMMAND_PICKER_ROWS: usize = 18;
 
 /// Width of the file picker overlay (`render_picker`), borders included.
 const PICKER_WIDTH: u16 = 78;
@@ -83,40 +89,6 @@ const PICKER_TIME_WIDTH: usize = 12;
 const FILES_WIDTH: u16 = 92;
 /// Rows of files the overlay lists at once before it scrolls.
 const FILES_ROWS: usize = 14;
-
-/// Short usage reminders for every slash command, shown in the sidebar's
-/// commands panel (`render_hints`) when `AppState::show_hints` is on.
-/// Kept in sync with the Commands table in README.md and `run_help`'s
-/// system notice.
-const COMMAND_HINTS: &[&str] = &[
-    "/join <name|ticket>",
-    "/invite",
-    "/msg <alias|hex> [text]",
-    "/leave [channel]",
-    "/rename <name>",
-    "/who",
-    "/send [path]",
-    "/save [hash]",
-    "/folder [path]",
-    "/maxsize [size|off]",
-    "/autosave [on|off|limit <size|default>]",
-    "/outbox [on|off]",
-    "/sync [receive-only|publish-and-receive|off|pause|resume|include <glob>|exclude <glob>]",
-    "/activity",
-    "/conflicts [local|remote|both <path>]",
-    "/trash [restore <path>|purge]",
-    "/files",
-    "/paste (or Ctrl+V)",
-    "/alias <hex> <name>",
-    "/nick <name>",
-    "/search <term> (/s)",
-    "/reply [text]",
-    "/thread (Ctrl+T pick)",
-    "/hints",
-    "/bell",
-    "/version",
-    "/help",
-];
 
 /// Curated, dark-background-friendly colors used to visually separate
 /// senders -- see `user_color`.
@@ -148,6 +120,7 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     // wins over the input box's. At most one is ever open: each owns every
     // key while it is.
     render_switcher(frame, app);
+    render_command_picker(frame, app);
     render_picker(frame, app);
     render_files(frame, app);
 }
@@ -412,6 +385,14 @@ fn render_switcher(frame: &mut Frame, app: &AppState) {
     render_scroll_indicator(frame, track, start, matches.len(), visible_rows);
 }
 
+fn command_picker_area(screen: Rect, matches: usize) -> Rect {
+    overlay_area(
+        screen,
+        COMMAND_PICKER_WIDTH,
+        matches.clamp(1, COMMAND_PICKER_ROWS),
+    )
+}
+
 /// Where the switcher box goes on a `screen`-sized frame when `matches`
 /// channels are listed: `SWITCHER_WIDTH` wide, tall enough for up to
 /// `SWITCHER_MAX_ROWS` matches (one row even with none, for the
@@ -419,6 +400,94 @@ fn render_switcher(frame: &mut Frame, app: &AppState) {
 /// `overlay_area`.
 fn switcher_area(screen: Rect, matches: usize) -> Rect {
     overlay_area(screen, SWITCHER_WIDTH, matches.clamp(1, SWITCHER_MAX_ROWS))
+}
+/// The slash-command picker opened with `Ctrl+K`. It mirrors the switcher's
+/// modal behavior, but rows show each command's syntax and description.
+fn render_command_picker(frame: &mut Frame, app: &AppState) {
+    let Some(picker) = &app.command_picker else {
+        return;
+    };
+    let matches = app.command_picker_matches();
+    let highlighted = app.command_picker_highlight();
+    let area = command_picker_area(frame.area(), matches.len());
+    let block = Block::bordered()
+        .title("commands")
+        .title_bottom("↑/↓ move · Enter run · Esc cancel")
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let [query_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    render_filter_row(frame, query_area, &picker.query);
+
+    if matches.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                " no matching commands",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )),
+            list_area,
+        );
+        return;
+    }
+
+    let visible_rows = (list_area.height as usize).max(1);
+    let highlighted_row = matches
+        .iter()
+        .position(|&index| Some(index) == highlighted)
+        .unwrap_or(0);
+    let start = nav_scroll_offset(matches.len(), visible_rows, highlighted_row);
+    let syntax_width = (list_area.width as usize / 2).max(1);
+    let items = matches
+        .iter()
+        .skip(start)
+        .take(visible_rows)
+        .map(|&index| {
+            let command = &command_catalog()[index];
+            let syntax_style = if Some(index) == highlighted {
+                Style::default().fg(Color::Black)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            let description_style = if Some(index) == highlighted {
+                Style::default().fg(Color::Black)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let row = Line::from(vec![
+                Span::styled(
+                    format!(
+                        " {:<syntax_width$}",
+                        truncate_chars(command.syntax, syntax_width)
+                    ),
+                    syntax_style,
+                ),
+                Span::styled(command.description, description_style),
+            ]);
+            let item = ListItem::new(row);
+            if Some(index) == highlighted {
+                item.style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                item
+            }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(items), list_area);
+    let track = Rect::new(
+        area.x,
+        list_area.y.saturating_sub(1),
+        area.width,
+        list_area.height + 2,
+    );
+    render_scroll_indicator(frame, track, start, matches.len(), visible_rows);
 }
 
 /// Where an overlay `width` wide, with room for `list_rows` rows under its
@@ -675,7 +744,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &AppState) {
         render_peers(frame, area, app);
         return;
     }
-    let hints_height = COMMAND_HINTS.len() as u16 + 2; // +2 for the block's borders
+    let hints_height = command_catalog().len() as u16 + 2; // +2 for the block's borders
     let [peers, hints] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(hints_height)]).areas(area);
     render_peers(frame, peers, app);
@@ -1356,13 +1425,13 @@ fn peer_item(app: &AppState, id: &[u8; 32]) -> ListItem<'static> {
     ]))
 }
 
-/// Renders the sidebar's command reference panel: one row per
-/// `COMMAND_HINTS` entry, showing just the bare usage -- full
+/// Renders the sidebar's command reference panel: one row per catalog entry,
+/// showing just the bare usage -- full
 /// descriptions still live in `/help`'s system notice and the README.
 fn render_hints(frame: &mut Frame, area: Rect) {
-    let items: Vec<ListItem> = COMMAND_HINTS
+    let items: Vec<ListItem> = command_catalog()
         .iter()
-        .map(|hint| ListItem::new(*hint))
+        .map(|command| ListItem::new(command.syntax))
         .collect();
     let list = List::new(items).block(
         Block::bordered()
@@ -2534,6 +2603,9 @@ mod tests {
     fn open_switcher(app: &mut AppState) {
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
     }
+    fn open_command_picker(app: &mut AppState) {
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+    }
 
     fn type_text(app: &mut AppState, text: &str) {
         for c in text.chars() {
@@ -2568,6 +2640,32 @@ mod tests {
 
         let open = render_to_rows(&app);
         assert!(open.iter().any(|row| row.contains("jump to")), "{open:#?}");
+    }
+
+    #[test]
+    fn command_picker_shows_command_syntax_and_descriptions() {
+        let mut app = app_with_every_kind();
+        open_command_picker(&mut app);
+
+        let text = render_to_rows(&app).join("\n");
+
+        assert!(text.contains("commands"), "got: {text}");
+        assert!(text.contains("/join <name|ticket>"), "got: {text}");
+        assert!(text.contains("Join or create a channel"), "got: {text}");
+    }
+    #[test]
+    fn command_picker_uses_more_rows_and_keeps_selected_text_readable() {
+        let mut app = app_with_every_kind();
+        open_command_picker(&mut app);
+
+        let screen = Rect::new(0, 0, 100, 40);
+        let area = command_picker_area(screen, app.command_picker_matches().len());
+        assert_eq!(area.height, COMMAND_PICKER_ROWS as u16 + 3);
+
+        let buffer = render_to_buffer(&app, screen.width, screen.height);
+        let selected_syntax = &buffer[(area.x + 2, area.y + 2)];
+        assert_eq!(selected_syntax.fg, Color::Black);
+        assert_eq!(selected_syntax.bg, Color::Cyan);
     }
 
     #[test]
@@ -3753,39 +3851,65 @@ mod tests {
 
     #[test]
     fn the_files_command_is_among_the_hints() {
-        assert!(COMMAND_HINTS.contains(&"/files"));
+        assert!(
+            command_catalog()
+                .iter()
+                .any(|command| command.syntax == "/files")
+        );
     }
 
     #[test]
     fn the_maxsize_command_is_among_the_hints() {
-        assert!(COMMAND_HINTS.contains(&"/maxsize [size|off]"));
+        assert!(
+            command_catalog()
+                .iter()
+                .any(|command| command.syntax.starts_with("/maxsize"))
+        );
     }
 
     #[test]
     fn the_autosave_command_is_among_the_hints() {
-        assert!(COMMAND_HINTS.contains(&"/autosave [on|off|limit <size|default>]"));
+        assert!(
+            command_catalog()
+                .iter()
+                .any(|command| command.syntax.starts_with("/autosave"))
+        );
     }
 
     #[test]
     fn the_outbox_command_is_among_the_hints() {
-        assert!(COMMAND_HINTS.contains(&"/outbox [on|off]"));
+        assert!(
+            command_catalog()
+                .iter()
+                .any(|command| command.syntax.starts_with("/outbox"))
+        );
     }
 
     #[test]
     fn the_sync_policy_command_is_among_the_hints() {
-        assert!(COMMAND_HINTS.contains(
-            &"/sync [receive-only|publish-and-receive|off|pause|resume|include <glob>|exclude <glob>]"
-        ));
+        assert!(
+            command_catalog()
+                .iter()
+                .any(|command| command.syntax.starts_with("/sync"))
+        );
     }
 
     #[test]
     fn the_sync_trash_command_is_among_the_hints() {
-        assert!(COMMAND_HINTS.contains(&"/trash [restore <path>|purge]"));
+        assert!(
+            command_catalog()
+                .iter()
+                .any(|command| command.syntax.starts_with("/trash"))
+        );
     }
 
     #[test]
     fn the_conflicts_command_is_among_the_hints() {
-        assert!(COMMAND_HINTS.contains(&"/conflicts [local|remote|both <path>]"));
+        assert!(
+            command_catalog()
+                .iter()
+                .any(|command| command.syntax.starts_with("/conflicts"))
+        );
     }
 
     #[test]

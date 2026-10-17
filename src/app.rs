@@ -38,6 +38,204 @@ mod replies;
 /// bounding render/memory cost in a long-lived session.
 const MAX_SCROLLBACK: usize = 500;
 
+/// One user-facing slash command. This catalog is the shared source for the
+/// command picker and sidebar hints; `input` is what selecting it places in
+/// the compose draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandDefinition {
+    pub syntax: &'static str,
+    pub input: &'static str,
+    pub aliases: &'static [&'static str],
+    pub description: &'static str,
+}
+
+const COMMANDS: &[CommandDefinition] = &[
+    CommandDefinition {
+        syntax: "/join <name|ticket>",
+        input: "/join ",
+        aliases: &[],
+        description: "Join or create a channel",
+    },
+    CommandDefinition {
+        syntax: "/invite",
+        input: "/invite",
+        aliases: &[],
+        description: "Show an invite for this channel",
+    },
+    CommandDefinition {
+        syntax: "/pair [ticket]",
+        input: "/pair ",
+        aliases: &[],
+        description: "Pair a device or show a pairing ticket",
+    },
+    CommandDefinition {
+        syntax: "/forget-device <hex-prefix>",
+        input: "/forget-device ",
+        aliases: &[],
+        description: "Forget a paired device",
+    },
+    CommandDefinition {
+        syntax: "/msg <peer> [text]",
+        input: "/msg ",
+        aliases: &[],
+        description: "Start a private channel message",
+    },
+    CommandDefinition {
+        syntax: "/dm <peer> [text]",
+        input: "/dm ",
+        aliases: &[],
+        description: "Start a direct peer conversation",
+    },
+    CommandDefinition {
+        syntax: "/alias <hex-prefix> <name>",
+        input: "/alias ",
+        aliases: &[],
+        description: "Set a local name for a peer",
+    },
+    CommandDefinition {
+        syntax: "/nick <name>",
+        input: "/nick ",
+        aliases: &[],
+        description: "Set your broadcast display name",
+    },
+    CommandDefinition {
+        syntax: "/leave [channel]",
+        input: "/leave",
+        aliases: &[],
+        description: "Leave a channel",
+    },
+    CommandDefinition {
+        syntax: "/rename [name]",
+        input: "/rename ",
+        aliases: &[],
+        description: "Set this channel's local display name",
+    },
+    CommandDefinition {
+        syntax: "/who",
+        input: "/who",
+        aliases: &[],
+        description: "List channel peers",
+    },
+    CommandDefinition {
+        syntax: "/send [path]",
+        input: "/send",
+        aliases: &[],
+        description: "Pick or share a file",
+    },
+    CommandDefinition {
+        syntax: "/save [hash-prefix]",
+        input: "/save",
+        aliases: &[],
+        description: "Download a shared file",
+    },
+    CommandDefinition {
+        syntax: "/folder [path]",
+        input: "/folder",
+        aliases: &[],
+        description: "Show or set the files folder",
+    },
+    CommandDefinition {
+        syntax: "/maxsize [size|off|default]",
+        input: "/maxsize",
+        aliases: &[],
+        description: "Show or set the file size limit",
+    },
+    CommandDefinition {
+        syntax: "/autosave [on|off|limit]",
+        input: "/autosave",
+        aliases: &[],
+        description: "Configure automatic file saving",
+    },
+    CommandDefinition {
+        syntax: "/outbox [on|off]",
+        input: "/outbox",
+        aliases: &[],
+        description: "Configure the watched send folder",
+    },
+    CommandDefinition {
+        syntax: "/sync [options]",
+        input: "/sync",
+        aliases: &[],
+        description: "Configure folder synchronization",
+    },
+    CommandDefinition {
+        syntax: "/activity",
+        input: "/activity",
+        aliases: &[],
+        description: "Show recent sync activity",
+    },
+    CommandDefinition {
+        syntax: "/conflicts [resolution]",
+        input: "/conflicts",
+        aliases: &[],
+        description: "List or resolve sync conflicts",
+    },
+    CommandDefinition {
+        syntax: "/trash [restore|purge]",
+        input: "/trash",
+        aliases: &[],
+        description: "Manage recoverable sync deletes",
+    },
+    CommandDefinition {
+        syntax: "/files",
+        input: "/files",
+        aliases: &[],
+        description: "Browse files shared in this channel",
+    },
+    CommandDefinition {
+        syntax: "/paste",
+        input: "/paste",
+        aliases: &[],
+        description: "Share the clipboard",
+    },
+    CommandDefinition {
+        syntax: "/search <term>",
+        input: "/search ",
+        aliases: &["/s"],
+        description: "Search channel messages",
+    },
+    CommandDefinition {
+        syntax: "/reply [text]",
+        input: "/reply",
+        aliases: &[],
+        description: "Reply to the latest message",
+    },
+    CommandDefinition {
+        syntax: "/thread",
+        input: "/thread",
+        aliases: &[],
+        description: "View the latest reply thread",
+    },
+    CommandDefinition {
+        syntax: "/hints",
+        input: "/hints",
+        aliases: &[],
+        description: "Toggle the command hints panel",
+    },
+    CommandDefinition {
+        syntax: "/bell",
+        input: "/bell",
+        aliases: &[],
+        description: "Toggle the message bell",
+    },
+    CommandDefinition {
+        syntax: "/version",
+        input: "/version",
+        aliases: &[],
+        description: "Show this build's version",
+    },
+    CommandDefinition {
+        syntax: "/help",
+        input: "/help",
+        aliases: &[],
+        description: "Show command and keybinding help",
+    },
+];
+
+pub fn command_catalog() -> &'static [CommandDefinition] {
+    COMMANDS
+}
+
 /// A line in a channel's transcript: either a real chat message or a
 /// local-only notice (invite output, command errors). System lines never
 /// travel over the network -- see message.rs for the wire format. Named
@@ -175,6 +373,14 @@ pub struct Switcher {
     /// (`AppState::edit_switcher_query`) and clamped on every read
     /// (`AppState::switcher_highlight`), since the matches can change under
     /// an open overlay -- a peer gets renamed, a channel joins.
+    selected: usize,
+}
+
+/// The slash-command picker opened with `Ctrl+K`. Entries come from
+/// `command_catalog`, so only its query and highlighted position are state.
+#[derive(Debug, Default)]
+pub struct CommandPicker {
+    pub query: String,
     selected: usize,
 }
 
@@ -465,7 +671,7 @@ impl Channel {
     /// Char-index bounds of the line containing the cursor: the nearest
     /// `\n` before/after it (exclusive of the newline itself), or the
     /// buffer's edges if there is none. Multi-line input redefines "line"
-    /// for `Home`/`End`/`Ctrl+A`/`Ctrl+E`/`Ctrl+U`/`Ctrl+K` from "the whole
+    /// for `Home`/`End`/`Ctrl+A`/`Ctrl+E`/`Ctrl+U` from "the whole
     /// buffer" to this -- matching standard multi-line editor behavior --
     /// while `Left`/`Right`/`Backspace`/`Delete`/`Ctrl+W` stay simple
     /// char-index operations that already cross a `\n` boundary like any
@@ -535,14 +741,6 @@ impl Channel {
         let end = self.byte_index(self.cursor);
         self.input.replace_range(start..end, "");
         self.cursor = line_start;
-    }
-
-    /// Ctrl+K: deletes from the cursor to the end of the current line.
-    fn delete_to_end(&mut self) {
-        let (_, line_end) = self.current_line_bounds();
-        let start = self.byte_index(self.cursor);
-        let end = self.byte_index(line_end);
-        self.input.replace_range(start..end, "");
     }
 
     /// Ctrl+W: deletes the word immediately before the cursor.
@@ -899,6 +1097,9 @@ pub struct AppState {
     /// checks this alongside `picking_reply`/`picking_thread`, before
     /// normal typing/editing, to dispatch into `handle_switcher_key`.
     pub switching: Option<Switcher>,
+    /// The open slash-command picker (`Ctrl+K`). It owns keyboard input like
+    /// the conversation switcher and never invokes a command directly.
+    pub command_picker: Option<CommandPicker>,
     /// The open file picker (a bare `/send`, see `run_send`), if any. A modal
     /// mode like `switching`: `handle_key` hands it every key, a paste
     /// filters it, and `is_composing` is false while it's open.
@@ -1025,6 +1226,7 @@ impl AppState {
             picking_reply: None,
             picking_thread: None,
             switching: None,
+            command_picker: None,
             replying_to: None,
             pending_redeem: None,
             restart_with_ticket: None,
@@ -1651,6 +1853,9 @@ impl AppState {
             self.handle_switcher_key(key);
             return None;
         }
+        if self.command_picker.is_some() {
+            return self.handle_command_picker_key(key);
+        }
         if self.picking_file.is_some() {
             return self.handle_picker_key(key);
         }
@@ -1680,7 +1885,7 @@ impl AppState {
             KeyCode::Char('a') if ctrl => self.active_mut().move_home(),
             KeyCode::Char('e') if ctrl => self.active_mut().move_end(),
             KeyCode::Char('u') if ctrl => self.active_mut().delete_to_start(),
-            KeyCode::Char('k') if ctrl => self.active_mut().delete_to_end(),
+            KeyCode::Char('k') if ctrl => self.start_command_picker(),
             KeyCode::Char('w') if ctrl => self.active_mut().delete_word_backward(),
             // Inserts a literal newline instead of submitting. Ctrl+J is
             // the plain ASCII linefeed byte, so every terminal reports it
@@ -1919,6 +2124,94 @@ impl AppState {
             self.active = index;
             self.finish_activating_channel();
         }
+    }
+
+    fn start_command_picker(&mut self) {
+        self.command_picker = Some(CommandPicker::default());
+    }
+
+    fn handle_command_picker_key(&mut self, key: KeyEvent) -> Option<InputAction> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('c') if ctrl => self.should_quit = true,
+            KeyCode::Esc => self.command_picker = None,
+            KeyCode::Enter => return self.confirm_command_picker(),
+            KeyCode::Up => self.move_command_picker(-1),
+            KeyCode::Down => self.move_command_picker(1),
+            KeyCode::Backspace => self.edit_command_picker_query(|query| {
+                query.pop();
+            }),
+            KeyCode::Char(c) if !ctrl => self.edit_command_picker_query(|query| query.push(c)),
+            _ => {}
+        }
+        None
+    }
+
+    fn edit_command_picker_query(&mut self, edit: impl FnOnce(&mut String)) {
+        if let Some(picker) = &mut self.command_picker {
+            edit(&mut picker.query);
+            picker.selected = 0;
+        }
+    }
+
+    pub fn command_picker_matches(&self) -> Vec<usize> {
+        let Some(picker) = &self.command_picker else {
+            return Vec::new();
+        };
+        let query = picker.query.to_lowercase();
+        let command_name_matches = command_catalog()
+            .iter()
+            .enumerate()
+            .filter(|(_, command)| {
+                command.syntax.to_lowercase().contains(&query)
+                    || command
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.to_lowercase().contains(&query))
+            })
+            .map(|(index, _)| index);
+        let description_matches = command_catalog()
+            .iter()
+            .enumerate()
+            .filter(|(_, command)| {
+                !command.syntax.to_lowercase().contains(&query)
+                    && !command
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.to_lowercase().contains(&query))
+                    && command.description.to_lowercase().contains(&query)
+            })
+            .map(|(index, _)| index);
+        command_name_matches.chain(description_matches).collect()
+    }
+
+    pub fn command_picker_highlight(&self) -> Option<usize> {
+        let picker = self.command_picker.as_ref()?;
+        let matches = self.command_picker_matches();
+        let last = matches.len().checked_sub(1)?;
+        Some(matches[picker.selected.min(last)])
+    }
+
+    fn move_command_picker(&mut self, delta: isize) {
+        let Some(last) = self.command_picker_matches().len().checked_sub(1) else {
+            return;
+        };
+        if let Some(picker) = &mut self.command_picker {
+            let current = picker.selected.min(last) as isize;
+            picker.selected = (current + delta).clamp(0, last as isize) as usize;
+        }
+    }
+
+    fn confirm_command_picker(&mut self) -> Option<InputAction> {
+        let Some(index) = self.command_picker_highlight() else {
+            return None;
+        };
+        let command = command_catalog()[index]
+            .input
+            .trim_start_matches('/')
+            .trim();
+        self.command_picker = None;
+        self.run_command(command)
     }
 
     /// Opens the file picker -- a bare `/send` -- for the channel that is
@@ -2464,6 +2757,7 @@ impl AppState {
              Enter save, Ctrl+O open one already saved (never a program or script), Esc close) -- \
              keys: Tab/Shift+Tab switch channels, \
              Ctrl+P jump to a channel (type to filter, \u{2191}/\u{2193} pick, Enter confirm), \
+             Ctrl+K browse slash commands (type to filter, \u{2191}/\u{2193} pick, Enter run), \
              a bare /send opens a file picker (type to filter, \u{2191}/\u{2193} pick, Space mark, \
              Enter open a folder or stage the marked files, Backspace up a level, Esc cancel), \
              Alt+Enter/Ctrl+J newline, Ctrl+V share the clipboard (a file or image is staged \
@@ -3933,6 +4227,7 @@ impl AppState {
             && self.picking_reply.is_none()
             && self.picking_thread.is_none()
             && self.switching.is_none()
+            && self.command_picker.is_none()
             && self.picking_file.is_none()
             && self.viewing_files.is_none()
     }
@@ -3953,6 +4248,12 @@ impl AppState {
         // so line breaks and other control characters are dropped.
         if self.switching.is_some() {
             self.edit_switcher_query(|query| {
+                query.extend(text.chars().filter(|c| !c.is_control()));
+            });
+            return;
+        }
+        if self.command_picker.is_some() {
+            self.edit_command_picker_query(|query| {
                 query.extend(text.chars().filter(|c| !c.is_control()));
             });
             return;
@@ -4231,16 +4532,17 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_k_deletes_only_to_the_end_of_the_current_line() {
+    fn ctrl_k_keeps_a_multiline_draft_unchanged_while_opening_the_picker() {
         let mut app = app();
         app.paste_text("first\nsecond");
         app.handle_key(key(KeyCode::Home)); // start of "second"
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         assert_eq!(
             app.active().input,
-            "first\n",
-            "Ctrl+K must not touch the previous line"
+            "first\nsecond",
+            "opening the picker must not change the draft"
         );
+        assert!(app.command_picker.is_some());
     }
 
     #[test]
@@ -5000,16 +5302,47 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_k_deletes_to_end() {
+    fn ctrl_k_opens_the_command_picker_without_changing_the_draft() {
         let mut app = app();
         for c in ['h', 'i', '!'] {
             app.handle_key(key(KeyCode::Char(c)));
         }
-        app.handle_key(key(KeyCode::Home));
-        app.handle_key(key(KeyCode::Right));
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
-        assert_eq!(app.active().input, "h");
-        assert_eq!(app.active().cursor, 1);
+        assert!(app.command_picker.is_some());
+        assert_eq!(app.active().input, "hi!");
+        assert!(!app.is_composing());
+    }
+
+    #[test]
+    fn command_picker_prioritizes_syntax_and_alias_matches_over_descriptions() {
+        let mut app = app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        type_text(&mut app, "file");
+        assert_eq!(
+            app.command_picker_matches().first(),
+            Some(&21),
+            "/files must precede commands that only mention files in their descriptions"
+        );
+
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        type_text(&mut app, "/s");
+        assert!(app.command_picker_matches().contains(&23));
+    }
+
+    #[test]
+    fn command_picker_enter_executes_the_selected_command_and_preserves_the_draft() {
+        let mut app = app();
+        type_text(&mut app, "old draft");
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        type_text(&mut app, "invite");
+
+        let action = app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(action, Some(InputAction::Invite(channel)) if channel == "general"));
+        assert!(app.command_picker.is_none());
+        assert_eq!(app.active().input, "old draft");
+        assert_eq!(app.active().cursor, 9);
     }
 
     #[test]

@@ -80,7 +80,9 @@ marks another with unread messages. Sync-enabled channels show `S`, `~`,
 panel scrolls once the list is
 taller than the terminal. Switch between channels with `Tab` / `Shift+Tab`,
 which step down / up the panel and wrap around, or press `Ctrl+P` to jump
-straight to one by typing part of its name.
+straight to one by typing part of its name. Press `Ctrl+K` to browse or filter
+slash commands by syntax or description; command-name and alias matches appear
+before description-only matches, and `Enter` runs the selected command.
 
 Your identity now persists in your OS config directory, keyed by your `$HOME`.
 Chat history persists the same way in your OS data directory -- one log
@@ -118,7 +120,7 @@ HOME=/tmp/leyline-b CARGO_HOME="$REAL_CARGO_HOME" cargo run
 | `End` / `Ctrl+E` | Jump to the end of the current line |
 | `Backspace` / `Delete` | Delete the character before / at the cursor (on an empty input, `Backspace` instead takes the most recently staged attachment back out -- see `Ctrl+V`) |
 | `Ctrl+U` | Delete from the start of the current line to the cursor |
-| `Ctrl+K` | Delete from the cursor to the end of the current line |
+| `Ctrl+K` | Open the command picker: type to filter slash commands by syntax, alias, or description (syntax and aliases rank first); `Up` / `Down` choose one, `Enter` runs it without changing the current draft, and `Esc` cancels |
 | `Ctrl+W` | Delete the word before the cursor |
 | `Alt+Enter` / `Ctrl+J` | Insert a newline in the message box without sending, for a longer, spaced-out message -- the box grows to fit (and scrolls, past a handful of lines) |
 | `Enter` | Send the composed message, or run a `/` command. With attachments staged (see `Ctrl+V`) it sends them all instead, the typed text becoming the caption of the first -- but a `/` command still runs as a command and leaves them staged |
@@ -130,7 +132,7 @@ HOME=/tmp/leyline-b CARGO_HOME="$REAL_CARGO_HOME" cargo run
 | `Up` / `Down` | Scroll the message history (or move the highlight while picking a reply or thread target, see `Ctrl+R`/`Ctrl+T`) |
 | `Tab` / `Shift+Tab` | Switch to the next / previous channel in the left-hand panel (group channels first, then conversations), wrapping around |
 | `Ctrl+P` | Jump to a channel or conversation by name -- type to narrow the list to names containing what you typed (case-insensitive), `Up`/`Down` move the highlight, `Enter` switches to it, `Esc` cancels and leaves you where you were |
-| `Esc` / `Ctrl+C` | Close the `Ctrl+P` jump-to list, or cancel an in-progress reply or thread pick, or an armed reply, first, if any; otherwise clear any staged attachments; otherwise leave an open thread view if one is active; otherwise quit |
+| `Esc` / `Ctrl+C` | Close the `Ctrl+P` jump-to list or `Ctrl+K` command picker, or cancel an in-progress reply or thread pick, or an armed reply, first, if any; otherwise clear any staged attachments; otherwise leave an open thread view if one is active; otherwise quit |
 
 ## Commands
 
