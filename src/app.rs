@@ -2887,42 +2887,57 @@ impl AppState {
     /// Handles `/help`: pushes the full command/keybinding reference as a
     /// system notice. The input box's border only shows a short hint (see
     /// `ui::render_input`) to stay uncluttered, so this is where that
-    /// detail actually lives.
+    /// detail actually lives. One entry per line, with a blank line between
+    /// entries -- `ui::build_rows` renders each `\n` as its own row.
     fn run_help(&mut self) -> Option<InputAction> {
         let autosave_limit = human_size(self.autosave_limit.max_bytes());
+        let commands = [
+            "/join <name|ticket> -- join a channel from a ticket, or create a new private one by name".to_string(),
+            "/invite -- show an invite ticket for this channel".to_string(),
+            "/pair [ticket] -- with no argument, shows a ticket for a new device to redeem; /pair <ticket> redeems one (after an Enter/Esc confirmation -- this replaces this device's identity and data)".to_string(),
+            "/forget-device <hex-prefix> -- forget a paired device".to_string(),
+            "/msg <alias|hex-prefix> [text] -- start a private channel message with a peer".to_string(),
+            "/dm <alias|hex-prefix|endpoint-id> [text] -- connect directly to a peer's endpoint id with no ticket or gossip channel, unlike /msg".to_string(),
+            "/leave [channel] -- leave a channel".to_string(),
+            "/rename [name] -- set this channel's local display name".to_string(),
+            "/who -- list channel peers".to_string(),
+            "/send [path] -- share a file; a bare /send opens a file picker".to_string(),
+            "/save [hash-prefix] -- download a shared file; each channel's files are kept in a folder of their own".to_string(),
+            "/folder [path] -- show where saved files go and, with a path, move them all".to_string(),
+            "/maxsize [size|off|default] -- show the biggest file you can share (500 MB to begin with) and, with a size like 2GB, change it (off lifts it, default restores it)".to_string(),
+            format!("/autosave [on|off|limit <size|default>] -- /autosave on saves trusted peers' files in this channel as they arrive, up to its limit (the device-wide {autosave_limit} default unless this channel overrides it); /autosave limit <size> sets this channel's finite override and default restores its device-wide fallback"),
+            "/outbox [on|off] -- /outbox on watches this channel's local send folder and shares new stable files once (off by default; existing, hidden, and temporary files are ignored)".to_string(),
+            "/files -- list shared attachments and local synced files in this channel (type to filter, \u{2191}/\u{2193} pick, Enter save a shared file, Ctrl+O open, Ctrl+R reveal, Ctrl+E edit a local copy; never default-open a program or script, Esc close)".to_string(),
+            "/paste -- share the clipboard".to_string(),
+            "/sync [receive-only|publish-and-receive|off|pause|resume|include <glob>|exclude <glob>|remove <include|exclude> <glob>|clear-rules] -- /sync receive-only mirrors safe remote index entries into this channel's folder, while /sync publish-and-receive also publishes stable local files (off by default, per channel); /sync include and /sync exclude add relative glob rules, with excludes taking precedence; it never propagates deletes or renames".to_string(),
+            "/conflicts [local|remote|both <path>] -- list unresolved sync collisions in this channel; /conflicts local|remote|both <path> resolves one by keeping the chosen copy (or both) and moving any displaced copy to recoverable sync trash".to_string(),
+            "/trash [restore <path>|purge] -- list this channel's recoverable remote deletes; /trash restore <path> brings one back without overwriting a local file, and /trash purge permanently removes them all (trash is never automatically purged)".to_string(),
+            "/alias <hex-prefix> <name> -- set a local name for a peer".to_string(),
+            "/nick <name> -- set your broadcast display name".to_string(),
+            "/search <term> (or /s) -- search channel messages".to_string(),
+            "/reply [text] -- reply to the latest message".to_string(),
+            "/thread -- view the latest reply thread".to_string(),
+            "/hints -- toggle command hints; also toggles mouse reporting (hold Shift, or Option in iTerm2, to select text); hover clipped command hints to read them".to_string(),
+            "/bell -- toggle the message bell".to_string(),
+            "/version -- show this build's version".to_string(),
+            "/help -- show this help".to_string(),
+        ];
+        let keys = [
+            "Tab/Shift+Tab -- switch channels",
+            "Ctrl+P -- jump to a channel (type to filter, \u{2191}/\u{2193} pick, Enter confirm)",
+            "Ctrl+K -- browse slash commands (type to filter, \u{2191}/\u{2193} pick, Enter run)",
+            "/send file picker -- type to filter, \u{2191}/\u{2193} pick, Space mark, Enter open a folder or stage the marked files, Backspace up a level, Esc cancel",
+            "Alt+Enter/Ctrl+J -- newline",
+            "Ctrl+V -- share the clipboard (a file or image is staged first: Enter sends it, Backspace on an empty input unstages, Esc clears)",
+            "Ctrl+R -- reply (\u{2191}/\u{2193} pick, Enter confirm)",
+            "Ctrl+T -- thread (\u{2191}/\u{2193} pick, Enter confirm)",
+            "Up/Down -- scroll",
+            "Esc/Ctrl+C -- quit",
+        ];
         self.push_system(format!(
-            "commands: /join <name|ticket>, /invite, /pair [ticket], /forget-device <hex-prefix>, \
-             /msg <alias|hex-prefix> [text], /dm <alias|hex-prefix|endpoint-id> [text], \
-             /leave [channel], /rename [name], /who, /send [path], \
-             /save [hash-prefix], /folder [path], /maxsize [size|off|default], \
-             /autosave [on|off|limit <size|default>], /outbox [on|off], /files, /paste, \
-             /sync [receive-only|publish-and-receive|off|pause|resume|include <glob>|exclude <glob>|remove <include|exclude> <glob>|clear-rules], /conflicts [local|remote|both <path>], /trash [restore <path>|purge], \
-             /alias <hex-prefix> <name>, /nick <name>, /search <term> (or /s), /reply [text], \
-             /thread, /hints, /bell, /version, /help -- /pair with no argument shows a \
-             ticket for a new device to redeem, /pair <ticket> redeems one (after an \
-             Enter/Esc confirmation -- this replaces this device's identity and data) -- \
-             /dm connects directly to a peer's endpoint id with no ticket or gossip channel, \
-             unlike /msg -- /save keeps each channel's files in a folder of its own, \
-             /folder shows where and, with a path, moves them all -- \
-             /maxsize shows the biggest file you can share (500 MB to begin with) and, with a size like 2GB, changes it (off lifts it, default restores it) -- \
-             /autosave on saves trusted peers' files in this channel as they arrive, up to its limit (the device-wide {autosave_limit} default unless this channel overrides it); /autosave limit <size> sets this channel's finite override and default restores its device-wide fallback -- \
-             /sync receive-only mirrors safe remote index entries into this channel's folder, while /sync publish-and-receive also publishes stable local files (off by default, per channel); /sync include and /sync exclude add relative glob rules, with excludes taking precedence; it never propagates deletes or renames -- \
-             /conflicts lists unresolved sync collisions in this channel; /conflicts local|remote|both <path> resolves one by keeping the chosen copy (or both) and moving any displaced copy to recoverable sync trash -- \
-             /trash lists this channel's recoverable remote deletes; /trash restore <path> brings one back without overwriting a local file, and /trash purge permanently removes them all (trash is never automatically purged) -- \
-             /outbox on watches this channel's local send folder and shares new stable files once (off by default; existing, hidden, and temporary files are ignored) -- \
-             /files lists shared attachments and local synced files in this channel (type to filter, \u{2191}/\u{2193} pick, \
-             Enter save a shared file, Ctrl+O open, Ctrl+R reveal, Ctrl+E edit a local copy; never default-open a program or script, Esc close) -- \
-             keys: Tab/Shift+Tab switch channels, \
-             Ctrl+P jump to a channel (type to filter, \u{2191}/\u{2193} pick, Enter confirm), \
-             Ctrl+K browse slash commands (type to filter, \u{2191}/\u{2193} pick, Enter run), \
-             a bare /send opens a file picker (type to filter, \u{2191}/\u{2193} pick, Space mark, \
-             Enter open a folder or stage the marked files, Backspace up a level, Esc cancel), \
-             Alt+Enter/Ctrl+J newline, Ctrl+V share the clipboard (a file or image is staged \
-             first: Enter sends it, Backspace on an empty input unstages, Esc clears), \
-             Ctrl+R reply (\u{2191}/\u{2193} pick, \
-             Enter confirm), Ctrl+T thread (\u{2191}/\u{2193} pick, Enter confirm), \
-             Up/Down scroll, Esc/Ctrl+C quit -- hover clipped command hints to read them; \
-             /hints also toggles mouse reporting (hold Shift, or Option in iTerm2, to select text)"
+            "commands:\n\n{}\n\nkeys:\n\n{}",
+            commands.join("\n\n"),
+            keys.join("\n\n"),
         ));
         None
     }
@@ -5904,6 +5919,23 @@ mod tests {
         assert!(action.is_none());
         let last = as_system(app.active().messages.back().unwrap());
         assert!(last.starts_with("commands:"), "got: {last}");
+    }
+
+    #[test]
+    fn help_puts_each_command_on_its_own_line() {
+        let mut app = app();
+        submit(&mut app, "/help");
+        let last = as_system(app.active().messages.back().unwrap());
+        for command in ["/join ", "/msg ", "/sync ", "/help "] {
+            assert!(
+                last.lines().any(|line| line.starts_with(command)),
+                "{command} should start its own line, got: {last}"
+            );
+        }
+        assert!(
+            last.lines().any(|line| line == "Esc/Ctrl+C -- quit"),
+            "got: {last}"
+        );
     }
 
     #[test]

@@ -989,12 +989,17 @@ fn build_message_rows(
                 // one unbroken token with no spaces to wrap on), and
                 // `List` doesn't wrap on its own -- without this, anything
                 // wider than the pane would just get clipped and
-                // unreadable/uncopyable.
+                // unreadable/uncopyable. A multi-line notice (e.g. `/help`)
+                // gets one row per `\n`, its continuation lines indented
+                // under the first line's `* ` marker.
                 let style = Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC);
-                for chunk in markdown::wrap_chars(&format!("* {text}"), inner_width) {
-                    rows.push(Line::from(Span::styled(chunk, style)));
+                for (index, line) in text.split('\n').enumerate() {
+                    let prefix = if index == 0 { "* " } else { "  " };
+                    for chunk in markdown::wrap_chars(&format!("{prefix}{line}"), inner_width) {
+                        rows.push(Line::from(Span::styled(chunk, style)));
+                    }
                 }
             }
         }
@@ -2266,6 +2271,17 @@ mod tests {
         let (_, _, unread_row) = build_message_rows(&app, app.active(), 80);
 
         assert_eq!(unread_row, Some(1));
+    }
+
+    #[test]
+    fn build_message_rows_gives_each_line_of_a_system_notice_its_own_row() {
+        let mut app = AppState::new([9; 32], vec!["general".to_string()], "general");
+        app.push_system("first\n\nsecond");
+
+        let (rows, _, _) = build_message_rows(&app, app.active(), 80);
+        let texts: Vec<String> = rows.iter().map(|row| row.to_string()).collect();
+
+        assert_eq!(texts, vec!["* first", "  ", "  second"]);
     }
 
     use std::collections::HashMap;
