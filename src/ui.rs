@@ -16,7 +16,8 @@ use ratatui::widgets::{
 use textwrap::wrap;
 
 use crate::app::{
-    AppState, Channel, FileOffer, FilesEntry, FilesNotice, TranscriptLine, command_catalog, hex_id,
+    AppState, Channel, FileOffer, FilesEntry, FilesNotice, PeerPresence, TranscriptLine,
+    command_catalog, hex_id,
 };
 use crate::files::{StagedAttachment, human_size};
 use crate::hyperlink;
@@ -1450,11 +1451,18 @@ fn user_color(id: &[u8; 32]) -> Color {
 }
 
 fn render_peers(frame: &mut Frame, area: Rect, app: &AppState) {
-    let channel = app.active();
-    // One row per person, not per device -- see `AppState::unique_peer_ids`.
-    let peers = app.unique_peer_ids(&channel.peers);
-    let mut items: Vec<ListItem> = peers.iter().map(|id| peer_item(app, id)).collect();
-    items.push(peer_item(app, &app.self_id));
+    let mut items: Vec<ListItem> = app
+        .peer_presence()
+        .iter()
+        .map(|peer| peer_item(app, peer))
+        .collect();
+    items.push(peer_item(
+        app,
+        &PeerPresence {
+            id: app.self_id,
+            last_seen_unix_ms: None,
+        },
+    ));
 
     let list = List::new(items).block(
         Block::bordered()
@@ -1464,13 +1472,26 @@ fn render_peers(frame: &mut Frame, area: Rect, app: &AppState) {
     frame.render_widget(list, area);
 }
 
-/// One peers-sidebar row: a colored dot (`user_color`) plus the peer's
-/// display name.
-fn peer_item(app: &AppState, id: &[u8; 32]) -> ListItem<'static> {
-    ListItem::new(Line::from(vec![
-        Span::styled("● ", Style::default().fg(user_color(id))),
-        Span::raw(app.display_name(id)),
-    ]))
+/// One peers-sidebar row. Online peers keep their colored dot; remembered
+/// offline peers are dimmed and carry the local time they were last seen.
+fn peer_item(app: &AppState, peer: &PeerPresence) -> ListItem<'static> {
+    match peer.last_seen_unix_ms {
+        None => ListItem::new(Line::from(vec![
+            Span::styled("● ", Style::default().fg(user_color(&peer.id))),
+            Span::raw(app.display_name(&peer.id)),
+        ])),
+        Some(seen_unix_ms) => ListItem::new(Line::from(vec![
+            Span::styled("○ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} · last seen {}",
+                    app.display_name(&peer.id),
+                    format_time(seen_unix_ms)
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])),
+    }
 }
 
 /// Renders the sidebar's command reference panel: one row per catalog entry,
@@ -2669,6 +2690,44 @@ mod tests {
             rows.iter().any(|row| row.contains("#general · 0 peer(s)")),
             "got: {rows:#?}"
         );
+    }
+
+    #[test]
+    fn peers_sidebar_distinguishes_online_and_last_seen_peers() {
+        let mut app = app_with_every_kind();
+        app.load_contacts(HashMap::from([
+            ([1; 32], "Alice".to_string()),
+            ([2; 32], "Bob".to_string()),
+        ]));
+        app.active_mut().peers.push([1; 32]);
+        app.record_peer_seen("general", [1; 32], 1_000);
+        app.record_peer_seen("general", [2; 32], 2_000);
+
+        let text = screen_rows(&render_to_buffer(&app, 100, 50)).join("\n");
+
+        assert!(text.contains("● Alice"), "got: {text}");
+        assert!(text.contains("○ Bob · last seen"), "got: {text}");
+        assert!(!text.contains("● Bob"), "got: {text}");
+    }
+
+    #[test]
+    fn peers_sidebar_only_shows_active_channels_last_seen_peers() {
+        let mut app = app_with_every_kind();
+        app.load_contacts(HashMap::from([
+            ([1; 32], "Alice".to_string()),
+            ([2; 32], "Bob".to_string()),
+        ]));
+        app.record_peer_seen("general", [1; 32], 1_000);
+        app.record_peer_seen("project-x", [2; 32], 2_000);
+
+        let general = screen_rows(&render_to_buffer(&app, 100, 50)).join("\n");
+        assert!(general.contains("○ Alice · last seen"), "got: {general}");
+        assert!(!general.contains("○ Bob · last seen"), "got: {general}");
+
+        app.active = 2;
+        let project = screen_rows(&render_to_buffer(&app, 100, 50)).join("\n");
+        assert!(project.contains("○ Bob · last seen"), "got: {project}");
+        assert!(!project.contains("○ Alice · last seen"), "got: {project}");
     }
 
     /// The screen every switcher render test draws on.

@@ -11,6 +11,7 @@ mod files;
 mod forgotten_devices;
 mod hyperlink;
 mod identity;
+mod last_seen;
 mod markdown;
 mod message;
 mod net;
@@ -72,6 +73,7 @@ use files::{
     reveal_in_file_manager, set_files_root, set_size_limit, stage_file, stage_image,
 };
 use forgotten_devices::ForgottenDevices;
+use last_seen::LastSeen;
 use message::ChatMessage;
 use net::{DEVICE_SYNC_CHANNEL, Net, NetEvent};
 use outbox::{Outbox, Watcher as OutboxWatcher};
@@ -108,6 +110,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize channel registry")?;
     let contacts = Contacts::load(dirs.data_dir().join("contacts"))
         .context("failed to initialize contacts")?;
+    let last_seen = LastSeen::load(dirs.data_dir().join("last_seen"))
+        .context("failed to initialize last-seen peer storage")?;
     let channel_renames = ChannelRenames::load(dirs.data_dir().join("channel_renames"))
         .context("failed to initialize channel renames")?;
     let autosave = AutoSave::load(dirs.data_dir().join("autosave"))
@@ -176,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
         backfill,
         registry,
         contacts,
+        last_seen,
         channel_renames,
         autosave,
         autosave_limit,
@@ -490,6 +495,7 @@ struct Session {
     backfill: BackfillStore,
     registry: ChannelRegistry,
     contacts: Contacts,
+    last_seen: LastSeen,
     channel_renames: ChannelRenames,
     /// Which channels have auto-save on -- see `autosave`. Seeded into
     /// `AppState` (`load_autosave`) at startup; written when `/autosave`
@@ -597,6 +603,7 @@ async fn run(
         backfill,
         mut registry,
         mut contacts,
+        mut last_seen,
         mut channel_renames,
         mut autosave,
         autosave_limit,
@@ -617,6 +624,7 @@ async fn run(
     let mut app = AppState::new(net.our_id, joined_channels.clone(), &active_channel);
     app.load_self_user_id(net.our_user_id());
     app.load_contacts(contacts.all());
+    app.load_last_seen(last_seen.snapshot());
     app.load_renames(channel_renames.all());
     app.load_autosave(autosave.channels());
     app.load_autosave_limits(autosave.limits());
@@ -1016,6 +1024,9 @@ async fn run(
                                 if let Err(err) = channel_renames.forget(&channel) {
                                     warn!(%channel, "failed to remove channel rename: {err}");
                                 }
+                                if let Err(err) = last_seen.forget_channel(&channel) {
+                                    warn!(%channel, "failed to forget peer last-seen data: {err}");
+                                }
                                 if let Err(err) = store.delete(&channel) {
                                     warn!(%channel, "failed to delete channel history: {err}");
                                 }
@@ -1296,6 +1307,13 @@ async fn run(
                     net.announce_version(channel);
                     net.announce_device(channel);
                     net.announce_docs(channel);
+                }
+                if let NetEvent::PeerJoined(channel, id) = &net_event {
+                    let seen_unix_ms = message::now_unix_ms();
+                    app.record_peer_seen(channel, *id, seen_unix_ms);
+                    if let Err(err) = last_seen.record(channel, *id, seen_unix_ms) {
+                        warn!(%channel, "failed to persist peer last-seen time: {err}");
+                    }
                 }
 
                 // Also peek for a channel finishing a runtime `/join`, so

@@ -41,6 +41,13 @@ struct HintHover {
     overflow: usize,
     tick: usize,
 }
+/// A peer shown in the active channel's sidebar. `last_seen_unix_ms` is
+/// absent only while the peer is currently online.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerPresence {
+    pub id: [u8; 32],
+    pub last_seen_unix_ms: Option<u64>,
+}
 
 impl HintHover {
     fn offset(self) -> usize {
@@ -509,6 +516,7 @@ pub struct Channel {
     pub name: String,
     pub messages: VecDeque<TranscriptLine>,
     pub peers: Vec<[u8; 32]>,
+    last_seen: HashMap<[u8; 32], u64>,
     pub scroll: usize,
     /// Number of newly received live messages not yet viewed. This is
     /// transient, like `scroll`: startup history and backfill establish the
@@ -580,6 +588,7 @@ impl Channel {
             name,
             messages: VecDeque::new(),
             peers: Vec::new(),
+            last_seen: HashMap::new(),
             scroll: 0,
             unread_count: 0,
             first_unread: None,
@@ -1344,6 +1353,24 @@ impl AppState {
     /// the event loop starts -- mirrors `load_history`.
     pub fn load_contacts(&mut self, petnames: HashMap<[u8; 32], String>) {
         self.petnames = petnames;
+    }
+    /// Seeds remembered peer observations loaded by the caller. Live gossip
+    /// events still decide online state; this data only keeps peers visible
+    /// after they leave and across restarts.
+    pub fn load_last_seen(&mut self, last_seen: HashMap<String, HashMap<[u8; 32], u64>>) {
+        for channel in &mut self.channels {
+            if let Some(peers) = last_seen.get(&channel.name) {
+                channel.last_seen = peers.clone();
+            }
+        }
+    }
+
+    /// Records a peer observation in the in-memory state. The runtime owns
+    /// persistence and calls this alongside `LastSeen::record`.
+    pub fn record_peer_seen(&mut self, channel: &str, id: [u8; 32], seen_unix_ms: u64) {
+        if let Some(channel) = self.channel_mut(channel) {
+            channel.last_seen.insert(id, seen_unix_ms);
+        }
     }
 
     /// Seeds our own canonical user identity (see `self_user_id`), loaded
@@ -2529,6 +2556,7 @@ impl AppState {
     /// listing it again here would just be the same person shown twice
     /// under two different labels. A peer with no known certificate is
     /// simply its own one-member group, so this changes nothing for it.
+    #[cfg(test)]
     pub fn unique_peer_ids(&self, ids: &[[u8; 32]]) -> Vec<[u8; 32]> {
         let mut seen = HashSet::new();
         ids.iter()
@@ -2536,6 +2564,60 @@ impl AppState {
             .filter(|id| seen.insert(self.canonical_id(id)))
             .copied()
             .collect()
+    }
+
+    /// The active channel's peers, with currently-online people first and
+    /// remembered offline people after them. Multiple endpoint ids certified
+    /// for one person collapse to one row; live presence wins over a
+    /// remembered sibling device, and otherwise the newest observation wins.
+    pub fn peer_presence(&self) -> Vec<PeerPresence> {
+        let channel = self.active();
+        let mut peers = Vec::new();
+
+        for id in &channel.peers {
+            let canonical = self.canonical_id(id);
+            if canonical == self.self_user_id {
+                continue;
+            }
+            if peers
+                .iter()
+                .any(|peer: &PeerPresence| self.canonical_id(&peer.id) == canonical)
+            {
+                continue;
+            }
+            peers.push(PeerPresence {
+                id: *id,
+                last_seen_unix_ms: None,
+            });
+        }
+
+        let mut offline: Vec<_> = channel.last_seen.iter().collect();
+        offline.sort_by_key(|(id, seen)| (std::cmp::Reverse(**seen), **id));
+        for (id, seen_unix_ms) in offline {
+            let canonical = self.canonical_id(id);
+            if canonical == self.self_user_id {
+                continue;
+            }
+            match peers
+                .iter_mut()
+                .find(|peer| self.canonical_id(&peer.id) == canonical)
+            {
+                Some(peer) if peer.last_seen_unix_ms.is_none() => {}
+                Some(peer) if peer.last_seen_unix_ms < Some(*seen_unix_ms) => {
+                    *peer = PeerPresence {
+                        id: *id,
+                        last_seen_unix_ms: Some(*seen_unix_ms),
+                    };
+                }
+                Some(_) => {}
+                None => peers.push(PeerPresence {
+                    id: *id,
+                    last_seen_unix_ms: Some(*seen_unix_ms),
+                }),
+            }
+        }
+
+        peers
     }
 
     /// The newest peer version we've heard (via `NetEvent::Version`) that's
@@ -4972,6 +5054,90 @@ mod tests {
         ));
 
         assert!(app.unique_peer_ids(&[PEER_ID]).is_empty());
+    }
+
+    #[test]
+    fn peer_presence_keeps_a_left_peer_with_its_last_seen_time() {
+        let mut app = app();
+        app.record_peer_seen("general", PEER_ID, 100);
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+
+        assert_eq!(
+            app.peer_presence(),
+            vec![PeerPresence {
+                id: PEER_ID,
+                last_seen_unix_ms: None,
+            }]
+        );
+
+        app.handle_net_event(NetEvent::PeerLeft("general".to_string(), PEER_ID));
+
+        assert_eq!(
+            app.peer_presence(),
+            vec![PeerPresence {
+                id: PEER_ID,
+                last_seen_unix_ms: Some(100),
+            }]
+        );
+    }
+
+    #[test]
+    fn peer_presence_loads_last_seen_per_channel() {
+        let mut app = multi_channel_app();
+        app.load_last_seen(HashMap::from([
+            ("general".to_string(), HashMap::from([(PEER_ID, 100)])),
+            ("random".to_string(), HashMap::from([(PEER_ID_2, 200)])),
+        ]));
+
+        assert_eq!(
+            app.peer_presence(),
+            vec![PeerPresence {
+                id: PEER_ID_2,
+                last_seen_unix_ms: Some(200),
+            }]
+        );
+        app.active = 0;
+        assert_eq!(
+            app.peer_presence(),
+            vec![PeerPresence {
+                id: PEER_ID,
+                last_seen_unix_ms: Some(100),
+            }]
+        );
+    }
+
+    #[test]
+    fn peer_presence_prefers_live_presence_and_deduplicates_certified_devices() {
+        let mut app = app();
+        let user_key = SecretKey::generate();
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID),
+        ));
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            device_cert(&user_key, PEER_ID_2),
+        ));
+        app.record_peer_seen("general", PEER_ID, 100);
+        app.record_peer_seen("general", PEER_ID_2, 200);
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+
+        assert_eq!(
+            app.peer_presence(),
+            vec![PeerPresence {
+                id: PEER_ID,
+                last_seen_unix_ms: None,
+            }]
+        );
+
+        app.handle_net_event(NetEvent::PeerLeft("general".to_string(), PEER_ID));
+        assert_eq!(
+            app.peer_presence(),
+            vec![PeerPresence {
+                id: PEER_ID_2,
+                last_seen_unix_ms: Some(200),
+            }]
+        );
     }
 
     #[test]
