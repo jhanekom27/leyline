@@ -128,30 +128,28 @@ fn sidebar_areas(area: Rect) -> [Rect; 2] {
     .areas(area)
 }
 
-/// Uses exactly the renderer's layout, excluding borders, hidden rows,
-/// and modal views. Returns the row and its clipped terminal-cell count.
-pub fn command_hint_at(
-    area: Rect,
-    app: &AppState,
-    column: u16,
-    row: u16,
-) -> Option<(usize, usize)> {
-    if !app.can_hover_hints() {
-        return None;
-    }
+/// The command hints panel and its inner (borderless) area, laid out
+/// exactly as `render_sidebar` draws them.
+fn hints_areas(area: Rect, app: &AppState) -> (Rect, Rect) {
     let [_, body, _, _] = frame_areas(area, app);
     let [_, _, sidebar] = body_areas(body);
     let [_, hints] = sidebar_areas(sidebar);
-    let inner = Block::bordered().inner(hints);
-    if !inner.contains((column, row).into()) || inner.width == 0 {
+    (hints, Block::bordered().inner(hints))
+}
+
+/// Uses exactly the renderer's layout, excluding borders, hidden rows,
+/// and modal views. Returns the catalog index of the command row under
+/// `(column, row)`.
+pub fn command_hint_at(area: Rect, app: &AppState, column: u16, row: u16) -> Option<usize> {
+    if !app.can_hover_hints() {
+        return None;
+    }
+    let (_, inner) = hints_areas(area, app);
+    if !inner.contains((column, row).into()) {
         return None;
     }
     let index = (row - inner.y) as usize;
-    let hint = command_catalog().get(index)?.syntax;
-    let overflow = Line::from(hint)
-        .width()
-        .saturating_sub(inner.width as usize);
-    (overflow > 0).then_some((index, overflow))
+    command_catalog().get(index).map(|_| index)
 }
 
 pub fn render(frame: &mut Frame, app: &AppState) {
@@ -161,6 +159,7 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     render_body(frame, body, app);
     render_staged(frame, staged, app);
     render_input(frame, input, app);
+    render_hint_popup(frame, app);
     // Last, so the overlay sits over everything else -- and so its cursor
     // wins over the input box's. At most one is ever open: each owns every
     // key while it is.
@@ -787,7 +786,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &AppState) {
     }
     let [peers, hints] = sidebar_areas(area);
     render_peers(frame, peers, app);
-    render_hints(frame, hints, app);
+    render_hints(frame, hints);
 }
 
 fn render_messages(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -1500,22 +1499,13 @@ fn peer_item(app: &AppState, peer: &PeerPresence) -> ListItem<'static> {
 }
 
 /// Renders the sidebar's command reference panel: one row per catalog entry,
-/// showing just the bare usage -- full
-/// descriptions still live in `/help`'s system notice and the README.
-fn render_hints(frame: &mut Frame, area: Rect, app: &AppState) {
+/// showing just the bare usage, clipped to fit -- hovering a row shows its
+/// whole usage and description (`render_hint_popup`), and full details
+/// still live in `/help`'s system notice and the README.
+fn render_hints(frame: &mut Frame, area: Rect) {
     let items: Vec<ListItem> = command_catalog()
         .iter()
-        .enumerate()
-        // Usages are ASCII, so each character is exactly one terminal cell.
-        .map(|(row, command)| {
-            ListItem::new(
-                command
-                    .syntax
-                    .chars()
-                    .skip(app.hint_scroll(row))
-                    .collect::<String>(),
-            )
-        })
+        .map(|command| ListItem::new(command.syntax))
         .collect();
     let list = List::new(items).block(
         Block::bordered()
@@ -1523,6 +1513,54 @@ fn render_hints(frame: &mut Frame, area: Rect, app: &AppState) {
             .border_type(BorderType::Rounded),
     );
     frame.render_widget(list, area);
+}
+
+/// Draws the hovered command hint's popup (`AppState::hovered_hint`): a
+/// cleared, bordered box holding the command's one-line description and,
+/// under it, its whole usage. It opens to the left of the hints panel,
+/// level with the hovered row, since the panel sits against the right
+/// edge; the box is shifted up to stay on screen, and a line too wide for
+/// the terminal wraps rather than being clipped.
+fn render_hint_popup(frame: &mut Frame, app: &AppState) {
+    let Some(index) = app.hovered_hint() else {
+        return;
+    };
+    let Some(command) = command_catalog().get(index) else {
+        return;
+    };
+    let screen = frame.area();
+    let (hints, inner) = hints_areas(screen, app);
+    let texts = [
+        (command.description, Style::default()),
+        (command.syntax, Style::default().fg(Color::Cyan)),
+    ];
+    // One cell of padding either side of the text, inside the borders.
+    let needed = texts
+        .iter()
+        .map(|(text, _)| Line::from(*text).width())
+        .max()
+        .unwrap_or(0)
+        + 4;
+    let width = (needed as u16).min(screen.width);
+    let text_width = (width as usize).saturating_sub(4).max(1);
+    let lines: Vec<Line> = texts
+        .iter()
+        .flat_map(|(text, style)| {
+            markdown::wrap_chars(text, text_width)
+                .into_iter()
+                .map(move |chunk| Line::from(Span::styled(format!(" {chunk} "), *style)))
+        })
+        .collect();
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let x = hints.x.saturating_sub(width);
+    let row = inner.y + index as u16;
+    let y = row.min(screen.bottom().saturating_sub(height));
+    let area = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().border_type(BorderType::Rounded)),
+        area,
+    );
 }
 
 fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -4008,49 +4046,74 @@ mod tests {
     }
 
     fn hints_inner(area: Rect, app: &AppState) -> Rect {
-        let [_, body, _, _] = frame_areas(area, app);
-        let [_, _, sidebar] = body_areas(body);
-        Block::bordered().inner(sidebar_areas(sidebar)[1])
+        hints_areas(area, app).1
+    }
+
+    fn catalog_index(prefix: &str) -> usize {
+        command_catalog()
+            .iter()
+            .position(|command| command.syntax.starts_with(prefix))
+            .unwrap()
     }
 
     #[test]
-    fn hover_scroll_reveals_the_full_usage_and_leaves_other_rows_alone() {
+    fn hovering_a_hint_shows_its_description_then_whole_usage_in_a_popup() {
         let mut app = AppState::new([1; 32], vec!["general".into()], "general");
         let area = Rect::new(0, 0, 100, 40);
         let inner = hints_inner(area, &app);
-        let index = command_catalog()
-            .iter()
-            .position(|command| command.syntax.starts_with("/maxsize "))
-            .unwrap();
-        let target = command_hint_at(area, &app, inner.x, inner.y + index as u16).unwrap();
-        app.set_hint_hover(Some(target));
+        let index = catalog_index("/maxsize ");
+        let command = &command_catalog()[index];
         let initial = render_to_buffer(&app, area.width, area.height);
-        let mut seen = String::new();
-        for _ in 0..(target.1 + 4) {
-            let buffer = render_to_buffer(&app, area.width, area.height);
-            let row = cells(&buffer, inner.y + index as u16, inner.x, inner.width);
-            seen.push_str(&row);
-            assert_eq!(
-                cells(&buffer, inner.y + 1, inner.x, inner.width),
-                cells(&initial, inner.y + 1, inner.x, inner.width)
-            );
-            app.tick_hint_hover();
-        }
+
+        let target = command_hint_at(area, &app, inner.x, inner.y + index as u16);
+        assert_eq!(target, Some(index));
+        app.set_hint_hover(target);
+        let buffer = render_to_buffer(&app, area.width, area.height);
+        let rows = screen_rows(&buffer);
+
+        let description_row = rows
+            .iter()
+            .position(|row| row.contains(command.description))
+            .expect("the popup shows the description");
         assert!(
-            seen.contains("off|default]"),
-            "the formerly clipped end must be readable"
+            rows[description_row + 1].contains(command.syntax),
+            "the whole usage sits on the line under the description"
         );
+        // The panel row itself stays clipped, not scrolled.
+        assert_eq!(
+            cells(&buffer, inner.y + index as u16, inner.x, inner.width),
+            cells(&initial, inner.y + index as u16, inner.x, inner.width)
+        );
+
         app.set_hint_hover(None);
         assert_eq!(render_to_buffer(&app, area.width, area.height), initial);
     }
 
     #[test]
-    fn hint_hit_testing_excludes_borders_short_rows_and_overlays() {
+    fn a_hint_that_already_fits_still_gets_a_popup() {
         let mut app = AppState::new([1; 32], vec!["general".into()], "general");
         let area = Rect::new(0, 0, 100, 40);
         let inner = hints_inner(area, &app);
-        assert!(command_hint_at(area, &app, inner.x, inner.y + 3).is_some());
-        assert_eq!(command_hint_at(area, &app, inner.x, inner.y + 1), None); // /invite fits
+        let index = catalog_index("/invite");
+        assert!(command_catalog()[index].syntax.len() < inner.width as usize);
+
+        app.set_hint_hover(command_hint_at(area, &app, inner.x, inner.y + index as u16));
+        let buffer = render_to_buffer(&app, area.width, area.height);
+
+        assert!(
+            screen_rows(&buffer)
+                .iter()
+                .any(|row| row.contains(command_catalog()[index].description))
+        );
+    }
+
+    #[test]
+    fn hint_hit_testing_excludes_borders_and_overlays() {
+        let mut app = AppState::new([1; 32], vec!["general".into()], "general");
+        let area = Rect::new(0, 0, 100, 40);
+        let inner = hints_inner(area, &app);
+        assert_eq!(command_hint_at(area, &app, inner.x, inner.y + 3), Some(3));
+        assert_eq!(command_hint_at(area, &app, inner.x, inner.y + 1), Some(1));
         assert_eq!(command_hint_at(area, &app, inner.x - 1, inner.y + 3), None);
         assert_eq!(
             command_hint_at(area, &app, inner.right(), inner.y + 3),
@@ -4063,7 +4126,7 @@ mod tests {
     }
 
     #[test]
-    fn hint_hit_testing_tracks_small_screens_and_multiline_composition() {
+    fn hint_hit_testing_and_popups_track_small_screens_and_multiline_composition() {
         let mut app = AppState::new([1; 32], vec!["general".into()], "general");
         for input in ["", "one\ntwo\nthree"] {
             app.active_mut().input = input.into();
@@ -4073,13 +4136,17 @@ mod tests {
                     let inner = hints_inner(area, &app);
                     let buffer = render_to_buffer(&app, width, height);
                     for row in 0..height {
-                        if let Some((index, overflow)) = command_hint_at(area, &app, inner.x, row) {
-                            assert!(overflow > 0);
+                        if let Some(index) = command_hint_at(area, &app, inner.x, row) {
                             assert_eq!(row, inner.y + index as u16);
                             assert!(
                                 cells(&buffer, row, inner.x, inner.width)
                                     .starts_with(&command_catalog()[index].syntax[..1])
                             );
+                            // Rendering the popup must never panic or
+                            // spill outside the terminal.
+                            app.set_hint_hover(Some(index));
+                            render_to_buffer(&app, width, height);
+                            app.set_hint_hover(None);
                         }
                     }
                 }
