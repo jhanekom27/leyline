@@ -40,6 +40,7 @@ mod version;
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -48,14 +49,14 @@ use std::time::Duration;
 use anyhow::Context;
 use arboard::Clipboard;
 use crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseEventKind,
 };
 use crossterm::execute;
 use iroh_tickets::Ticket;
 use tokio::sync::mpsc;
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
 use tracing::{debug, warn};
 
 use app::{
@@ -214,6 +215,9 @@ async fn main() -> anyhow::Result<()> {
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let result = run(&mut terminal, session).await;
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    if let Err(err) = drain_terminal_events(event::poll, event::read) {
+        debug!("failed to drain terminal events during shutdown: {err}");
+    }
     ratatui::restore();
     match result {
         // A live `/pair <ticket>` redeem was confirmed (see
@@ -227,6 +231,28 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Consumes events queued by the terminal after the app's event stream has
+/// stopped. A terminal can have SGR mouse reports in flight when capture is
+/// disabled; leaving them unread hands their escape sequence to the shell
+/// after raw mode is restored.
+///
+/// The caller must have dropped any `EventStream` first: crossterm permits
+/// only one event reader. The first short poll lets its background reader
+/// release the terminal; later polls return immediately.
+fn drain_terminal_events<P, R>(mut poll: P, mut read: R) -> std::io::Result<usize>
+where
+    P: FnMut(Duration) -> std::io::Result<bool>,
+    R: FnMut() -> std::io::Result<Event>,
+{
+    let mut drained = 0;
+    let mut timeout = Duration::from_millis(10);
+    while poll(timeout)? {
+        read()?;
+        drained += 1;
+        timeout = Duration::ZERO;
+    }
+    Ok(drained)
+}
 /// Mouse reporting follows the hints panel and is restored on every
 /// return path (including draw or event-stream errors).
 struct MouseReporting<W: Write> {
@@ -1957,9 +1983,26 @@ async fn run(
         }
     }
 
-    net.shutdown().await?;
+    if !wait_for_shutdown(Duration::from_secs(2), net.shutdown()).await? {
+        warn!("timed out waiting for network shutdown; restoring the terminal anyway");
+    }
 
     Ok(app.restart_with_ticket)
+}
+/// Waits for a graceful network shutdown without letting a stalled network
+/// task hold the terminal in raw mode indefinitely. Returns `false` only
+/// when the deadline elapsed; a completed shutdown error still propagates.
+async fn wait_for_shutdown<F>(limit: Duration, shutdown: F) -> anyhow::Result<bool>
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    match timeout(limit, shutdown).await {
+        Ok(result) => {
+            result?;
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
 }
 fn report_sync_trash(app: &mut AppState, outcome: SyncTrashOutcome) {
     match outcome {
@@ -2111,6 +2154,66 @@ mod tests {
         write_mouse_reporting(&mut expected, true).unwrap();
         write_mouse_reporting(&mut expected, false).unwrap();
         assert_eq!(bytes, expected);
+    }
+    #[test]
+    fn draining_terminal_events_consumes_ready_events_after_one_short_wait() {
+        let mut ready = [true, true, false].into_iter();
+        let mut timeouts = Vec::new();
+        let mut reads = 0;
+
+        let drained = drain_terminal_events(
+            |timeout| {
+                timeouts.push(timeout);
+                Ok(ready.next().unwrap())
+            },
+            || {
+                reads += 1;
+                Ok(Event::FocusLost)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(drained, 2);
+        assert_eq!(reads, 2);
+        assert_eq!(
+            timeouts,
+            vec![Duration::from_millis(10), Duration::ZERO, Duration::ZERO]
+        );
+    }
+
+    #[test]
+    fn draining_terminal_events_does_not_read_when_none_are_ready() {
+        let mut reads = 0;
+
+        let drained = drain_terminal_events(
+            |_| Ok(false),
+            || {
+                reads += 1;
+                Ok(Event::FocusLost)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(drained, 0);
+        assert_eq!(reads, 0);
+    }
+
+    #[tokio::test]
+    async fn network_shutdown_wait_completes_when_the_shutdown_finishes() {
+        assert!(
+            wait_for_shutdown(Duration::ZERO, async { Ok(()) })
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn network_shutdown_wait_times_out_without_blocking_terminal_cleanup() {
+        assert!(
+            !wait_for_shutdown(Duration::ZERO, std::future::pending::<anyhow::Result<()>>())
+                .await
+                .unwrap()
+        );
     }
 
     #[test]
