@@ -16,7 +16,7 @@ use ratatui::widgets::{
 use textwrap::wrap;
 
 use crate::app::{
-    AppState, Channel, FileOffer, FilesNotice, SharedFile, TranscriptLine, command_catalog, hex_id,
+    AppState, Channel, FileOffer, FilesEntry, FilesNotice, TranscriptLine, command_catalog, hex_id,
 };
 use crate::files::{StagedAttachment, human_size};
 use crate::hyperlink;
@@ -3466,8 +3466,14 @@ mod tests {
         let mut app = app_with_shared_files();
         open_files(&mut app);
         let when = |name: &str| {
-            let shared = app.files_matches();
-            let shared = shared.iter().find(|s| s.file.filename == name).unwrap();
+            let entries = app.files_matches();
+            let shared = entries
+                .iter()
+                .find_map(|entry| match entry {
+                    FilesEntry::Shared(shared) if shared.file.filename == name => Some(shared),
+                    _ => None,
+                })
+                .unwrap();
             sent_label(shared.ts_unix_ms, Local::now())
         };
 
@@ -3685,7 +3691,7 @@ mod tests {
         let rows = files_box(&app);
         let bottom = rows.last().unwrap();
         assert!(
-            bottom.contains("not saved yet · Enter saves it"),
+            bottom.contains("not available locally · Enter saves shared files"),
             "got: {bottom}"
         );
         assert!(!bottom.contains("Esc close"), "got: {bottom}");
@@ -3745,7 +3751,7 @@ mod tests {
     #[test]
     fn both_keys_on_a_saved_program_say_it_will_not_be_opened_from_here() {
         let mut app = app_viewing_a_saved_program();
-        let said = "already saved · won't open programs or scripts from here";
+        let said = "won't open programs or scripts · Ctrl+R reveal · Ctrl+E edit";
 
         press(&mut app, KeyCode::Enter);
         let rows = files_box(&app);

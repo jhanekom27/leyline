@@ -196,7 +196,7 @@ const COMMANDS: &[CommandDefinition] = &[
         syntax: "/files",
         input: "/files",
         aliases: &[],
-        description: "Browse files shared in this channel",
+        description: "Browse shared and synced channel files",
     },
     CommandDefinition {
         syntax: "/paste",
@@ -415,6 +415,9 @@ pub struct FilesOverlay {
     /// `Enter` must save into the folder of the channel whose list the user
     /// was looking at.
     pub channel: String,
+    /// Identity of the background folder scan requested when this overlay
+    /// opened. A late response may only update this exact overlay.
+    request: u64,
     /// What's been typed so far, matched case-insensitively against each
     /// file's name and its sender as shown (`AppState::display_name`).
     pub query: String,
@@ -432,6 +435,9 @@ pub struct FilesOverlay {
     /// moment -- app.rs can't look for itself -- and nothing outside an open
     /// overlay needs it, so it lives and dies with it.
     saved: HashMap<Hash, PathBuf>,
+    /// Eligible regular files below this channel's folder, supplied by the
+    /// runtime after its background scan.
+    local: Vec<LocalFile>,
     /// What the last key did not do, and why -- see `FilesNotice`. Dropped by
     /// the next key (`AppState::handle_files_key`) or paste
     /// (`AppState::edit_files_query`).
@@ -447,28 +453,54 @@ pub enum FilesNotice {
     /// `Enter` on a file that is already saved and can be opened: it is not
     /// saved a second time, `Ctrl+O` opens it.
     AlreadySaved,
-    /// `Ctrl+O` on a file that isn't saved: there is nothing to open yet,
-    /// `Enter` saves it.
-    NotSaved,
     /// `Enter` or `Ctrl+O` on a file that is already saved but runs
     /// something when opened (`files::runs_when_opened`): it is not saved a
     /// second time, and leyline won't open it -- a program or script is
     /// opened by hand, from the file manager, if at all.
     SavedNotOpened,
+    /// An operation requires a local copy, but this attachment is not saved.
+    NotLocal,
+    /// Enter saves remote attachments; a sync-local file is already present.
+    LocalFile,
 }
 
 /// What `Enter` and `Ctrl+O` can do for a file in the files overlay, worked
 /// out in one place (`AppState::file_offer`) so the bottom border and the
 /// two keys can't disagree about it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileOffer<'a> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileOffer {
     /// Not saved: `Enter` saves it.
     Save,
     /// Saved, and the copy at this path can be opened: `Ctrl+O` opens it.
-    Open(&'a Path),
+    Open(PathBuf),
     /// Saved, but a kind of file that runs something when opened
     /// (`files::runs_when_opened`): neither key has anything to do for it.
     SavedOnly,
+}
+
+/// One safe regular file discovered below a channel's local folder. The
+/// runtime owns the filesystem scan; app state only stores the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalFile {
+    pub path: PathBuf,
+    pub relative: String,
+    pub size: u64,
+    pub modified_unix_ms: u64,
+}
+
+/// One row in the `/files` overlay: either an attachment that can be saved
+/// from peers or a regular file already present in the channel folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilesEntry {
+    Shared(SharedFile),
+    Local(LocalFile),
+}
+
+/// Result of one asynchronous `/files` folder scan.
+pub struct FilesListing {
+    pub request: u64,
+    pub channel: String,
+    pub files: Result<Vec<LocalFile>, String>,
 }
 
 /// One joined channel's transcript, presence, per-channel scroll state,
@@ -967,12 +999,14 @@ pub enum InputAction {
     /// the caller only needs to persist it (`files::set_size_limit`), as it
     /// does for `Bell`.
     SetSizeLimit(SizeLimit),
-    /// Tell the files overlay which of `channel`'s files are saved. The
-    /// overlay has just opened on it (`run_files`), and that is a fact about
-    /// the disk, which app.rs never touches: the caller looks (see
-    /// `saved_files::SavedFiles::present_in`) and answers through
-    /// `AppState::apply_saved_files`, before the next frame is drawn.
-    CheckSavedFiles(String),
+    /// Read the local folder for an open `/files` overlay on a blocking
+    /// thread, then return a `FilesListing`. The request identifies the
+    /// overlay that asked for it.
+    ReadFiles {
+        request: u64,
+        channel: String,
+        dir: PathBuf,
+    },
     /// Open the saved file at `path` with the OS's default application --
     /// `Ctrl+O` in the files overlay (`open_highlighted_file`). Never for a
     /// file that runs something when opened (`files::runs_when_opened`):
@@ -980,6 +1014,10 @@ pub enum InputAction {
     /// given -- once it has checked the file is still there
     /// (`files::open_in_default_app`).
     OpenFile(PathBuf),
+    /// Reveal a local file in the operating system's file manager.
+    RevealFile(PathBuf),
+    /// Open a local file in the operating system's text editor.
+    EditFile(PathBuf),
     /// Share whatever's on the OS clipboard with `channel` -- from `/paste`
     /// or the `Ctrl+V`/`Cmd+V` keybinding (see `run_paste`). The caller
     /// (`net::Net::paste`) reads the clipboard and decides what it found;
@@ -1187,6 +1225,9 @@ pub struct AppState {
     /// keeps a slow answer to a closed picker's read from landing in the
     /// next one.
     browse_requests: u64,
+    /// Sequence for `/files` folder snapshots, separate from send-file
+    /// picker reads so replies cannot be applied to the wrong overlay.
+    files_requests: u64,
     /// The armed reply target for the next sent message (confirmed via
     /// `Enter` while picking, or `/reply`), by message id. Attached to the
     /// next `Send`-ed `ChatMessage` and cleared on send (`send_text`), on
@@ -1271,6 +1312,7 @@ impl AppState {
             sync_status: HashMap::new(),
             auto_saving: HashSet::new(),
             browse_requests: 0,
+            files_requests: 0,
         }
     }
 
@@ -2786,8 +2828,8 @@ impl AppState {
              /conflicts lists unresolved sync collisions in this channel; /conflicts local|remote|both <path> resolves one by keeping the chosen copy (or both) and moving any displaced copy to recoverable sync trash -- \
              /trash lists this channel's recoverable remote deletes; /trash restore <path> brings one back without overwriting a local file, and /trash purge permanently removes them all (trash is never automatically purged) -- \
              /outbox on watches this channel's local send folder and shares new stable files once (off by default; existing, hidden, and temporary files are ignored) -- \
-             /files lists the files shared in this channel (type to filter, \u{2191}/\u{2193} pick, \
-             Enter save, Ctrl+O open one already saved (never a program or script), Esc close) -- \
+             /files lists shared attachments and local synced files in this channel (type to filter, \u{2191}/\u{2193} pick, \
+             Enter save a shared file, Ctrl+O open, Ctrl+R reveal, Ctrl+E edit a local copy; never default-open a program or script, Esc close) -- \
              keys: Tab/Shift+Tab switch channels, \
              Ctrl+P jump to a channel (type to filter, \u{2191}/\u{2193} pick, Enter confirm), \
              Ctrl+K browse slash commands (type to filter, \u{2191}/\u{2193} pick, Enter run), \
@@ -9839,7 +9881,7 @@ mod tests {
     fn listed(app: &AppState) -> Vec<String> {
         app.files_matches()
             .iter()
-            .map(|shared| shared.file.filename.clone())
+            .map(|entry| entry.filename().to_string())
             .collect()
     }
 
@@ -9868,6 +9910,24 @@ mod tests {
     /// as the caller does when it answers `InputAction::CheckSavedFiles`.
     fn mark_saved(app: &mut AppState, channel: &str, hash: Hash, path: &str) {
         app.apply_saved_files(channel, HashMap::from([(hash, PathBuf::from(path))]));
+    }
+
+    fn apply_local_files(app: &mut AppState, files: Vec<LocalFile>) {
+        let overlay = app.viewing_files.as_ref().expect("files overlay is open");
+        app.apply_files_listing(FilesListing {
+            request: overlay.request,
+            channel: overlay.channel.clone(),
+            files: Ok(files),
+        });
+    }
+
+    fn local_file(relative: &str, modified_unix_ms: u64) -> LocalFile {
+        LocalFile {
+            path: PathBuf::from("/files/general").join(relative),
+            relative: relative.to_string(),
+            size: 7,
+            modified_unix_ms,
+        }
     }
 
     /// `general` with four files -- two from Alice, one from Bob, one of our
@@ -9899,18 +9959,105 @@ mod tests {
     }
 
     #[test]
-    fn slash_files_opens_the_overlay_on_the_active_channel_and_asks_what_is_saved() {
+    fn slash_files_opens_the_overlay_on_the_active_channel_and_reads_its_folder() {
         let mut app = multi_channel_app(); // "random" is active
 
         let action = open_files(&mut app);
 
         match action.expect("/files returns an action") {
-            InputAction::CheckSavedFiles(channel) => assert_eq!(channel, "random"),
-            _ => panic!("expected InputAction::CheckSavedFiles"),
+            InputAction::ReadFiles { channel, .. } => assert_eq!(channel, "random"),
+            _ => panic!("expected InputAction::ReadFiles"),
         }
         let overlay = app.viewing_files.as_ref().expect("the overlay is open");
         assert_eq!(overlay.channel, "random");
         assert_eq!(overlay.query, "");
+    }
+
+    #[test]
+    fn synced_files_join_shared_files_and_match_nested_relative_paths() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        open_files(&mut app);
+        apply_local_files(
+            &mut app,
+            vec![local_file("docs/project-plan.md", now_unix_ms())],
+        );
+
+        assert_eq!(listed(&app), ["docs/project-plan.md", "report.pdf"]);
+        type_text(&mut app, "project");
+        assert_eq!(listed(&app), ["docs/project-plan.md"]);
+    }
+
+    #[test]
+    fn a_local_scan_deduplicates_a_saved_shared_copy() {
+        let mut app = app();
+        receive(
+            &mut app,
+            "general",
+            file_message(1, PEER_ID, "report.pdf", b"report"),
+        );
+        open_files(&mut app);
+        mark_saved(
+            &mut app,
+            "general",
+            hash_of(b"report"),
+            "/files/general/report.pdf",
+        );
+        apply_local_files(&mut app, vec![local_file("report.pdf", now_unix_ms())]);
+
+        assert_eq!(app.overlay_files().len(), 1);
+        assert!(matches!(
+            app.overlay_files().as_slice(),
+            [FilesEntry::Shared(_)]
+        ));
+    }
+
+    #[test]
+    fn a_late_files_listing_does_not_update_a_newer_overlay() {
+        let mut app = app();
+        open_files(&mut app);
+        let request = app.viewing_files.as_ref().unwrap().request;
+        let channel = app.viewing_files.as_ref().unwrap().channel.clone();
+        app.handle_key(key(KeyCode::Esc));
+        open_files(&mut app);
+
+        app.apply_files_listing(FilesListing {
+            request,
+            channel,
+            files: Ok(vec![local_file("stale.md", now_unix_ms())]),
+        });
+
+        assert!(app.overlay_files().is_empty());
+    }
+
+    #[test]
+    fn local_files_offer_open_reveal_and_edit_actions() {
+        let mut app = app();
+        open_files(&mut app);
+        apply_local_files(&mut app, vec![local_file("notes.txt", now_unix_ms())]);
+
+        assert!(matches!(
+            ctrl_o(&mut app),
+            Some(InputAction::OpenFile(path)) if path == PathBuf::from("/files/general/notes.txt")
+        ));
+
+        open_files(&mut app);
+        apply_local_files(&mut app, vec![local_file("notes.txt", now_unix_ms())]);
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Some(InputAction::RevealFile(path)) if path == PathBuf::from("/files/general/notes.txt")
+        ));
+
+        open_files(&mut app);
+        apply_local_files(&mut app, vec![local_file("notes.txt", now_unix_ms())]);
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            Some(InputAction::EditFile(path)) if path == PathBuf::from("/files/general/notes.txt")
+        ));
     }
 
     #[test]
@@ -9956,11 +10103,14 @@ mod tests {
         let files = app.files_matches();
 
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].file.filename, "report.pdf");
-        assert_eq!(files[0].file.size, 6);
-        assert_eq!(files[0].file.hash, hash_of(b"six by"));
-        assert_eq!(files[0].sender, PEER_ID);
-        assert_eq!(files[0].ts_unix_ms, 1_760_000_000_000);
+        let FilesEntry::Shared(shared) = &files[0] else {
+            panic!("expected shared attachment");
+        };
+        assert_eq!(shared.file.filename, "report.pdf");
+        assert_eq!(shared.file.size, 6);
+        assert_eq!(shared.file.hash, hash_of(b"six by"));
+        assert_eq!(shared.sender, PEER_ID);
+        assert_eq!(shared.ts_unix_ms, 1_760_000_000_000);
     }
 
     #[test]
@@ -10005,7 +10155,10 @@ mod tests {
 
         let rows: Vec<(&str, [u8; 32])> = files
             .iter()
-            .map(|shared| (shared.file.filename.as_str(), shared.sender))
+            .map(|entry| match entry {
+                FilesEntry::Shared(shared) => (shared.file.filename.as_str(), shared.sender),
+                FilesEntry::Local(_) => panic!("fixture has no local files"),
+            })
             .collect();
         assert_eq!(
             rows,
@@ -10021,7 +10174,13 @@ mod tests {
         open_files(&mut app);
 
         assert_eq!(listed(&app), ["mine.pdf"]);
-        assert_eq!(app.files_matches()[0].sender, SELF_ID);
+        assert!(matches!(
+            app.files_matches()[0],
+            FilesEntry::Shared(SharedFile {
+                sender: SELF_ID,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -10069,8 +10228,8 @@ mod tests {
         ] {
             app.active = index;
             match open_files(&mut app).expect("/files returns an action") {
-                InputAction::CheckSavedFiles(channel) => assert_eq!(channel, name),
-                _ => panic!("expected InputAction::CheckSavedFiles"),
+                InputAction::ReadFiles { channel, .. } => assert_eq!(channel, name),
+                _ => panic!("expected InputAction::ReadFiles"),
             }
             assert_eq!(listed(&app), [expected], "{name}");
             app.handle_key(key(KeyCode::Esc));
@@ -10502,7 +10661,7 @@ mod tests {
 
         assert!(ctrl_o(&mut app).is_none());
 
-        assert_eq!(files_notice(&app), Some(FilesNotice::NotSaved));
+        assert_eq!(files_notice(&app), Some(FilesNotice::NotLocal));
         let (_, _, filename, ..) = save_fields(app.handle_key(key(KeyCode::Enter)));
         assert_eq!(filename, "report.pdf", "the notice points at Enter");
     }
@@ -10572,7 +10731,7 @@ mod tests {
         let saved_document = app_viewing_file("report.pdf", Some("/files/general/report.pdf"));
         assert_eq!(
             saved_document.file_offer(&saved_document.files_matches()[0]),
-            FileOffer::Open(Path::new("/files/general/report.pdf"))
+            FileOffer::Open(PathBuf::from("/files/general/report.pdf"))
         );
 
         let saved_program = app_viewing_file("setup.exe", Some("/files/general/setup.exe"));

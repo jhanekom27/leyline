@@ -15,7 +15,7 @@ pub(super) fn render_files(frame: &mut Frame, app: &AppState) {
         .title(files_title(
             &app.channel_heading(&overlay.channel),
             files.len(),
-            app.channel_files().len(),
+            app.overlay_files().len(),
             area.width as usize,
         ))
         .title_bottom(files_footer(
@@ -57,11 +57,10 @@ pub(super) fn render_files(frame: &mut Frame, app: &AppState) {
         .enumerate()
         .skip(start)
         .take(visible_rows)
-        .map(|(row, shared)| {
+        .map(|(row, entry)| {
             files_row(
                 app,
-                shared,
-                app.saved_copy(shared.file.hash).is_some(),
+                entry,
                 Some(row) == highlighted,
                 list_area.width as usize,
                 now,
@@ -110,16 +109,17 @@ pub(super) fn files_title(heading: &str, shown: usize, total: usize, width: usiz
 /// offer is a dead one.
 pub(super) fn files_footer(
     app: &AppState,
-    highlighted: Option<&SharedFile>,
+    highlighted: Option<&FilesEntry>,
     notice: Option<FilesNotice>,
 ) -> Line<'static> {
     if let Some(notice) = notice {
         let text = match notice {
             FilesNotice::AlreadySaved => " already saved · Ctrl+O opens it ",
-            FilesNotice::NotSaved => " not saved yet · Enter saves it ",
             FilesNotice::SavedNotOpened => {
-                " already saved · won't open programs or scripts from here "
+                " won't open programs or scripts · Ctrl+R reveal · Ctrl+E edit "
             }
+            FilesNotice::NotLocal => " not available locally · Enter saves shared files ",
+            FilesNotice::LocalFile => " already available locally · Ctrl+O opens it ",
         };
         return Line::styled(
             text,
@@ -130,10 +130,12 @@ pub(super) fn files_footer(
     }
     Line::from(match highlighted {
         None => " Esc close ",
-        Some(shared) => match app.file_offer(shared) {
+        Some(entry) => match app.file_offer(entry) {
             FileOffer::Save => " ↑/↓ move · Enter save · Esc close ",
-            FileOffer::Open(_) => " ↑/↓ move · Ctrl+O open · Esc close ",
-            FileOffer::SavedOnly => " ↑/↓ move · Esc close ",
+            FileOffer::Open(_) => {
+                " ↑/↓ move · Ctrl+O open · Ctrl+R reveal · Ctrl+E edit · Esc close "
+            }
+            FileOffer::SavedOnly => " ↑/↓ move · Ctrl+R reveal · Ctrl+E edit · Esc close ",
         },
     })
 }
@@ -146,8 +148,7 @@ pub(super) fn files_footer(
 /// picker's, so it carries no colors of its own.
 pub(super) fn files_row(
     app: &AppState,
-    shared: &SharedFile,
-    saved: bool,
+    entry: &FilesEntry,
     highlighted: bool,
     width: usize,
     now: DateTime<Local>,
@@ -165,7 +166,28 @@ pub(super) fn files_row(
     };
     let muted = Style::default().fg(Color::DarkGray);
 
-    let gutter = if saved { " ✓ " } else { "   " };
+    let (gutter, filename, size, source, source_style, timestamp) = match entry {
+        FilesEntry::Shared(shared) => (
+            if app.saved_copy(shared.file.hash).is_some() {
+                " ✓ "
+            } else {
+                "   "
+            },
+            shared.file.filename.as_str(),
+            shared.file.size,
+            app.display_name(&shared.sender),
+            Style::default().fg(user_color(&shared.sender)),
+            shared.ts_unix_ms,
+        ),
+        FilesEntry::Local(local) => (
+            " ↔ ",
+            local.relative.as_str(),
+            local.size,
+            "sync".to_string(),
+            Style::default().fg(Color::Cyan),
+            local.modified_unix_ms,
+        ),
+    };
     let spans = vec![
         styled(
             gutter.to_string(),
@@ -174,21 +196,12 @@ pub(super) fn files_row(
                 .add_modifier(Modifier::BOLD),
         ),
         styled(
-            format!(
-                "{:<name_width$}",
-                truncate_chars(&shared.file.filename, name_width)
-            ),
+            format!("{:<name_width$}", truncate_chars(filename, name_width)),
             Style::default(),
         ),
-        styled(
-            format!("{:>PICKER_SIZE_WIDTH$}  ", human_size(shared.file.size)),
-            muted,
-        ),
-        styled(
-            fit_name(&app.display_name(&shared.sender), NAME_WIDTH),
-            Style::default().fg(user_color(&shared.sender)),
-        ),
-        styled(format!("  {}", sent_label(shared.ts_unix_ms, now)), muted),
+        styled(format!("{:>PICKER_SIZE_WIDTH$}  ", human_size(size)), muted),
+        styled(fit_name(&source, NAME_WIDTH), source_style),
+        styled(format!("  {}", sent_label(timestamp, now)), muted),
     ];
     let item = ListItem::new(Line::from(spans));
     if highlighted {

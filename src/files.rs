@@ -357,7 +357,24 @@ const OPENER: &str = "xdg-open";
 /// launcher is reaped on a thread of its own, so one that outlives this
 /// call is never left a zombie.
 pub fn open_in_default_app(path: &Path) -> std::io::Result<()> {
-    let mut launcher = open_command(path).spawn()?;
+    launch(open_command(path))
+}
+
+/// Reveals `path` in the OS file manager. macOS selects the file in Finder;
+/// other platforms open its containing directory when selection is not a
+/// portable capability.
+pub fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
+    launch(reveal_command(path))
+}
+
+/// Opens `path` in the platform text editor. This is distinct from default
+/// opening so scripts and other runnable files can be inspected safely.
+pub fn edit_in_text_editor(path: &Path) -> std::io::Result<()> {
+    launch(editor_command(path))
+}
+
+fn launch(mut command: Command) -> std::io::Result<()> {
+    let mut launcher = command.spawn()?;
     std::thread::spawn(move || {
         let _ = launcher.wait();
     });
@@ -371,8 +388,62 @@ pub fn open_in_default_app(path: &Path) -> std::io::Result<()> {
 /// over the TUI.
 fn open_command(path: &Path) -> Command {
     let mut command = Command::new(OPENER);
+    command.arg(path);
+    quiet(&mut command);
     command
-        .arg(path)
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_command(path: &Path) -> Command {
+    let mut command = Command::new("open");
+    command.arg("-R").arg(path);
+    quiet(&mut command);
+    command
+}
+
+#[cfg(target_os = "windows")]
+fn reveal_command(path: &Path) -> Command {
+    let mut command = Command::new("explorer");
+    command.arg(format!("/select,{}", path.display()));
+    quiet(&mut command);
+    command
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn reveal_command(path: &Path) -> Command {
+    let mut command = Command::new("xdg-open");
+    command.arg(path.parent().unwrap_or(path));
+    quiet(&mut command);
+    command
+}
+
+#[cfg(target_os = "macos")]
+fn editor_command(path: &Path) -> Command {
+    let mut command = Command::new("open");
+    command.arg("-e").arg(path);
+    quiet(&mut command);
+    command
+}
+
+#[cfg(target_os = "windows")]
+fn editor_command(path: &Path) -> Command {
+    let mut command = Command::new("notepad");
+    command.arg(path);
+    quiet(&mut command);
+    command
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn editor_command(path: &Path) -> Command {
+    let mut command = Command::new("xdg-open");
+    command.arg(path);
+    quiet(&mut command);
+    command
+}
+
+/// Applies the shared terminal-safe process configuration to an OS launcher.
+fn quiet(command: &mut Command) -> &mut Command {
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -847,6 +918,26 @@ mod tests {
         assert!(
             !message.contains("os error 17"),
             "should replace the cryptic OS error, got: {message}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_reveal_and_editor_launchers_pass_the_path_as_an_argument() {
+        let path = Path::new("/files/general/a & b; $(echo hi).txt");
+
+        let reveal = reveal_command(path);
+        assert_eq!(reveal.get_program(), "open");
+        assert_eq!(
+            reveal.get_args().collect::<Vec<_>>(),
+            ["-R".as_ref(), path.as_os_str()]
+        );
+
+        let editor = editor_command(path);
+        assert_eq!(editor.get_program(), "open");
+        assert_eq!(
+            editor.get_args().collect::<Vec<_>>(),
+            ["-e".as_ref(), path.as_os_str()]
         );
     }
 

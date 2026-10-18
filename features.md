@@ -339,6 +339,15 @@ mechanisms, not one, since they trade off differently:
   a shell, since a file's name is a peer's to choose -- with the standard
   streams closed so it can't draw over the TUI, and reaps the launcher on a
   thread; main.rs checks the file is still there first.
+  The browser now also takes a background snapshot of the active channel's
+  eligible local sync folder and merges it with attachment history: a local
+  path that is already the recorded saved copy of an attachment stays one
+  checked attachment row, while any other local file is shown with a `↔`
+  source marker and its relative path. The same safe inventory used by sync
+  excludes hidden files, `.leyline-trash`, `send/`, symlinks, and temporary
+  editor/download files. Local rows can be opened (`Ctrl+O` when safe),
+  revealed (`Ctrl+R`), or opened in the platform text editor (`Ctrl+E`);
+  unsaved attachment rows keep `Enter`'s existing `/save` behavior.
   Not covered: files shared further back than the channel's loaded history,
   files saved before this existed (they show as unsaved until saved again),
   and any check of what a file is beyond its extension -- the list is a

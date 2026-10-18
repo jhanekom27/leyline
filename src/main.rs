@@ -57,7 +57,9 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, warn};
 
-use app::{AppState, ConflictResolution, InputAction, SaveRequest, SyncConflict};
+use app::{
+    AppState, ConflictResolution, FilesListing, InputAction, LocalFile, SaveRequest, SyncConflict,
+};
 use autosave::{AutoSave, limit as autosave_limit};
 use backfill::BackfillStore;
 use channel_registry::ChannelRegistry;
@@ -66,8 +68,8 @@ use contacts::Contacts;
 use direct_registry::DirectRegistry;
 use dm_registry::DmRegistry;
 use files::{
-    dropped_files, open_in_default_app, resolve_destination, set_files_root, set_size_limit,
-    stage_file, stage_image,
+    dropped_files, edit_in_text_editor, open_in_default_app, resolve_destination,
+    reveal_in_file_manager, set_files_root, set_size_limit, stage_file, stage_image,
 };
 use forgotten_devices::ForgottenDevices;
 use message::ChatMessage;
@@ -730,6 +732,7 @@ async fn run(
     // Likewise for the file picker's folder reads (see `InputAction::
     // ReadFolder`), which are filesystem work, not network activity.
     let (browse_tx, mut browse_rx) = mpsc::channel::<FolderListing>(8);
+    let (files_tx, mut files_rx) = mpsc::channel::<FilesListing>(8);
     let (trash_tx, mut trash_rx) = mpsc::channel::<SyncTrashOutcome>(8);
     let (conflict_tx, mut conflict_rx) = mpsc::channel::<SyncConflictOutcome>(8);
     // Outbox directory reads stay off the event loop, exactly like the file
@@ -1096,14 +1099,41 @@ async fn run(
                                     app.push_system(message);
                                 }
                             }
-                            // The files overlay just opened. What it marks
-                            // as saved is a fact about the disk, answered
-                            // here, before the next frame is drawn: a stat
-                            // per file saved for this one channel, the same
-                            // kind of inline filesystem work as a save's
-                            // destination.
-                            Some(InputAction::CheckSavedFiles(channel)) => {
+                            Some(InputAction::ReadFiles {
+                                request,
+                                channel,
+                                dir,
+                            }) => {
                                 app.apply_saved_files(&channel, saved_files.present_in(&channel));
+                                let files_tx = files_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let files = sync_publish::scan(channel.clone(), dir).map(
+                                        |candidates| {
+                                            candidates
+                                                .into_iter()
+                                                .map(|candidate| LocalFile {
+                                                    path: candidate.path,
+                                                    relative: candidate.relative,
+                                                    size: candidate.size,
+                                                    modified_unix_ms: candidate
+                                                        .modified
+                                                        .duration_since(
+                                                            std::time::SystemTime::UNIX_EPOCH,
+                                                        )
+                                                        .unwrap_or_default()
+                                                        .as_millis()
+                                                        .try_into()
+                                                        .unwrap_or(u64::MAX),
+                                                })
+                                                .collect()
+                                        },
+                                    );
+                                    let _ = files_tx.blocking_send(FilesListing {
+                                        request,
+                                        channel,
+                                        files,
+                                    });
+                                });
                             }
                             // `Ctrl+O` in the files overlay. The copy may have
                             // been deleted since the overlay looked, which
@@ -1119,6 +1149,32 @@ async fn run(
                                 } else if let Err(err) = open_in_default_app(&path) {
                                     app.push_system(format!(
                                         "can't open {}: {err}",
+                                        path.display()
+                                    ));
+                                }
+                            }
+                            Some(InputAction::RevealFile(path)) => {
+                                if !path.is_file() {
+                                    app.push_system(format!(
+                                        "can't reveal {}: it has been moved or deleted",
+                                        path.display()
+                                    ));
+                                } else if let Err(err) = reveal_in_file_manager(&path) {
+                                    app.push_system(format!(
+                                        "can't reveal {}: {err}",
+                                        path.display()
+                                    ));
+                                }
+                            }
+                            Some(InputAction::EditFile(path)) => {
+                                if !path.is_file() {
+                                    app.push_system(format!(
+                                        "can't edit {}: it has been moved or deleted",
+                                        path.display()
+                                    ));
+                                } else if let Err(err) = edit_in_text_editor(&path) {
+                                    app.push_system(format!(
+                                        "can't edit {}: {err}",
                                         path.display()
                                     ));
                                 }
@@ -1747,6 +1803,10 @@ async fn run(
             }
             Some(listing) = browse_rx.recv() => {
                 app.apply_folder_listing(listing);
+                dirty = true;
+            }
+            Some(listing) = files_rx.recv() => {
+                app.apply_files_listing(listing);
                 dirty = true;
             }
             Some(outcome) = trash_rx.recv() => {

@@ -36,6 +36,15 @@ Each instance needs leyline running.
 
 If one participant should only download shared files, use `/sync receive-only`
 there instead. `/sync off` disables both directions for the active channel.
+## Browse a channel's files
+
+Run `/files` to fuzzy-search the channel's shared attachments and its eligible
+local sync files together. Attachment rows retain their saved `✓`; local sync
+rows use `↔` and show their relative folder path. Select a locally available
+file and use `Ctrl+O` to open it, `Ctrl+R` to reveal it in the file manager,
+or `Ctrl+E` to open it in the platform text editor. `Enter` still downloads an
+unsaved shared attachment. The browser excludes the same hidden, temporary,
+outbox, symlink, and trash paths that sync itself ignores.
 
 ## Read the status
 
