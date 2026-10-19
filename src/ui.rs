@@ -16,8 +16,8 @@ use ratatui::widgets::{
 use textwrap::wrap;
 
 use crate::app::{
-    AppState, Channel, FileOffer, FilesEntry, FilesNotice, PeerPresence, TranscriptLine,
-    command_catalog, hex_id, hex_prefix,
+    AppState, Channel, CommandDefinition, FileOffer, FilesEntry, FilesNotice, PeerPresence,
+    TranscriptLine, command_catalog, hex_id, hex_prefix,
 };
 use crate::files::{StagedAttachment, human_size};
 use crate::hyperlink;
@@ -69,6 +69,8 @@ const SWITCHER_MAX_ROWS: usize = 10;
 const COMMAND_PICKER_WIDTH: u16 = 78;
 /// Most command-picker rows shown before it scrolls.
 const COMMAND_PICKER_ROWS: usize = 18;
+/// Width reserved for shortcut labels in command-picker rows.
+const COMMAND_PICKER_SHORTCUT_WIDTH: usize = 8;
 
 /// Width of the file picker overlay (`render_picker`), borders included.
 const PICKER_WIDTH: u16 = 78;
@@ -472,12 +474,104 @@ fn render_switcher(frame: &mut Frame, app: &AppState) {
     );
     render_scroll_indicator(frame, track, start, matches.len(), visible_rows);
 }
+/// Splits a command-picker row into command, shortcut, and description
+/// columns. The shortcut column stays fixed where space permits so empty
+/// cells clearly mean that no shortcut exists, rather than hiding it in
+/// surrounding text.
+fn command_picker_columns(width: usize) -> (usize, usize, usize) {
+    let content_width = width.saturating_sub(1);
+    let shortcut_width = content_width.min(COMMAND_PICKER_SHORTCUT_WIDTH);
+    let remaining = content_width.saturating_sub(shortcut_width);
+    let syntax_width = remaining / 2;
+    let description_width = remaining.saturating_sub(syntax_width);
+    (syntax_width, shortcut_width, description_width)
+}
+
+fn command_picker_header(width: usize) -> Line<'static> {
+    let (syntax_width, shortcut_width, description_width) = command_picker_columns(width);
+    Line::from(vec![
+        Span::styled(
+            format!(" {:<syntax_width$}", "command"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:<shortcut_width$}", "shortcut"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            truncate_chars("description", description_width),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+/// One command-picker row, with every span constrained to a dedicated
+/// column so narrow terminals stay legible.
+fn command_picker_row(
+    command: &CommandDefinition,
+    width: usize,
+    highlighted: bool,
+) -> ListItem<'static> {
+    let (syntax_width, shortcut_width, description_width) = command_picker_columns(width);
+    let syntax_style = if highlighted {
+        Style::default().fg(Color::Black)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    let shortcut_style = if highlighted {
+        Style::default().fg(Color::Black)
+    } else {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    };
+    let description_style = if highlighted {
+        Style::default().fg(Color::Black)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let mut spans = vec![Span::styled(
+        format!(
+            " {:<syntax_width$}",
+            truncate_chars(command.syntax, syntax_width)
+        ),
+        syntax_style,
+    )];
+    spans.push(Span::styled(
+        format!(
+            "{:<shortcut_width$}",
+            truncate_chars(command.shortcut.unwrap_or_default(), shortcut_width)
+        ),
+        shortcut_style,
+    ));
+    spans.push(Span::styled(
+        truncate_chars(command.description, description_width),
+        description_style,
+    ));
+    let item = ListItem::new(Line::from(spans));
+    if highlighted {
+        item.style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        item
+    }
+}
 
 fn command_picker_area(screen: Rect, matches: usize) -> Rect {
     overlay_area(
         screen,
         COMMAND_PICKER_WIDTH,
-        matches.clamp(1, COMMAND_PICKER_ROWS),
+        matches.clamp(1, COMMAND_PICKER_ROWS) + 1,
     )
 }
 
@@ -490,7 +584,8 @@ fn switcher_area(screen: Rect, matches: usize) -> Rect {
     overlay_area(screen, SWITCHER_WIDTH, matches.clamp(1, SWITCHER_MAX_ROWS))
 }
 /// The slash-command picker opened with `Ctrl+K`. It mirrors the switcher's
-/// modal behavior, but rows show each command's syntax and description.
+/// modal behavior, but rows show each command's syntax, shortcut, if any,
+/// and description in dedicated columns.
 fn render_command_picker(frame: &mut Frame, app: &AppState) {
     let Some(picker) = &app.command_picker else {
         return;
@@ -499,15 +594,23 @@ fn render_command_picker(frame: &mut Frame, app: &AppState) {
     let highlighted = app.command_picker_highlight();
     let area = command_picker_area(frame.area(), matches.len());
     let block = Block::bordered()
-        .title("commands")
-        .title_bottom("↑/↓ move · Enter run · Esc cancel")
+        .title("commands · Ctrl+K")
+        .title_bottom("↑/↓ move · Enter run · Ctrl+P channels · Esc cancel")
         .border_type(BorderType::Rounded);
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
-    let [query_area, list_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    let [query_area, header_area, list_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
     render_filter_row(frame, query_area, &picker.query);
+    frame.render_widget(
+        Paragraph::new(command_picker_header(header_area.width as usize)),
+        header_area,
+    );
 
     if matches.is_empty() {
         frame.render_widget(
@@ -528,44 +631,16 @@ fn render_command_picker(frame: &mut Frame, app: &AppState) {
         .position(|&index| Some(index) == highlighted)
         .unwrap_or(0);
     let start = nav_scroll_offset(matches.len(), visible_rows, highlighted_row);
-    let syntax_width = (list_area.width as usize / 2).max(1);
     let items = matches
         .iter()
         .skip(start)
         .take(visible_rows)
         .map(|&index| {
-            let command = &command_catalog()[index];
-            let syntax_style = if Some(index) == highlighted {
-                Style::default().fg(Color::Black)
-            } else {
-                Style::default().fg(Color::Cyan)
-            };
-            let description_style = if Some(index) == highlighted {
-                Style::default().fg(Color::Black)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let row = Line::from(vec![
-                Span::styled(
-                    format!(
-                        " {:<syntax_width$}",
-                        truncate_chars(command.syntax, syntax_width)
-                    ),
-                    syntax_style,
-                ),
-                Span::styled(command.description, description_style),
-            ]);
-            let item = ListItem::new(row);
-            if Some(index) == highlighted {
-                item.style(
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                item
-            }
+            command_picker_row(
+                &command_catalog()[index],
+                list_area.width as usize,
+                Some(index) == highlighted,
+            )
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(items), list_area);
@@ -2974,6 +3049,68 @@ mod tests {
         assert!(text.contains("/join <name|ticket>"), "got: {text}");
         assert!(text.contains("Join or create a channel"), "got: {text}");
     }
+
+    #[test]
+    fn command_picker_shows_shortcuts_in_a_dedicated_column() {
+        let mut app = app_with_every_kind();
+        open_command_picker(&mut app);
+        type_text(&mut app, "paste");
+        let rows = render_to_rows(&app);
+        let text = rows.join("\n");
+
+        assert!(text.contains("commands · Ctrl+K"), "got: {text}");
+        assert!(text.contains("Ctrl+P channels"), "got: {text}");
+        assert!(text.contains("/paste"), "got: {text}");
+        assert!(text.contains("Ctrl+V"), "got: {text}");
+        assert!(text.contains("Share the clipboard"), "got: {text}");
+        let header = rows.iter().find(|row| row.contains("shortcut")).unwrap();
+        let paste = rows.iter().find(|row| row.contains("Ctrl+V")).unwrap();
+        assert_eq!(
+            header.find("shortcut"),
+            paste.find("Ctrl+V"),
+            "shortcut labels must align under their dedicated header"
+        );
+
+        press(&mut app, KeyCode::Esc);
+        open_command_picker(&mut app);
+        type_text(&mut app, "invite");
+        let text = render_to_rows(&app).join("\n");
+        assert!(text.contains("/invite"), "got: {text}");
+        assert!(!text.contains("[Ctrl+V]"), "got: {text}");
+    }
+
+    #[test]
+    fn command_picker_shows_reply_and_thread_shortcuts() {
+        let mut app = app_with_every_kind();
+        open_command_picker(&mut app);
+        type_text(&mut app, "reply");
+        let reply = render_to_rows(&app).join("\n");
+        assert!(reply.contains("Ctrl+R"), "got: {reply}");
+
+        press(&mut app, KeyCode::Esc);
+        open_command_picker(&mut app);
+        type_text(&mut app, "thread");
+        let thread = render_to_rows(&app).join("\n");
+        assert!(thread.contains("Ctrl+T"), "got: {thread}");
+    }
+
+    #[test]
+    fn command_picker_shortcuts_survive_narrow_terminals() {
+        let mut app = app_with_every_kind();
+        open_command_picker(&mut app);
+        type_text(&mut app, "paste");
+
+        for width in 1..=24 {
+            for height in 1..=8 {
+                render_to_buffer(&app, width, height);
+            }
+        }
+
+        let buffer = render_to_buffer(&app, 24, 8);
+        let area = command_picker_area(Rect::new(0, 0, 24, 8), 1);
+        let text = box_rows(&buffer, area).join("\n");
+        assert!(text.contains("Ctrl+V"), "got: {text}");
+    }
     #[test]
     fn command_picker_uses_more_rows_and_keeps_selected_text_readable() {
         let mut app = app_with_every_kind();
@@ -2981,10 +3118,10 @@ mod tests {
 
         let screen = Rect::new(0, 0, 100, 40);
         let area = command_picker_area(screen, app.command_picker_matches().len());
-        assert_eq!(area.height, COMMAND_PICKER_ROWS as u16 + 3);
+        assert_eq!(area.height, COMMAND_PICKER_ROWS as u16 + 4);
 
         let buffer = render_to_buffer(&app, screen.width, screen.height);
-        let selected_syntax = &buffer[(area.x + 2, area.y + 2)];
+        let selected_syntax = &buffer[(area.x + 2, area.y + 3)];
         assert_eq!(selected_syntax.fg, Color::Black);
         assert_eq!(selected_syntax.bg, Color::Cyan);
     }

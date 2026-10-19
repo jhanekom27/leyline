@@ -69,6 +69,9 @@ const MAX_SCROLLBACK: usize = 500;
 pub struct CommandDefinition {
     pub syntax: &'static str,
     pub input: &'static str,
+    /// A global keybinding for this command or its more specific picker, if
+    /// one exists.
+    pub shortcut: Option<&'static str>,
     pub aliases: &'static [&'static str],
     pub description: &'static str,
 }
@@ -77,180 +80,210 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/join <name|ticket>",
         input: "/join ",
+        shortcut: None,
         aliases: &[],
         description: "Join or create a channel",
     },
     CommandDefinition {
         syntax: "/invite",
         input: "/invite",
+        shortcut: None,
         aliases: &[],
         description: "Show an invite for this channel",
     },
     CommandDefinition {
         syntax: "/pair [ticket]",
         input: "/pair ",
+        shortcut: None,
         aliases: &[],
         description: "Pair a device or show a pairing ticket",
     },
     CommandDefinition {
         syntax: "/forget-device <hex-prefix>",
         input: "/forget-device ",
+        shortcut: None,
         aliases: &[],
         description: "Forget a paired device",
     },
     CommandDefinition {
         syntax: "/msg <peer> [text]",
         input: "/msg ",
+        shortcut: None,
         aliases: &[],
         description: "Start a private channel message",
     },
     CommandDefinition {
         syntax: "/dm <peer> [text]",
         input: "/dm ",
+        shortcut: None,
         aliases: &[],
         description: "Start a direct peer conversation",
     },
     CommandDefinition {
         syntax: "/alias <hex-prefix> <name>",
         input: "/alias ",
+        shortcut: None,
         aliases: &[],
         description: "Set a local name for a peer",
     },
     CommandDefinition {
         syntax: "/nick <name>",
         input: "/nick ",
+        shortcut: None,
         aliases: &[],
         description: "Set your broadcast display name",
     },
     CommandDefinition {
         syntax: "/leave [channel]",
         input: "/leave",
+        shortcut: None,
         aliases: &[],
         description: "Leave a channel",
     },
     CommandDefinition {
         syntax: "/rename [name]",
         input: "/rename ",
+        shortcut: None,
         aliases: &[],
         description: "Set this channel's local display name",
     },
     CommandDefinition {
         syntax: "/who",
         input: "/who",
+        shortcut: None,
         aliases: &[],
         description: "List channel peers",
     },
     CommandDefinition {
         syntax: "/send [path]",
         input: "/send",
+        shortcut: None,
         aliases: &[],
         description: "Pick or share a file",
     },
     CommandDefinition {
         syntax: "/save [hash-prefix]",
         input: "/save",
+        shortcut: None,
         aliases: &[],
         description: "Download a shared file",
     },
     CommandDefinition {
         syntax: "/folder [path]",
         input: "/folder",
+        shortcut: None,
         aliases: &[],
         description: "Show or set the files folder",
     },
     CommandDefinition {
         syntax: "/maxsize [size|off|default]",
         input: "/maxsize",
+        shortcut: None,
         aliases: &[],
         description: "Show or set the file size limit",
     },
     CommandDefinition {
         syntax: "/autosave [on|off|limit]",
         input: "/autosave",
+        shortcut: None,
         aliases: &[],
         description: "Configure automatic file saving",
     },
     CommandDefinition {
         syntax: "/outbox [on|off]",
         input: "/outbox",
+        shortcut: None,
         aliases: &[],
         description: "Configure the watched send folder",
     },
     CommandDefinition {
         syntax: "/sync [options]",
         input: "/sync",
+        shortcut: None,
         aliases: &[],
         description: "Configure folder synchronization",
     },
     CommandDefinition {
         syntax: "/activity",
         input: "/activity",
+        shortcut: None,
         aliases: &[],
         description: "Show recent sync activity",
     },
     CommandDefinition {
         syntax: "/conflicts [resolution]",
         input: "/conflicts",
+        shortcut: None,
         aliases: &[],
         description: "List or resolve sync conflicts",
     },
     CommandDefinition {
         syntax: "/trash [restore|purge]",
         input: "/trash",
+        shortcut: None,
         aliases: &[],
         description: "Manage recoverable sync deletes",
     },
     CommandDefinition {
         syntax: "/files",
         input: "/files",
+        shortcut: None,
         aliases: &[],
         description: "Browse shared and synced channel files",
     },
     CommandDefinition {
         syntax: "/paste",
         input: "/paste",
+        shortcut: Some("Ctrl+V"),
         aliases: &[],
         description: "Share the clipboard",
     },
     CommandDefinition {
         syntax: "/search <term>",
         input: "/search ",
+        shortcut: None,
         aliases: &["/s"],
         description: "Search channel messages",
     },
     CommandDefinition {
         syntax: "/reply [text]",
         input: "/reply",
+        shortcut: Some("Ctrl+R"),
         aliases: &[],
         description: "Reply to the latest message",
     },
     CommandDefinition {
         syntax: "/thread",
         input: "/thread",
+        shortcut: Some("Ctrl+T"),
         aliases: &[],
         description: "View the latest reply thread",
     },
     CommandDefinition {
         syntax: "/hints",
         input: "/hints",
+        shortcut: None,
         aliases: &[],
         description: "Toggle command hints and hover reporting",
     },
     CommandDefinition {
         syntax: "/bell",
         input: "/bell",
+        shortcut: None,
         aliases: &[],
         description: "Toggle the message bell",
     },
     CommandDefinition {
         syntax: "/version",
         input: "/version",
+        shortcut: None,
         aliases: &[],
         description: "Show this build's version",
     },
     CommandDefinition {
         syntax: "/help",
         input: "/help",
+        shortcut: None,
         aliases: &[],
         description: "Show command and keybinding help",
     },
@@ -5715,6 +5748,21 @@ mod tests {
         assert!(app.command_picker.is_some());
         assert_eq!(app.active().input, "hi!");
         assert!(!app.is_composing());
+    }
+    #[test]
+    fn command_catalog_exposes_command_shortcuts() {
+        let shortcuts: Vec<_> = command_catalog()
+            .iter()
+            .filter_map(|command| command.shortcut.map(|shortcut| (command.syntax, shortcut)))
+            .collect();
+        assert_eq!(
+            shortcuts,
+            vec![
+                ("/paste", "Ctrl+V"),
+                ("/reply [text]", "Ctrl+R"),
+                ("/thread", "Ctrl+T"),
+            ]
+        );
     }
 
     #[test]
