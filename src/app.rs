@@ -42,6 +42,22 @@ pub struct PeerPresence {
     pub last_seen_unix_ms: Option<u64>,
 }
 
+/// What the peers-panel hover popup shows for one peer -- see
+/// `AppState::peer_details`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerDetails {
+    /// The hovered device's id, for its identity colour.
+    pub id: [u8; 32],
+    /// Our local `/alias` for them, if any.
+    pub alias: Option<String>,
+    /// Their self-chosen `/nick`, if they've announced one.
+    pub nickname: Option<String>,
+    /// `None` while online, as in `PeerPresence`.
+    pub last_seen_unix_ms: Option<u64>,
+    /// Their announced leyline build version, if heard.
+    pub version: Option<String>,
+}
+
 /// Cap on in-memory scrollback per channel, per concept.md's guidance on
 /// bounding render/memory cost in a long-lived session.
 const MAX_SCROLLBACK: usize = 500;
@@ -1071,6 +1087,9 @@ pub struct AppState {
     /// The command-hints row under the mouse, if any -- `ui::render`
     /// shows that command's popup while it's set.
     hint_hover: Option<usize>,
+    /// The peers-panel peer under the mouse, if any -- `ui::render`
+    /// shows their popup while it's set.
+    peer_hover: Option<[u8; 32]>,
     /// Whether an incoming message rings the terminal bell -- toggled via
     /// `/bell` (`run_bell`). Unlike `show_hints`, this preference is
     /// persisted across restarts (see `crate::settings::Settings`);
@@ -1277,6 +1296,7 @@ impl AppState {
             should_quit: false,
             show_hints: true,
             hint_hover: None,
+            peer_hover: None,
             bell_enabled: true,
             petnames: HashMap::new(),
             nicknames: HashMap::new(),
@@ -2960,6 +2980,48 @@ impl AppState {
         self.hint_hover.filter(|_| self.can_hover_hints())
     }
 
+    /// Records the peers-panel peer measured under the mouse by the
+    /// read-only UI layout (`ui::peer_at`); returns whether the frame
+    /// changed. Gated like `set_hint_hover`, since mouse reporting itself
+    /// is only on while the hints panel is shown.
+    pub fn set_peer_hover(&mut self, peer: Option<[u8; 32]>) -> bool {
+        let peer = peer.filter(|_| self.can_hover_hints());
+        if self.peer_hover == peer {
+            return false;
+        }
+        self.peer_hover = peer;
+        true
+    }
+
+    /// The hovered peer's popup details -- never while another view owns
+    /// input, nor once that peer has left the active channel's list, even
+    /// before the next mouse event clears the hover.
+    pub fn hovered_peer(&self) -> Option<PeerDetails> {
+        let id = self.peer_hover.filter(|_| self.can_hover_hints())?;
+        let peer = self
+            .peer_presence()
+            .into_iter()
+            .find(|peer| peer.id == id)?;
+        Some(self.peer_details(&peer))
+    }
+
+    /// Everything the peers-panel popup shows about `peer`. Alias, nickname,
+    /// and version are recorded per person (`canonical_id`), like
+    /// `display_name`.
+    pub fn peer_details(&self, peer: &PeerPresence) -> PeerDetails {
+        let id = self.canonical_id(&peer.id);
+        PeerDetails {
+            id: peer.id,
+            alias: self.petnames.get(&id).cloned(),
+            nickname: self.nicknames.get(&id).cloned(),
+            last_seen_unix_ms: peer.last_seen_unix_ms,
+            version: self
+                .peer_versions
+                .get(&id)
+                .map(|(version, _)| version.clone()),
+        }
+    }
+
     /// Handles `/hints`: toggles the sidebar's command hints panel (see
     /// `ui::render_sidebar`) and reports the new state as a system
     /// notice. Purely local UI state -- no `InputAction` needed, unlike
@@ -2967,6 +3029,7 @@ impl AppState {
     fn run_hints(&mut self) -> Option<InputAction> {
         self.show_hints = !self.show_hints;
         self.set_hint_hover(None);
+        self.set_peer_hover(None);
         let state = if self.show_hints { "shown" } else { "hidden" };
         self.push_system(format!("command hints {state}"));
         None
@@ -4496,7 +4559,7 @@ fn peer_for_channel(associations: &HashMap<[u8; 32], String>, channel: &str) -> 
 }
 
 /// Shortened hex id used to display peers we don't have a nickname for.
-fn hex_prefix(bytes: &[u8; 32]) -> String {
+pub fn hex_prefix(bytes: &[u8; 32]) -> String {
     bytes[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -5066,6 +5129,71 @@ mod tests {
                 last_seen_unix_ms: Some(100),
             }]
         );
+    }
+
+    #[test]
+    fn hovered_peer_reports_alias_nickname_presence_and_version() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        assert!(app.set_peer_hover(Some(PEER_ID)));
+        assert!(!app.set_peer_hover(Some(PEER_ID)));
+        assert_eq!(
+            app.hovered_peer(),
+            Some(PeerDetails {
+                id: PEER_ID,
+                alias: None,
+                nickname: None,
+                last_seen_unix_ms: None,
+                version: None,
+            })
+        );
+
+        app.load_contacts(HashMap::from([(PEER_ID, "Alice".to_string())]));
+        app.handle_net_event(NetEvent::Identity(
+            "general".to_string(),
+            IdentityAnnounce {
+                sender: PEER_ID,
+                nickname: "ally".to_string(),
+            },
+        ));
+        app.handle_net_event(NetEvent::Version(
+            "general".to_string(),
+            VersionAnnounce {
+                sender: PEER_ID,
+                version: "1.2.3".to_string(),
+                git_hash: "abc1234".to_string(),
+            },
+        ));
+        app.record_peer_seen("general", PEER_ID, 100);
+        app.handle_net_event(NetEvent::PeerLeft("general".to_string(), PEER_ID));
+
+        assert_eq!(
+            app.hovered_peer(),
+            Some(PeerDetails {
+                id: PEER_ID,
+                alias: Some("Alice".to_string()),
+                nickname: Some("ally".to_string()),
+                last_seen_unix_ms: Some(100),
+                version: Some("1.2.3".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn hovered_peer_is_hidden_for_an_unlisted_peer_and_behind_overlays() {
+        let mut app = app();
+        app.set_peer_hover(Some(PEER_ID));
+        assert_eq!(app.hovered_peer(), None, "not in the active channel");
+
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        assert!(app.hovered_peer().is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(app.hovered_peer(), None, "the command picker owns input");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        submit(&mut app, "/hints");
+        assert!(app.peer_hover.is_none());
+        assert!(!app.set_peer_hover(Some(PEER_ID)));
     }
 
     #[test]
