@@ -657,7 +657,7 @@ async fn run(
     app.load_autosave_limit(autosave_limit);
     app.load_outbox(outbox.channels());
     app.load_sync(sync_settings.configs());
-    app.load_settings(settings.bell_enabled());
+    app.load_settings(settings.bell_enabled(), settings.nickname());
     app.load_dm_registry(dm_registry.all());
     app.load_forgotten_devices(forgotten_devices.all());
     app.load_browse_dir(start_folder(&data_dir));

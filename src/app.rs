@@ -42,8 +42,7 @@ pub struct PeerPresence {
     pub last_seen_unix_ms: Option<u64>,
 }
 
-/// What the peers-panel hover popup shows for one peer -- see
-/// `AppState::peer_details`.
+/// Identity and presence details for one row in a peer presentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerDetails {
     /// The hovered device's id, for its identity colour.
@@ -152,7 +151,7 @@ const COMMANDS: &[CommandDefinition] = &[
         input: "/who",
         shortcut: None,
         aliases: &[],
-        description: "List channel peers",
+        description: "View this device and active peer details",
     },
     CommandDefinition {
         syntax: "/send [path]",
@@ -439,6 +438,16 @@ pub struct Switcher {
 pub struct CommandPicker {
     pub query: String,
     selected: usize,
+}
+
+/// The peer-details overlay opened with `/who`. It snapshots the active
+/// channel's online and remembered peers plus their current identity details
+/// so a later focus change or network update cannot change the table out from
+/// under the user.
+#[derive(Debug)]
+pub struct PeersOverlay {
+    pub heading: String,
+    pub peers: Vec<PeerDetails>,
 }
 
 /// The files overlay opened with `/files` -- see `AppState::viewing_files`.
@@ -1130,6 +1139,10 @@ pub struct AppState {
     /// `load_settings` seeds the actual saved value, mirroring how
     /// `petnames` starts empty until `load_contacts` runs.
     pub bell_enabled: bool,
+    /// This device's persisted broadcast nickname, if one was configured
+    /// with `/nick`. Kept separately from peer announcements because this
+    /// device does not receive its own identity gossip.
+    local_nickname: Option<String>,
     /// Local pet names assigned via `/alias`, keyed by endpoint id --
     /// checked by `display_name` before falling back to a hex prefix.
     /// Seeded once at startup from `crate::contacts::Contacts` (see
@@ -1213,6 +1226,9 @@ pub struct AppState {
     /// The open slash-command picker (`Ctrl+K`). It owns keyboard input like
     /// the conversation switcher and never invokes a command directly.
     pub command_picker: Option<CommandPicker>,
+    /// The peer-details overlay opened with `/who`. It owns input until
+    /// `Esc` closes it, like the file and command-picker overlays.
+    pub viewing_peers: Option<PeersOverlay>,
     /// The open file picker (a bare `/send`, see `run_send`), if any. A modal
     /// mode like `switching`: `handle_key` hands it every key, a paste
     /// filters it, and `is_composing` is false while it's open.
@@ -1331,6 +1347,7 @@ impl AppState {
             hint_hover: None,
             peer_hover: None,
             bell_enabled: true,
+            local_nickname: None,
             petnames: HashMap::new(),
             nicknames: HashMap::new(),
             peer_versions: HashMap::new(),
@@ -1345,6 +1362,7 @@ impl AppState {
             picking_thread: None,
             switching: None,
             command_picker: None,
+            viewing_peers: None,
             replying_to: None,
             pending_redeem: None,
             restart_with_ticket: None,
@@ -1421,12 +1439,13 @@ impl AppState {
         self.self_user_id = user_id;
     }
 
-    /// Seeds the persisted bell preference loaded by the caller (see
+    /// Seeds persisted local preferences loaded by the caller (see
     /// settings.rs). Intended to be called once, right after
     /// `AppState::new`, before the event loop starts -- mirrors
     /// `load_contacts`.
-    pub fn load_settings(&mut self, bell_enabled: bool) {
+    pub fn load_settings(&mut self, bell_enabled: bool, nickname: Option<String>) {
         self.bell_enabled = bell_enabled;
+        self.local_nickname = nickname;
     }
 
     /// Seeds known peer <-> DM channel associations persisted by the
@@ -1996,6 +2015,10 @@ impl AppState {
         if self.command_picker.is_some() {
             return self.handle_command_picker_key(key);
         }
+        if self.viewing_peers.is_some() {
+            self.handle_peers_overlay_key(key);
+            return None;
+        }
         if self.picking_file.is_some() {
             return self.handle_picker_key(key);
         }
@@ -2287,6 +2310,14 @@ impl AppState {
             _ => {}
         }
         None
+    }
+
+    fn handle_peers_overlay_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
+        } else if key.code == KeyCode::Esc {
+            self.viewing_peers = None;
+        }
     }
 
     fn edit_command_picker_query(&mut self, edit: impl FnOnce(&mut String)) {
@@ -2940,7 +2971,7 @@ impl AppState {
             "/dm <alias|hex-prefix|endpoint-id> [text] -- connect directly to a peer's endpoint id with no ticket or gossip channel, unlike /msg".to_string(),
             "/leave [channel] -- leave a channel".to_string(),
             "/rename [name] -- set this channel's local display name".to_string(),
-            "/who -- list channel peers".to_string(),
+            "/who -- open this device plus online and remembered peer details for the active channel".to_string(),
             "/send [path] -- share a file; a bare /send opens a file picker".to_string(),
             "/save [hash-prefix] -- download a shared file; each channel's files are kept in a folder of their own".to_string(),
             "/folder [path] -- show where saved files go and, with a path, move them all".to_string(),
@@ -2972,7 +3003,8 @@ impl AppState {
             "Ctrl+R -- reply (\u{2191}/\u{2193} pick, Enter confirm)",
             "Ctrl+T -- thread (\u{2191}/\u{2193} pick, Enter confirm)",
             "Up/Down -- scroll",
-            "Esc/Ctrl+C -- quit",
+            "Esc -- close /who peer details, the Ctrl+P jump-to list, or the Ctrl+K command picker; cancel an in-progress reply or thread pick, or an armed reply; otherwise clear staged attachments, leave an open thread, or quit",
+            "Ctrl+C -- quit",
         ];
         self.push_system(format!(
             "commands:\n\n{}\n\nkeys:\n\n{}",
@@ -2986,6 +3018,7 @@ impl AppState {
     pub fn can_hover_hints(&self) -> bool {
         self.show_hints
             && self.command_picker.is_none()
+            && self.viewing_peers.is_none()
             && self.switching.is_none()
             && self.picking_file.is_none()
             && self.viewing_files.is_none()
@@ -3052,6 +3085,16 @@ impl AppState {
                 .peer_versions
                 .get(&id)
                 .map(|(version, _)| version.clone()),
+        }
+    }
+
+    fn self_peer_details(&self) -> PeerDetails {
+        PeerDetails {
+            id: self.self_id,
+            alias: None,
+            nickname: self.local_nickname.clone(),
+            last_seen_unix_ms: None,
+            version: None,
         }
     }
 
@@ -3197,6 +3240,7 @@ impl AppState {
             self.push_system("usage: /nick <name>");
             return None;
         }
+        self.local_nickname = Some(arg.to_string());
         self.push_system(format!(
             "nickname set to {arg} (broadcast to joined channels)"
         ));
@@ -3329,87 +3373,31 @@ impl AppState {
             })
     }
 
-    /// Handles `/who`: lists the active channel's current peers, one per
-    /// system notice, each showing their full endpoint id plus their
-    /// broadcast nickname and/or local alias if set (see `who_line`).
-    /// Unlike `display_name`, which blends petname/nickname/hex-prefix
-    /// into a single string with a precedence order for compact display
-    /// elsewhere, `/who` exists specifically to show all three fields
-    /// explicitly (features.md's "`/who`" entry). Takes no argument --
-    /// like `/invite`, it always reports on the active channel. Purely
-    /// local, like `/hints`/`/help`: no `InputAction` needed.
+    /// Handles `/who`: opens a local, dismissible table for the active
+    /// channel's online and remembered peers. Presence comes from the same
+    /// `peer_presence` view as the sidebar, while alias and nickname follow
+    /// `peer_details`' canonical identity lookup. The table is a snapshot,
+    /// so a focus change or network event cannot replace its data while it is
+    /// open.
     fn run_who(&mut self) -> Option<InputAction> {
-        let channel = self.active();
-        let name = self.channel_heading(&channel.name);
-        let peers = channel.peers.clone();
-        if peers.is_empty() {
-            self.push_system(format!("no peers currently in {name}"));
-            return None;
-        }
-        self.push_system(format!("peers in {name} ({}):", peers.len()));
-        for line in self.grouped_who_lines(&peers) {
-            self.push_system(line);
-        }
+        let heading = self.channel_heading(&self.active().name);
+        let presence = self.peer_presence();
+        let first_offline = presence
+            .iter()
+            .position(|peer| peer.last_seen_unix_ms.is_some())
+            .unwrap_or(presence.len());
+        let mut peers: Vec<_> = presence[..first_offline]
+            .iter()
+            .map(|peer| self.peer_details(peer))
+            .collect();
+        peers.push(self.self_peer_details());
+        peers.extend(
+            presence[first_offline..]
+                .iter()
+                .map(|peer| self.peer_details(peer)),
+        );
+        self.viewing_peers = Some(PeersOverlay { heading, peers });
         None
-    }
-
-    /// Groups `peers` (raw device ids, in `/who`'s existing per-channel
-    /// order) by `canonical_id`, so devices certified under the same user
-    /// key are shown together instead of as unrelated lines. A group of
-    /// exactly one device -- the common case, since this only groups once
-    /// a certificate has actually been seen -- renders identically to a
-    /// bare `who_line`, so an unpaired peer's `/who` output is unchanged
-    /// from before device certificates existed.
-    fn grouped_who_lines(&self, peers: &[[u8; 32]]) -> Vec<String> {
-        let mut groups: Vec<([u8; 32], Vec<[u8; 32]>)> = Vec::new();
-        for &id in peers {
-            let canonical = self.canonical_id(&id);
-            match groups
-                .iter_mut()
-                .find(|(group_id, _)| *group_id == canonical)
-            {
-                Some((_, devices)) => devices.push(id),
-                None => groups.push((canonical, vec![id])),
-            }
-        }
-        let mut lines = Vec::new();
-        for (canonical, devices) in groups {
-            match devices.as_slice() {
-                [only] => lines.push(self.who_line(only)),
-                _ => {
-                    lines.push(format!(
-                        "{} ({} devices):",
-                        self.display_name(&canonical),
-                        devices.len()
-                    ));
-                    lines.extend(devices.iter().map(|id| format!("  {}", self.who_line(id))));
-                }
-            }
-        }
-        lines
-    }
-
-    /// Formats one `/who` line for `id`: its full hex id, plus `nickname:
-    /// <n>` and/or `alias: <a>` in parentheses for whichever of
-    /// `nicknames`/`petnames` actually have an entry for it -- both are
-    /// shown when both are set, and neither is invented when absent,
-    /// unlike `display_name`'s single-string fallback chain.
-    fn who_line(&self, id: &[u8; 32]) -> String {
-        let mut details = Vec::new();
-        if let Some(nickname) = self.nicknames.get(id) {
-            details.push(format!("nickname: {nickname}"));
-        }
-        if let Some(alias) = self.petnames.get(id) {
-            details.push(format!("alias: {alias}"));
-        }
-        if let Some((version, git_hash)) = self.peer_versions.get(id) {
-            details.push(format!("version: {version} ({git_hash})"));
-        }
-        if details.is_empty() {
-            hex_id(id)
-        } else {
-            format!("{} ({})", hex_id(id), details.join(", "))
-        }
     }
 
     /// Handles `/version`: reports our own build version and git commit,
@@ -4516,6 +4504,7 @@ impl AppState {
             && self.picking_thread.is_none()
             && self.switching.is_none()
             && self.command_picker.is_none()
+            && self.viewing_peers.is_none()
             && self.picking_file.is_none()
             && self.viewing_files.is_none()
     }
@@ -4544,6 +4533,9 @@ impl AppState {
             self.edit_command_picker_query(|query| {
                 query.extend(text.chars().filter(|c| !c.is_control()));
             });
+            return;
+        }
+        if self.viewing_peers.is_some() {
             return;
         }
         // So does an open file picker, whose filter is one line too.
@@ -5617,7 +5609,7 @@ mod tests {
     }
 
     #[test]
-    fn older_peer_version_does_not_notice_but_is_recorded_for_who() {
+    fn older_peer_version_does_not_notice_but_is_recorded_for_peer_details() {
         let mut app = app();
         app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
         let before = app.active().messages.len();
@@ -5637,8 +5629,17 @@ mod tests {
         );
 
         submit(&mut app, "/who");
-        let last = as_system(app.active().messages.back().unwrap());
-        assert!(last.contains("version: 0.0.0 (abc1234)"), "got: {last}");
+        assert_eq!(
+            app.viewing_peers
+                .as_ref()
+                .unwrap()
+                .peers
+                .first()
+                .unwrap()
+                .version
+                .as_deref(),
+            Some("0.0.0")
+        );
     }
 
     #[test]
@@ -6080,8 +6081,9 @@ mod tests {
                 "{command} should start its own line, got: {last}"
             );
         }
+        assert!(last.contains("/who peer details"), "got: {last}");
         assert!(
-            last.lines().any(|line| line == "Esc/Ctrl+C -- quit"),
+            last.lines().any(|line| line == "Ctrl+C -- quit"),
             "got: {last}"
         );
     }
@@ -6183,10 +6185,30 @@ mod tests {
     }
 
     #[test]
-    fn load_settings_seeds_bell_enabled() {
+    fn load_settings_seeds_bell_enabled_and_local_nickname() {
         let mut app = app();
-        app.load_settings(false);
+        app.load_settings(false, Some("me".to_string()));
         assert!(!app.bell_enabled);
+        assert_eq!(app.local_nickname.as_deref(), Some("me"));
+    }
+
+    #[test]
+    fn slash_nick_updates_this_devices_who_row() {
+        let mut app = app();
+
+        let action = submit(&mut app, "/nick me");
+        submit(&mut app, "/who");
+
+        assert!(matches!(action, Some(InputAction::Nick(name)) if name == "me"));
+        let self_row = app
+            .viewing_peers
+            .as_ref()
+            .unwrap()
+            .peers
+            .iter()
+            .find(|peer| peer.id == SELF_ID)
+            .unwrap();
+        assert_eq!(self_row.nickname.as_deref(), Some("me"));
     }
 
     #[test]
@@ -6811,100 +6833,96 @@ mod tests {
     }
 
     #[test]
-    fn slash_who_reports_no_peers_when_channel_is_empty() {
+    fn slash_who_includes_this_devices_endpoint_without_a_transcript_notice() {
         let mut app = app();
+        let messages = app.active().messages.len();
+
         let action = submit(&mut app, "/who");
+
         assert!(action.is_none());
-        let last = as_system(app.active().messages.back().unwrap());
-        assert_eq!(last, "no peers currently in #general");
-    }
-
-    #[test]
-    fn slash_who_lists_a_peer_with_no_nickname_or_alias() {
-        let mut app = app();
-        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
-        let action = submit(&mut app, "/who");
-        assert!(action.is_none());
-        let messages: Vec<&TranscriptLine> = app.active().messages.iter().collect();
-        let len = messages.len();
-        assert_eq!(as_system(messages[len - 2]), "peers in #general (1):");
-        assert_eq!(as_system(messages[len - 1]), hex_id(&PEER_ID));
-    }
-
-    #[test]
-    fn slash_who_shows_nickname_when_set() {
-        let mut app = app();
-        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
-        app.handle_net_event(NetEvent::Identity(
-            "general".to_string(),
-            IdentityAnnounce {
-                sender: PEER_ID,
-                nickname: "alice".to_string(),
-            },
-        ));
-        submit(&mut app, "/who");
-        let last = as_system(app.active().messages.back().unwrap());
-        assert_eq!(last, format!("{} (nickname: alice)", hex_id(&PEER_ID)));
-    }
-
-    #[test]
-    fn slash_who_shows_alias_when_set() {
-        let mut app = app();
-        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
-        app.load_contacts(HashMap::from([(PEER_ID, "Bob".to_string())]));
-        submit(&mut app, "/who");
-        let last = as_system(app.active().messages.back().unwrap());
-        assert_eq!(last, format!("{} (alias: Bob)", hex_id(&PEER_ID)));
-    }
-
-    #[test]
-    fn slash_who_shows_both_nickname_and_alias_when_both_are_set() {
-        let mut app = app();
-        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
-        app.load_contacts(HashMap::from([(PEER_ID, "Bob".to_string())]));
-        app.handle_net_event(NetEvent::Identity(
-            "general".to_string(),
-            IdentityAnnounce {
-                sender: PEER_ID,
-                nickname: "alice".to_string(),
-            },
-        ));
-        submit(&mut app, "/who");
-        let last = as_system(app.active().messages.back().unwrap());
+        let overlay = app.viewing_peers.as_ref().expect("/who opens an overlay");
+        assert_eq!(overlay.heading, "#general");
         assert_eq!(
-            last,
-            format!("{} (nickname: alice, alias: Bob)", hex_id(&PEER_ID))
+            overlay
+                .peers
+                .iter()
+                .map(|peer| (peer.id, peer.alias.as_deref(), peer.nickname.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![(SELF_ID, None, None)]
         );
+        assert_eq!(app.active().messages.len(), messages);
+        assert!(!app.is_composing());
     }
 
     #[test]
-    fn slash_who_lists_every_peer_in_the_active_channel() {
+    fn slash_who_snapshots_endpoint_alias_and_nickname_for_each_active_peer() {
         let mut app = app();
         app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
         app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID_2));
-        submit(&mut app, "/who");
-        let messages: Vec<&TranscriptLine> = app.active().messages.iter().collect();
-        let len = messages.len();
-        assert_eq!(as_system(messages[len - 3]), "peers in #general (2):");
-        assert_eq!(as_system(messages[len - 2]), hex_id(&PEER_ID));
-        assert_eq!(as_system(messages[len - 1]), hex_id(&PEER_ID_2));
-    }
+        app.load_contacts(HashMap::from([(PEER_ID, "Bob".to_string())]));
+        app.handle_net_event(NetEvent::Identity(
+            "general".to_string(),
+            IdentityAnnounce {
+                sender: PEER_ID,
+                nickname: "alice".to_string(),
+            },
+        ));
 
-    #[test]
-    fn slash_who_only_lists_the_active_channels_peers() {
-        let mut app = multi_channel_app();
-        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
-        assert_eq!(app.active().name, "random");
         submit(&mut app, "/who");
-        let last = as_system(app.active().messages.back().unwrap());
+
+        let overlay = app.viewing_peers.as_ref().unwrap();
         assert_eq!(
-            last, "no peers currently in #random",
-            "a peer in another joined channel must not show up"
+            overlay
+                .peers
+                .iter()
+                .map(|peer| (peer.id, peer.alias.as_deref(), peer.nickname.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (PEER_ID, Some("Bob"), Some("alice")),
+                (PEER_ID_2, None, None),
+                (SELF_ID, None, None),
+            ]
         );
     }
 
     #[test]
-    fn who_groups_two_devices_certified_under_the_same_user_key() {
+    fn slash_who_only_snapshots_the_active_channels_peers() {
+        let mut app = multi_channel_app();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        assert_eq!(app.active().name, "random");
+
+        submit(&mut app, "/who");
+
+        let overlay = app.viewing_peers.as_ref().unwrap();
+        assert_eq!(overlay.heading, "#random");
+        assert_eq!(
+            overlay.peers.iter().map(|peer| peer.id).collect::<Vec<_>>(),
+            [SELF_ID]
+        );
+    }
+
+    #[test]
+    fn slash_who_lists_online_peers_before_remembered_offline_peers() {
+        let mut app = app();
+        app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
+        app.record_peer_seen("general", PEER_ID_2, 100);
+
+        submit(&mut app, "/who");
+
+        assert_eq!(
+            app.viewing_peers
+                .as_ref()
+                .unwrap()
+                .peers
+                .iter()
+                .map(|peer| (peer.id, peer.last_seen_unix_ms))
+                .collect::<Vec<_>>(),
+            vec![(PEER_ID, None), (SELF_ID, None), (PEER_ID_2, Some(100))]
+        );
+    }
+
+    #[test]
+    fn slash_who_deduplicates_certified_devices_like_the_peer_sidebar() {
         let mut app = app();
         let user_key = SecretKey::generate();
         app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
@@ -6917,19 +6935,39 @@ mod tests {
             "general".to_string(),
             device_cert(&user_key, PEER_ID_2),
         ));
+        app.load_contacts(HashMap::from([(
+            *user_key.public().as_bytes(),
+            "Alice".to_string(),
+        )]));
 
         submit(&mut app, "/who");
 
-        let messages: Vec<&TranscriptLine> = app.active().messages.iter().collect();
-        let len = messages.len();
-        assert_eq!(as_system(messages[len - 4]), "peers in #general (2):");
-        assert!(
-            as_system(messages[len - 3]).contains("2 devices"),
-            "got: {}",
-            as_system(messages[len - 3])
+        let overlay = app.viewing_peers.as_ref().unwrap();
+        assert_eq!(
+            overlay.peers.iter().map(|peer| peer.id).collect::<Vec<_>>(),
+            vec![PEER_ID, SELF_ID]
         );
-        assert!(as_system(messages[len - 2]).starts_with("  "));
-        assert!(as_system(messages[len - 1]).starts_with("  "));
+        assert!(
+            overlay
+                .peers
+                .iter()
+                .filter(|peer| peer.id != SELF_ID)
+                .all(|peer| peer.alias.as_deref() == Some("Alice"))
+        );
+    }
+
+    #[test]
+    fn esc_closes_the_who_overlay_and_its_paste_never_reaches_the_draft() {
+        let mut app = app();
+        submit(&mut app, "/who");
+        app.paste_text("hidden");
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.viewing_peers.is_none());
+        assert!(app.is_composing());
+        assert!(!app.should_quit);
+        assert!(app.active().input.is_empty());
     }
 
     #[test]
@@ -9688,8 +9726,7 @@ mod tests {
         let action = submit(&mut app, "/who");
 
         assert!(action.is_none());
-        let last = as_system(app.active().messages.back().unwrap());
-        assert_eq!(last, "no peers currently in @Alice");
+        assert_eq!(app.viewing_peers.as_ref().unwrap().heading, "@Alice");
     }
 
     /// `general`, a `/msg` DM (`dm-Alice`), `project-x`, and a `/dm` chat
@@ -11338,14 +11375,14 @@ mod tests {
     }
 
     #[test]
-    fn a_renamed_channel_is_called_by_its_local_name_in_notices() {
+    fn a_renamed_channel_is_called_by_its_local_name_in_overlays_and_notices() {
         let mut app = app_for_the_switcher();
         app.active = 2;
         submit(&mut app, "/rename proj");
 
         submit(&mut app, "/who");
-        let last = as_system(app.active().messages.back().unwrap());
-        assert_eq!(last, "no peers currently in #proj");
+        assert_eq!(app.viewing_peers.as_ref().unwrap().heading, "#proj");
+        app.handle_key(key(KeyCode::Esc));
 
         app.remove_channel("project-x");
         let last = as_system(app.active().messages.back().unwrap());
