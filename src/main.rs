@@ -756,7 +756,6 @@ async fn run(
 
     let mut term_events = TermEvents::new();
     let mut tick = interval(Duration::from_millis(250));
-    let mut hint_tick = interval(Duration::from_millis(174));
     let mut history_heartbeat = interval(HISTORY_ANNOUNCE_INTERVAL);
     // Reports for `/search`'s background on-disk scans (see search.rs and
     // `InputAction::Search`) -- kept separate from `net_rx`/`NetEvent`
@@ -1961,9 +1960,6 @@ async fn run(
                     }
                 }
                 dirty = true;
-            }
-            _ = hint_tick.tick() => {
-                dirty |= app.tick_hint_hover();
             }
             _ = tick.tick() => {
                 replay_paused_sync_events(&mut paused_sync_events, &app, &replay_tx);
