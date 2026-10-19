@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title description">
+  <title id="title">leyline</title>
+  <desc id="description">Private peer-to-peer chat for the terminal.</desc>
+  <rect width="1280" height="640" fill="#0b1020"/>
+  <rect x="72" y="64" width="1136" height="512" rx="28" fill="#111a30" stroke="#334155" stroke-width="2"/>
+  <rect x="72" y="64" width="1136" height="76" rx="28" fill="#17233f"/>
+  <path d="M72 112h1136v28H72z" fill="#17233f"/>
+  <circle cx="116" cy="102" r="11" fill="#fb7185"/>
+  <circle cx="150" cy="102" r="11" fill="#fbbf24"/>
+  <circle cx="184" cy="102" r="11" fill="#4ade80"/>
+  <text x="222" y="112" fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="26">leyline — private terminal chat</text>
+  <text x="136" y="226" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="72" font-weight="700">leyline</text>
+  <text x="140" y="280" fill="#cbd5e1" font-family="ui-sans-serif, system-ui, sans-serif" font-size="30">Private chat that lives in your terminal.</text>
+  <text x="140" y="350" fill="#34d399" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="28">alice@leyline  #project</text>
+  <text x="140" y="398" fill="#e2e8f0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="32">&gt; ready to ship?</text>
+  <text x="140" y="446" fill="#93c5fd" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="32">bob@leyline    sounds good.</text>
+  <line x1="140" y1="492" x2="1140" y2="492" stroke="#334155" stroke-width="2"/>
+  <text x="140" y="536" fill="#94a3b8" font-family="ui-sans-serif, system-ui, sans-serif" font-size="26">peer-to-peer  •  no accounts  •  built for small groups</text>
+</svg>
