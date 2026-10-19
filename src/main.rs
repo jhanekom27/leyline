@@ -793,6 +793,9 @@ async fn run(
             let target = mouse_position
                 .and_then(|(column, row)| ui::command_hint_at(area, &app, column, row));
             app.set_hint_hover(target);
+            let peer =
+                mouse_position.and_then(|(column, row)| ui::peer_at(area, &app, column, row));
+            app.set_peer_hover(peer);
             terminal.draw(|frame| ui::render(frame, &app))?;
             dirty = false;
         }
@@ -1260,6 +1263,7 @@ async fn run(
                                 let size = terminal.size()?;
                                 let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
                                 dirty |= app.set_hint_hover(ui::command_hint_at(area, &app, mouse.column, mouse.row));
+                                dirty |= app.set_peer_hover(ui::peer_at(area, &app, mouse.column, mouse.row));
                             }
                             _ => {}
                         }
@@ -1267,6 +1271,7 @@ async fn run(
                     Event::FocusLost => {
                         mouse_position = None;
                         dirty |= app.set_hint_hover(None);
+                        dirty |= app.set_peer_hover(None);
                     }
                     Event::Resize(_, _) => dirty = true,
                     Event::Paste(text) => {

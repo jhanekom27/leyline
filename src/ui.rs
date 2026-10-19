@@ -17,7 +17,7 @@ use textwrap::wrap;
 
 use crate::app::{
     AppState, Channel, FileOffer, FilesEntry, FilesNotice, PeerPresence, TranscriptLine,
-    command_catalog, hex_id,
+    command_catalog, hex_id, hex_prefix,
 };
 use crate::files::{StagedAttachment, human_size};
 use crate::hyperlink;
@@ -137,6 +137,33 @@ fn hints_areas(area: Rect, app: &AppState) -> (Rect, Rect) {
     (hints, Block::bordered().inner(hints))
 }
 
+/// The peers panel and its inner (borderless) area, laid out exactly as
+/// `render_sidebar` draws them while the hints panel is shown -- the only
+/// time mouse hover is reported at all.
+fn peers_areas(area: Rect, app: &AppState) -> (Rect, Rect) {
+    let [_, body, _, _] = frame_areas(area, app);
+    let [_, _, sidebar] = body_areas(body);
+    let [peers, _] = sidebar_areas(sidebar);
+    (peers, Block::bordered().inner(peers))
+}
+
+/// Uses exactly the renderer's layout, excluding borders, our own row,
+/// and modal views. Returns the id of the peers-panel peer under
+/// `(column, row)`.
+pub fn peer_at(area: Rect, app: &AppState, column: u16, row: u16) -> Option<[u8; 32]> {
+    if !app.can_hover_hints() {
+        return None;
+    }
+    let (_, inner) = peers_areas(area, app);
+    if !inner.contains((column, row).into()) {
+        return None;
+    }
+    // `render_peers` lists `peer_presence` first, then our own row.
+    app.peer_presence()
+        .get((row - inner.y) as usize)
+        .map(|peer| peer.id)
+}
+
 /// Uses exactly the renderer's layout, excluding borders, hidden rows,
 /// and modal views. Returns the catalog index of the command row under
 /// `(column, row)`.
@@ -160,6 +187,7 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     render_staged(frame, staged, app);
     render_input(frame, input, app);
     render_hint_popup(frame, app);
+    render_peer_popup(frame, app);
     // Last, so the overlay sits over everything else -- and so its cursor
     // wins over the input box's. At most one is ever open: each owns every
     // key while it is.
@@ -1515,12 +1543,8 @@ fn render_hints(frame: &mut Frame, area: Rect) {
     frame.render_widget(list, area);
 }
 
-/// Draws the hovered command hint's popup (`AppState::hovered_hint`): a
-/// cleared, bordered box holding the command's one-line description and,
-/// under it, its whole usage. It opens to the left of the hints panel,
-/// level with the hovered row, since the panel sits against the right
-/// edge; the box is shifted up to stay on screen, and a line too wide for
-/// the terminal wraps rather than being clipped.
+/// Draws the hovered command hint's popup (`AppState::hovered_hint`): the
+/// command's one-line description and, under it, its whole usage.
 fn render_hint_popup(frame: &mut Frame, app: &AppState) {
     let Some(index) = app.hovered_hint() else {
         return;
@@ -1528,32 +1552,76 @@ fn render_hint_popup(frame: &mut Frame, app: &AppState) {
     let Some(command) = command_catalog().get(index) else {
         return;
     };
-    let screen = frame.area();
-    let (hints, inner) = hints_areas(screen, app);
-    let texts = [
-        (command.description, Style::default()),
-        (command.syntax, Style::default().fg(Color::Cyan)),
+    let (hints, inner) = hints_areas(frame.area(), app);
+    let entries = vec![
+        vec![Span::raw(command.description)],
+        vec![Span::styled(
+            command.syntax,
+            Style::default().fg(Color::Cyan),
+        )],
     ];
+    render_popup(frame, hints, inner.y + index as u16, entries);
+}
+
+/// Draws the hovered peer's popup (`AppState::hovered_peer`), one entry per
+/// line: our alias for them (only if we've set one), their nickname (or
+/// their short hex id, if they haven't announced one) -- both in their
+/// identity colour, like their dot -- then their online status and
+/// announced build version.
+fn render_peer_popup(frame: &mut Frame, app: &AppState) {
+    let Some(peer) = app.hovered_peer() else {
+        return;
+    };
+    let (peers, inner) = peers_areas(frame.area(), app);
+    let Some(index) = app.peer_presence().iter().position(|p| p.id == peer.id) else {
+        return;
+    };
+    let identity = Style::default().fg(user_color(&peer.id));
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut entries = Vec::new();
+    if let Some(alias) = peer.alias {
+        entries.push(vec![Span::raw("Alias: "), Span::styled(alias, identity)]);
+    }
+    entries.push(match peer.nickname {
+        Some(nickname) => vec![Span::styled(nickname, identity)],
+        None => vec![Span::styled(hex_prefix(&peer.id), identity)],
+    });
+    entries.push(match peer.last_seen_unix_ms {
+        None => vec![Span::styled("Online", Style::default().fg(Color::Green))],
+        Some(seen_unix_ms) => vec![Span::styled(
+            format!("Offline: last seen {}", format_time(seen_unix_ms)),
+            dim,
+        )],
+    });
+    entries.push(match peer.version {
+        Some(version) => vec![Span::raw(format!("v{version}"))],
+        None => vec![Span::styled("version unknown", dim)],
+    });
+    render_popup(frame, peers, inner.y + index as u16, entries);
+}
+
+/// Draws a sidebar hover popup: a cleared, bordered box holding `entries`,
+/// one per line. It opens to the left of `panel`, level with `row`, since
+/// the sidebar sits against the right edge; the box is shifted up to stay
+/// on screen, and an entry too wide for the terminal wraps (keeping each
+/// span's style) rather than being clipped.
+fn render_popup(frame: &mut Frame, panel: Rect, row: u16, entries: Vec<Vec<Span<'static>>>) {
+    let screen = frame.area();
     // One cell of padding either side of the text, inside the borders.
-    let needed = texts
+    let needed = entries
         .iter()
-        .map(|(text, _)| Line::from(*text).width())
+        .map(|spans| spans.iter().map(Span::width).sum::<usize>())
         .max()
         .unwrap_or(0)
         + 4;
     let width = (needed as u16).min(screen.width);
     let text_width = (width as usize).saturating_sub(4).max(1);
-    let lines: Vec<Line> = texts
+    let lines: Vec<Line> = entries
         .iter()
-        .flat_map(|(text, style)| {
-            markdown::wrap_chars(text, text_width)
-                .into_iter()
-                .map(move |chunk| Line::from(Span::styled(format!(" {chunk} "), *style)))
-        })
+        .flat_map(|spans| wrap_spans(spans, text_width))
         .collect();
     let height = (lines.len() as u16 + 2).min(screen.height);
-    let x = hints.x.saturating_sub(width);
-    let row = inner.y + index as u16;
+    let x = panel.x.saturating_sub(width);
     let y = row.min(screen.bottom().saturating_sub(height));
     let area = Rect::new(x, y, width, height);
     frame.render_widget(Clear, area);
@@ -1561,6 +1629,35 @@ fn render_hint_popup(frame: &mut Frame, app: &AppState) {
         Paragraph::new(lines).block(Block::bordered().border_type(BorderType::Rounded)),
         area,
     );
+}
+
+/// Breaks `spans` into rows of at most `width` characters, like
+/// `markdown::wrap_chars`, padding each row with a space either side and
+/// keeping every character's original style.
+fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
+    let chars: Vec<(char, Style)> = spans
+        .iter()
+        .flat_map(|span| span.content.chars().map(move |c| (c, span.style)))
+        .collect();
+    if chars.is_empty() {
+        return vec![Line::from("")];
+    }
+    chars
+        .chunks(width.max(1))
+        .map(|chunk| {
+            let mut text: Vec<Span<'static>> = Vec::new();
+            for &(c, style) in chunk {
+                match text.last_mut() {
+                    Some(last) if last.style == style => last.content.to_mut().push(c),
+                    _ => text.push(Span::styled(c.to_string(), style)),
+                }
+            }
+            let mut row = vec![Span::raw(" ")];
+            row.extend(text);
+            row.push(Span::raw(" "));
+            Line::from(row)
+        })
+        .collect()
 }
 
 fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -4105,6 +4202,103 @@ mod tests {
                 .iter()
                 .any(|row| row.contains(command_catalog()[index].description))
         );
+    }
+
+    fn peers_inner(area: Rect, app: &AppState) -> Rect {
+        peers_areas(area, app).1
+    }
+
+    #[test]
+    fn hovering_a_peer_lists_alias_nickname_status_and_version_in_a_popup() {
+        use crate::message::{IdentityAnnounce, VersionAnnounce};
+        use crate::net::NetEvent;
+
+        let peer = [7; 32];
+        let mut app = AppState::new([1; 32], vec!["general".into()], "general");
+        app.active_mut().peers.push(peer);
+        app.load_contacts(HashMap::from([(peer, "Alice".to_string())]));
+        app.handle_net_event(NetEvent::Identity(
+            "general".into(),
+            IdentityAnnounce {
+                sender: peer,
+                nickname: "ally".into(),
+            },
+        ));
+        app.handle_net_event(NetEvent::Version(
+            "general".into(),
+            VersionAnnounce {
+                sender: peer,
+                version: "1.2.3".into(),
+                git_hash: "abc1234".into(),
+            },
+        ));
+        let area = Rect::new(0, 0, 100, 40);
+        let inner = peers_inner(area, &app);
+        let initial = render_to_buffer(&app, area.width, area.height);
+
+        app.set_peer_hover(peer_at(area, &app, inner.x, inner.y));
+        let buffer = render_to_buffer(&app, area.width, area.height);
+        let rows = screen_rows(&buffer);
+        let alias = rows
+            .iter()
+            .position(|row| row.contains("Alias: Alice"))
+            .expect("the popup shows the alias");
+        assert!(rows[alias + 1].contains("ally"));
+        assert!(rows[alias + 2].contains("Online"));
+        assert!(rows[alias + 3].contains("v1.2.3"));
+
+        // Alias and nickname are drawn in the peer's identity colour.
+        for (row, name) in [(alias, "Alice"), (alias + 1, "ally")] {
+            // A character (not byte) offset: the popup's border is multi-byte.
+            let byte = rows[row].find(name).unwrap();
+            let column = rows[row][..byte].chars().count() as u16;
+            assert_eq!(
+                buffer[(column, row as u16)].fg,
+                user_color(&peer),
+                "{name} should use the identity colour"
+            );
+        }
+
+        app.set_peer_hover(None);
+        assert_eq!(render_to_buffer(&app, area.width, area.height), initial);
+    }
+
+    #[test]
+    fn a_peer_popup_omits_an_unset_alias_and_falls_back_to_the_short_id() {
+        let peer = [7; 32];
+        let mut app = AppState::new([1; 32], vec!["general".into()], "general");
+        app.record_peer_seen("general", peer, 1_000);
+        let area = Rect::new(0, 0, 100, 40);
+        let inner = peers_inner(area, &app);
+
+        app.set_peer_hover(peer_at(area, &app, inner.x, inner.y));
+        let rows = screen_rows(&render_to_buffer(&app, area.width, area.height));
+
+        assert!(!rows.iter().any(|row| row.contains("Alias:")));
+        // The panel row reads "○ 07070707 · last seen ..."; only the popup
+        // puts the short id straight after its border.
+        let nickname = rows
+            .iter()
+            .position(|row| row.contains(&format!("│ {} ", hex_prefix(&peer))))
+            .expect("the popup shows the short id in place of a nickname");
+        assert!(!rows.iter().any(|row| row.contains(&hex_id(&peer))));
+        assert!(rows[nickname + 1].contains(&format!("Offline: last seen {}", format_time(1_000))));
+        assert!(rows[nickname + 2].contains("version unknown"));
+    }
+
+    #[test]
+    fn peer_hit_testing_excludes_our_own_row_borders_and_overlays() {
+        let peer = [7; 32];
+        let mut app = AppState::new([1; 32], vec!["general".into()], "general");
+        app.active_mut().peers.push(peer);
+        let area = Rect::new(0, 0, 100, 40);
+        let inner = peers_inner(area, &app);
+        assert_eq!(peer_at(area, &app, inner.x, inner.y), Some(peer));
+        assert_eq!(peer_at(area, &app, inner.x, inner.y + 1), None); // you
+        assert_eq!(peer_at(area, &app, inner.x - 1, inner.y), None);
+        assert_eq!(peer_at(area, &app, inner.x, inner.y - 1), None);
+        open_switcher(&mut app);
+        assert_eq!(peer_at(area, &app, inner.x, inner.y), None);
     }
 
     #[test]
