@@ -50,7 +50,7 @@ release tag:
 cargo install --git https://github.com/jhanekom27/leyline --tag v<VERSION> leyline
 ```
 
-Replace `<VERSION>` with a release version such as `0.18.0`. This path needs a
+Replace `<VERSION>` with a release version such as `0.21.1`. This path needs a
 supported Rust toolchain and compilation tools; use a prebuilt archive when
 you only want to run leyline.
 

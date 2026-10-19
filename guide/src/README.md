@@ -6,16 +6,16 @@ the capability that lets another person join.
 
 ## Start here
 
-1. Install a recent stable Rust toolchain, then run `cargo run`.
-2. In one instance, run `/invite` to show a channel ticket.
-3. In another instance, paste that ticket with `/join <ticket>`.
-4. Chat normally, or continue to [Folder sync](folder-sync.md) to share a
+1. [Install leyline](installation.md) from a published release.
+2. Run `leyline`.
+3. In one instance, run `/invite` to show a channel ticket.
+4. In another instance, paste that ticket with `/join <ticket>`.
+5. Chat normally, or continue to [Folder sync](folder-sync.md) to share a
    channel's working folder safely.
 
-> **Tip:** Two local test instances need separate homes. Run one with
-> `HOME=/tmp/leyline-a cargo run` and the other with
-> `HOME=/tmp/leyline-b cargo run`. Set `CARGO_HOME` to your normal Cargo home
-> if you do not want each temporary home to rebuild dependencies.
+> **Tip:** To test two local instances, run the installed executable with a
+> separate home for each peer: `HOME=/tmp/leyline-a leyline` and
+> `HOME=/tmp/leyline-b leyline`.
 
 ## What the badges mean
 
