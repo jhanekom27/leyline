@@ -1,23 +1,22 @@
 # 60-second quickstart
 
 Run two leyline peers, share a private channel invite, and send a message.
-For two real people, each person runs the same commands in their own clone.
+For two real people, each person follows the same steps on their own computer.
 For a local test, use two terminals and the separate `HOME` directories below.
 
-## 1. Build leyline
+## 1. Install leyline
 
-```sh
-git clone https://github.com/jhanekom27/leyline.git
-cd leyline
-cargo build
-```
+Follow the [installation guide](installation.md) to download a published
+release or install a published release tag with Cargo. Confirm that
+`leyline --version` works before continuing.
 
 ## 2. Start Alice
 
-In the first terminal, run:
+In the first terminal, run `leyline`. For a local two-terminal test, give
+Alice a separate home:
 
 ```sh
-HOME=/tmp/leyline-alice target/debug/leyline
+HOME=/tmp/leyline-alice leyline
 ```
 
 At the prompt, create a channel just for this demo:
@@ -37,10 +36,10 @@ channel, so send it only to the person you mean to invite.
 
 ## 3. Start Bob
 
-In a second terminal, run:
+In a second terminal, run `leyline`. For the local test, use a different home:
 
 ```sh
-HOME=/tmp/leyline-bob target/debug/leyline
+HOME=/tmp/leyline-bob leyline
 ```
 
 Paste Alice's ticket into Bob's message box:
