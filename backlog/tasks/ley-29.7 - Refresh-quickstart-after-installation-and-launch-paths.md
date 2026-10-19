@@ -1,11 +1,11 @@
 ---
 id: LEY-29.7
 title: Refresh quickstart after installation and launch paths
-status: In Progress
+status: Done
 assignee:
   - '@Jurgen'
 created_date: '2026-10-15 14:35'
-updated_date: '2026-10-19 07:47'
+updated_date: '2026-10-19 08:07'
 labels:
   - documentation
   - ux
@@ -26,7 +26,7 @@ Refresh the user-facing quickstart after the installation and repository-metadat
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [x] #1 The quickstart uses the installation path delivered by LEY-30 rather than a development-build-only path
-- [ ] #2 Quickstart links and user-facing project metadata reflect the outcomes of LEY-31
+- [x] #2 Quickstart links and user-facing project metadata reflect the outcomes of LEY-31
 - [x] #3 The two-peer invite walkthrough remains concise and technically accurate
 <!-- AC:END -->
 
@@ -47,4 +47,14 @@ Updated the guide landing page and 60-second walkthrough to install a published 
 Validated with `task docs:build` and `task docs:test`.
 
 Acceptance criterion 2 remains pending: LEY-31 is still To Do, so its repository-metadata outcome cannot yet be reflected in the quickstart.
+
+After LEY-31 merged, verified the live GitHub description, guide homepage, topics, MIT license, and custom social preview. Added an explicit quickstart link to the public repository for releases, issue reports, and feedback.
+
+Revalidated with `task docs:build`, `task docs:test`, and `git diff --check`.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Refreshed the quickstart for published installations, retained the concise two-peer invite walkthrough, and linked readers to the completed public repository presence. Verified the live GitHub metadata and social preview, plus mdBook build/test and a clean documentation diff.
+<!-- SECTION:FINAL_SUMMARY:END -->

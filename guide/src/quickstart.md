@@ -57,6 +57,8 @@ Both peers now have `#demo` open. Type a message in either pane and press
 - Use `/msg` for an invite-backed one-to-one conversation, or `/dm` to message
   a known endpoint directly.
 - Read [Folder sync](folder-sync.md) to safely share a channel folder.
+- Find releases, report problems, or suggest improvements at
+  [leyline on GitHub](https://github.com/jhanekom27/leyline).
 
 `#general` is private too: each fresh installation starts with its own secret,
 so create a named channel such as `#demo` before sharing an invite with a
