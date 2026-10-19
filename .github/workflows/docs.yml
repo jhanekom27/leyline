@@ -1,0 +1,61 @@
+name: Documentation
+
+on:
+  pull_request:
+    paths:
+      - guide/**
+      - docs/**
+      - README.md
+      - Taskfile.yml
+      - .github/workflows/docs.yml
+  push:
+    branches:
+      - main
+    paths:
+      - guide/**
+      - docs/**
+      - README.md
+      - Taskfile.yml
+      - .github/workflows/docs.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: documentation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          cache-directories: .tools
+      - run: cargo install mdbook --locked --force --version 0.5.4 --root .tools
+      - run: .tools/bin/mdbook build guide
+      - run: .tools/bin/mdbook test guide
+      - uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: guide/book
+
+  deploy:
+    name: Deploy documentation
+    if: github.event_name != 'pull_request'
+    needs: build
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5.0.1

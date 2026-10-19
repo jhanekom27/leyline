@@ -2,6 +2,7 @@
 name = "leyline"
 version = "0.21.1"
 edition = "2024"
+repository = "https://github.com/jhanekom27/leyline"
 
 [dependencies]
 anyhow = "1.0.104"

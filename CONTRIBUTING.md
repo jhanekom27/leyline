@@ -4,20 +4,52 @@ Thank you for helping improve leyline. The user-facing guide is
 [README.md](./README.md); this document collects project workflow and
 validation information for contributors.
 
+## Pull requests
+
+`main` is protected and is updated only through pull requests. Start every
+change from an up-to-date `main` checkout on a focused feature branch, for
+example `feat/ley-42-command-picker` or `fix/file-transfer-timeout`. Use
+[Conventional Commits](https://www.conventionalcommits.org/) for commit
+subjects, open a pull request, and address review before squash-merging it.
+
+Create or find the relevant Backlog task before planning or implementing
+non-trivial work. Read `AGENTS.md` before making changes: it defines the
+event-loop, UI, and networking boundaries, plus the required task-management
+workflow.
+
 ## Development
 
+Contributors need Rust 1.91 or newer. Run the same Rust checks as pull-request
+CI before opening or updating a pull request:
+
 ```sh
-cargo fmt
-cargo test
-cargo clippy
-cargo build --release
+cargo fmt --check
+cargo clippy --all-targets --all-features
+cargo test --locked
+cargo build --release --locked
 ```
 
-Read `AGENTS.md` before making changes. It defines the event-loop, UI, and
-networking boundaries, plus the task-management workflow. Start each task
-with `backlog instructions overview`, use the matching detailed Backlog guide
-before planning or changing task state, and update tasks through the CLI rather
-than editing their Markdown directly.
+Pull-request CI runs these checks on the stable toolchain and validates the
+test/build path on Rust 1.91. Documentation changes also build and test the
+guide before merge.
+
+## Releases
+
+Versions change only in a release-preparation pull request. Normal feature,
+fix, documentation, and Backlog pull requests do not increment `Cargo.toml`.
+The release owner chooses the next plain `X.Y.Z` version from the accumulated
+user-visible changes, includes any curated release notes, and merges that
+reviewed pull request to `main`.
+
+From the resulting clean `main` commit, run `task release` to build and verify
+the candidate, then create and push the matching annotated `vX.Y.Z` tag.
+Cargo-dist's release workflow validates the tag against `Cargo.toml`, builds
+the macOS, Linux, and Windows artifacts, verifies checksums, and publishes the
+GitHub Release. Do not use local tooling to upload release assets.
+
+Documentation merged to `main` is built, tested, and deployed to GitHub Pages
+by the documentation workflow. Use `task docs:build` and `task docs:test` for
+local guide feedback; do not force-push a `gh-pages` branch.
 
 ## Project history
 

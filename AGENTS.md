@@ -1,5 +1,8 @@
 # leyline agent guide
 leyline is a peer-to-peer terminal chat app built with Rust, iroh, iroh-gossip, and ratatui. Read `README.md` for user-facing behavior and `concept.md` before changing architectural boundaries.
+## Branches and pull requests
+- Never implement changes directly on `main`. Create or continue a focused feature branch from up-to-date `main`, then open a pull request for review and merge.
+- Keep each branch scoped to one coherent task. Use a conventional branch name such as `feat/ley-42-command-picker`, `fix/file-transfer-timeout`, or `chore/ley-36-ci-cd`.
 ## Architecture invariants
 - The `main` event loop is the only owner of `AppState`; communicate with it through actions and events rather than sharing it behind a mutex.
 - `app` contains pure UI-state transitions. It must not perform network or filesystem I/O.
@@ -27,7 +30,7 @@ Before adding a refusal, capability guard, or user-facing claim that narrows sup
 - Release build: `cargo build --release`
 Tests live inline beside the module they cover. Do not add feature behavior while performing a structural refactor.
 ## Versioning
-Completed Backlog tasks use semver in `Cargo.toml`: `feat` bumps minor; `fix` and `perf` bump patch; breaking changes bump major (or minor while on `0.x`, after asking). `docs`, `test`, `refactor`, `style`, `build`, `ci`, and `chore` do not bump the version. Never add a pre-release suffix because peers compare versions as plain `X.Y.Z` triples in `src/version.rs`.
+Versioning happens only in a dedicated release-preparation pull request. Ordinary feature, fix, documentation, task, and Backlog work must not change `Cargo.toml` solely to bump the version. The release owner selects the next semver value from the accumulated user-visible changes, merges the reviewed release PR to `main`, then creates and pushes the matching `vX.Y.Z` tag from that commit. GitHub Actions validates the tag and publishes the artifacts. Never add a pre-release suffix because peers compare versions as plain `X.Y.Z` triples in `src/version.rs`.
 <!-- BACKLOG.MD GUIDELINES START -->
 <!-- backlog.md-instructions-version: 1.53.0 -->
 <CRITICAL_INSTRUCTION>

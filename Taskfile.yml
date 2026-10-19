@@ -3,7 +3,6 @@ version: "3"
 vars:
   MDBOOK_VERSION: "0.5.4"
   MDBOOK: "{{.ROOT_DIR}}/.tools/bin/mdbook"
-  PAGES_API: "repos/{owner}/{repo}/pages"
   CARGO_DIST_VERSION: "0.32.0"
   PACKAGE_VERSION:
     sh: 'package_id="$(cargo pkgid)"; printf "%s" "${package_id##*#}"'
@@ -52,56 +51,6 @@ tasks:
       - cargo build --release
       - bash docs/demo.sh render
 
-  docs:configure:
-    desc: Configure GitHub Pages to publish the gh-pages branch
-    preconditions:
-      - sh: command -v gh >/dev/null
-        msg: "Install GitHub CLI first: brew install gh"
-      - sh: gh auth status >/dev/null
-        msg: "Authenticate GitHub CLI first: gh auth login"
-    cmds:
-      - |
-        if gh api "{{.PAGES_API}}" >/dev/null 2>&1; then
-          gh api --method PUT "{{.PAGES_API}}" \
-            -f build_type=legacy \
-            -f 'source[branch]=gh-pages' \
-            -f 'source[path]=/'
-        else
-          gh api --method POST "{{.PAGES_API}}" \
-            -f build_type=legacy \
-            -f 'source[branch]=gh-pages' \
-            -f 'source[path]=/'
-        fi
-
-  docs:publish:
-    desc: Build and manually publish the guide from a clean main checkout
-    deps:
-      - docs:build
-    preconditions:
-      - sh: test "$(git branch --show-current)" = main
-        msg: Publish only from the main branch.
-      - sh: git diff --quiet && git diff --cached --quiet && test -z "$(git ls-files --others --exclude-standard -- guide)"
-        msg: Commit or stash tracked changes and untracked guide files before publishing documentation.
-      - sh: test -n "$(git config --get user.name)"
-        msg: Configure a Git user name before publishing documentation.
-      - sh: test -n "$(git config --get user.email)"
-        msg: Configure a Git email before publishing documentation.
-    cmds:
-      - |
-        publish_dir="$(mktemp -d)"
-        trap 'rm -rf "$publish_dir"' EXIT
-        git init --quiet --initial-branch=gh-pages "$publish_dir"
-        git -C "$publish_dir" remote add origin "$(git remote get-url origin)"
-        cp -R guide/book/. "$publish_dir/"
-        touch "$publish_dir/.nojekyll"
-        git -C "$publish_dir" add --all
-        git -C "$publish_dir" \
-          -c user.name="$(git config --get user.name)" \
-          -c user.email="$(git config --get user.email)" \
-          commit --quiet -m "docs: publish site" \
-          -m "Co-Authored-By: Warp <agent@warp.dev>"
-        git -C "$publish_dir" push --force origin gh-pages
-      - task: docs:configure
 
   release:preflight:
     internal: true
@@ -117,22 +66,16 @@ tasks:
         msg: "Install cargo-zigbuild first: cargo install cargo-zigbuild --locked"
       - sh: command -v cargo-xwin >/dev/null
         msg: "Install cargo-xwin first: cargo install cargo-xwin --locked"
-      - sh: command -v gh >/dev/null
-        msg: "Install GitHub CLI first: https://cli.github.com/"
-      - sh: gh auth status >/dev/null
-        msg: "Authenticate GitHub CLI first: gh auth login"
       - sh: 'test "$(git branch --show-current)" = main'
-        msg: "Release only from the main branch."
+        msg: "Validate release candidates from the main branch."
       - sh: 'test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"'
-        msg: "Push the current main commit before releasing."
+        msg: "Push the current main commit before validating a release candidate."
       - sh: 'git diff --quiet && git diff --cached --quiet && test -z "$(git ls-files --others --exclude-standard)"'
-        msg: "Commit or stash all changes before releasing."
+        msg: "Commit or stash all changes before validating a release candidate."
       - sh: '! git rev-parse -q --verify "refs/tags/{{.RELEASE_TAG}}" >/dev/null'
         msg: "The local tag {{.RELEASE_TAG}} already exists."
       - sh: '! git ls-remote --exit-code --tags origin "refs/tags/{{.RELEASE_TAG}}" >/dev/null 2>&1'
         msg: "The remote tag {{.RELEASE_TAG}} already exists."
-      - sh: '! gh release view "{{.RELEASE_TAG}}" >/dev/null 2>&1'
-        msg: "The GitHub Release {{.RELEASE_TAG}} already exists."
 
   release:plan:
     internal: true
@@ -194,56 +137,10 @@ tasks:
       - task: release:verify
       - task: release:smoke
 
-  release:draft:
-    internal: true
-    desc: Create the draft GitHub Release and upload verified assets
-    cmds:
-      - task: release:preflight
-      - task: release:verify
-      - >-
-        gh release create "{{.RELEASE_TAG}}" --draft --generate-notes
-        --target "$(git rev-parse HEAD)"
-        "{{.DIST_DIR}}/leyline-aarch64-apple-darwin.tar.xz"
-        "{{.DIST_DIR}}/leyline-aarch64-apple-darwin.tar.xz.sha256"
-        "{{.DIST_DIR}}/leyline-x86_64-apple-darwin.tar.xz"
-        "{{.DIST_DIR}}/leyline-x86_64-apple-darwin.tar.xz.sha256"
-        "{{.DIST_DIR}}/leyline-x86_64-unknown-linux-gnu.tar.xz"
-        "{{.DIST_DIR}}/leyline-x86_64-unknown-linux-gnu.tar.xz.sha256"
-        "{{.DIST_DIR}}/leyline-x86_64-pc-windows-msvc.zip"
-        "{{.DIST_DIR}}/leyline-x86_64-pc-windows-msvc.zip.sha256"
-        "{{.DIST_DIR}}/sha256.sum"
-
-  release:publish:
-    internal: true
-    desc: Publish a complete draft GitHub Release
-    cmds:
-      - |
-        test "$(gh release view "{{.RELEASE_TAG}}" --json isDraft --jq .isDraft)" = true
-        assets="$(gh api "repos/{owner}/{repo}/releases" --paginate --jq '.[] | select(.tag_name == "{{.RELEASE_TAG}}") | .assets[].name')"
-        for asset in \
-          "leyline-aarch64-apple-darwin.tar.xz" \
-          "leyline-aarch64-apple-darwin.tar.xz.sha256" \
-          "leyline-x86_64-apple-darwin.tar.xz" \
-          "leyline-x86_64-apple-darwin.tar.xz.sha256" \
-          "leyline-x86_64-unknown-linux-gnu.tar.xz" \
-          "leyline-x86_64-unknown-linux-gnu.tar.xz.sha256" \
-          "leyline-x86_64-pc-windows-msvc.zip" \
-          "leyline-x86_64-pc-windows-msvc.zip.sha256" \
-          "sha256.sum"
-        do
-          case "$assets" in
-            *"$asset"*) ;;
-            *)
-              printf 'draft release is missing asset: %s\n' "$asset"
-              exit 1
-              ;;
-          esac
-        done
-      - gh release edit "{{.RELEASE_TAG}}" --draft=false
 
   release:
-    desc: Build, upload, and publish the current Leyline version
-    prompt: "Publish Leyline {{.PACKAGE_VERSION}}? Confirm that Windows and Linux smoke tests have passed."
+    desc: Build and verify the current Leyline version before creating its release tag
+    prompt: "Verify Leyline {{.PACKAGE_VERSION}} before creating {{.RELEASE_TAG}}?"
     cmds:
       - task: release:preflight
       - task: release:plan
