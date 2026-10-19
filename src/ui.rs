@@ -158,10 +158,30 @@ pub fn peer_at(area: Rect, app: &AppState, column: u16, row: u16) -> Option<[u8;
     if !inner.contains((column, row).into()) {
         return None;
     }
-    // `render_peers` lists `peer_presence` first, then our own row.
-    app.peer_presence()
+    peers_panel_rows(app)
         .get((row - inner.y) as usize)
         .map(|peer| peer.id)
+        .filter(|id| *id != app.self_id)
+}
+
+/// The peers panel's rows, top to bottom, as `render_peers` draws them:
+/// every online peer, then our own row (we're always online), then every
+/// remembered offline peer -- `peer_presence` already lists online peers
+/// before offline ones, most recently seen first.
+fn peers_panel_rows(app: &AppState) -> Vec<PeerPresence> {
+    let mut rows = app.peer_presence();
+    let first_offline = rows
+        .iter()
+        .position(|peer| peer.last_seen_unix_ms.is_some())
+        .unwrap_or(rows.len());
+    rows.insert(
+        first_offline,
+        PeerPresence {
+            id: app.self_id,
+            last_seen_unix_ms: None,
+        },
+    );
+    rows
 }
 
 /// Uses exactly the renderer's layout, excluding borders, hidden rows,
@@ -1467,6 +1487,18 @@ fn format_time(ts_unix_ms: u64) -> String {
     }
 }
 
+/// Like `format_time`, but followed by the local date -- for a peer's
+/// popup, where "last seen" may well be days ago.
+fn format_date_time(ts_unix_ms: u64) -> String {
+    match DateTime::from_timestamp_millis(ts_unix_ms as i64) {
+        Some(dt) => dt
+            .with_timezone(&Local)
+            .format("%H:%M %Y-%m-%d")
+            .to_string(),
+        None => "--:-- ----------".to_string(),
+    }
+}
+
 /// Deterministically maps an endpoint id to one of `USER_PALETTE`'s colors,
 /// so a given peer -- ourselves included -- always renders in the same
 /// color across the message list, peers sidebar, and header. A pure
@@ -1483,18 +1515,10 @@ fn user_color(id: &[u8; 32]) -> Color {
 }
 
 fn render_peers(frame: &mut Frame, area: Rect, app: &AppState) {
-    let mut items: Vec<ListItem> = app
-        .peer_presence()
+    let items: Vec<ListItem> = peers_panel_rows(app)
         .iter()
         .map(|peer| peer_item(app, peer))
         .collect();
-    items.push(peer_item(
-        app,
-        &PeerPresence {
-            id: app.self_id,
-            last_seen_unix_ms: None,
-        },
-    ));
 
     let list = List::new(items).block(
         Block::bordered()
@@ -1505,21 +1529,18 @@ fn render_peers(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 /// One peers-sidebar row. Online peers keep their colored dot; remembered
-/// offline peers are dimmed and carry the local time they were last seen.
+/// offline peers are dimmed -- when they were last seen is in their hover
+/// popup (`render_peer_popup`) rather than crowding the row.
 fn peer_item(app: &AppState, peer: &PeerPresence) -> ListItem<'static> {
     match peer.last_seen_unix_ms {
         None => ListItem::new(Line::from(vec![
             Span::styled("● ", Style::default().fg(user_color(&peer.id))),
             Span::raw(app.display_name(&peer.id)),
         ])),
-        Some(seen_unix_ms) => ListItem::new(Line::from(vec![
+        Some(_) => ListItem::new(Line::from(vec![
             Span::styled("○ ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!(
-                    "{} · last seen {}",
-                    app.display_name(&peer.id),
-                    format_time(seen_unix_ms)
-                ),
+                app.display_name(&peer.id),
                 Style::default().fg(Color::DarkGray),
             ),
         ])),
@@ -1564,16 +1585,17 @@ fn render_hint_popup(frame: &mut Frame, app: &AppState) {
 }
 
 /// Draws the hovered peer's popup (`AppState::hovered_peer`), one entry per
-/// line: our alias for them (only if we've set one), their nickname (or
-/// their short hex id, if they haven't announced one) -- both in their
-/// identity colour, like their dot -- then their online status and
-/// announced build version.
+/// line: our alias for them (only if we've set one), their nickname
+/// followed by their short hex id in parentheses (or just the short id, if
+/// they haven't announced one) -- alias and nickname in their identity
+/// colour, like their dot -- then their online status and, only while
+/// they're online, their announced build version.
 fn render_peer_popup(frame: &mut Frame, app: &AppState) {
     let Some(peer) = app.hovered_peer() else {
         return;
     };
     let (peers, inner) = peers_areas(frame.area(), app);
-    let Some(index) = app.peer_presence().iter().position(|p| p.id == peer.id) else {
+    let Some(index) = peers_panel_rows(app).iter().position(|p| p.id == peer.id) else {
         return;
     };
     let identity = Style::default().fg(user_color(&peer.id));
@@ -1583,20 +1605,27 @@ fn render_peer_popup(frame: &mut Frame, app: &AppState) {
         entries.push(vec![Span::raw("Alias: "), Span::styled(alias, identity)]);
     }
     entries.push(match peer.nickname {
-        Some(nickname) => vec![Span::styled(nickname, identity)],
+        Some(nickname) => vec![
+            Span::styled(nickname, identity),
+            Span::raw(format!(" ({})", hex_prefix(&peer.id))),
+        ],
         None => vec![Span::styled(hex_prefix(&peer.id), identity)],
     });
     entries.push(match peer.last_seen_unix_ms {
         None => vec![Span::styled("Online", Style::default().fg(Color::Green))],
         Some(seen_unix_ms) => vec![Span::styled(
-            format!("Offline: last seen {}", format_time(seen_unix_ms)),
+            format!("Offline: last seen {}", format_date_time(seen_unix_ms)),
             dim,
         )],
     });
-    entries.push(match peer.version {
-        Some(version) => vec![Span::raw(format!("v{version}"))],
-        None => vec![Span::styled("version unknown", dim)],
-    });
+    // A version is only worth showing for someone who's here now -- an
+    // offline peer's may well be stale.
+    if peer.last_seen_unix_ms.is_none() {
+        entries.push(match peer.version {
+            Some(version) => vec![Span::raw(format!("v{version}"))],
+            None => vec![Span::styled("version unknown", dim)],
+        });
+    }
     render_popup(frame, peers, inner.y + index as u16, entries);
 }
 
@@ -2854,11 +2883,17 @@ mod tests {
         app.record_peer_seen("general", [1; 32], 1_000);
         app.record_peer_seen("general", [2; 32], 2_000);
 
-        let text = screen_rows(&render_to_buffer(&app, 100, 50)).join("\n");
+        let rows = screen_rows(&render_to_buffer(&app, 100, 50));
+        let text = rows.join("\n");
 
         assert!(text.contains("● Alice"), "got: {text}");
-        assert!(text.contains("○ Bob · last seen"), "got: {text}");
+        assert!(text.contains("○ Bob"), "got: {text}");
         assert!(!text.contains("● Bob"), "got: {text}");
+        assert!(!text.contains("last seen"), "got: {text}");
+        // Online rows (ours included) all come before offline ones.
+        let row_of = |needle: &str| rows.iter().position(|row| row.contains(needle)).unwrap();
+        assert!(row_of("● Alice") < row_of("● you"), "got: {text}");
+        assert!(row_of("● you") < row_of("○ Bob"), "got: {text}");
     }
 
     #[test]
@@ -2872,13 +2907,13 @@ mod tests {
         app.record_peer_seen("project-x", [2; 32], 2_000);
 
         let general = screen_rows(&render_to_buffer(&app, 100, 50)).join("\n");
-        assert!(general.contains("○ Alice · last seen"), "got: {general}");
-        assert!(!general.contains("○ Bob · last seen"), "got: {general}");
+        assert!(general.contains("○ Alice"), "got: {general}");
+        assert!(!general.contains("○ Bob"), "got: {general}");
 
         app.active = 2;
         let project = screen_rows(&render_to_buffer(&app, 100, 50)).join("\n");
-        assert!(project.contains("○ Bob · last seen"), "got: {project}");
-        assert!(!project.contains("○ Alice · last seen"), "got: {project}");
+        assert!(project.contains("○ Bob"), "got: {project}");
+        assert!(!project.contains("○ Alice"), "got: {project}");
     }
 
     /// The screen every switcher render test draws on.
@@ -4243,9 +4278,19 @@ mod tests {
             .iter()
             .position(|row| row.contains("Alias: Alice"))
             .expect("the popup shows the alias");
-        assert!(rows[alias + 1].contains("ally"));
+        assert!(
+            rows[alias + 1].contains(&format!("ally ({})", hex_prefix(&peer))),
+            "the short id follows the nickname in parentheses"
+        );
         assert!(rows[alias + 2].contains("Online"));
         assert!(rows[alias + 3].contains("v1.2.3"));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains(&hex_prefix(&peer)))
+                .count(),
+            1,
+            "the short id appears only beside the nickname"
+        );
 
         // Alias and nickname are drawn in the peer's identity colour.
         for (row, name) in [(alias, "Alice"), (alias + 1, "ally")] {
@@ -4264,26 +4309,58 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_popup_omits_an_unset_alias_and_falls_back_to_the_short_id() {
+    fn an_offline_peers_popup_omits_an_unset_alias_and_the_version() {
+        use crate::message::VersionAnnounce;
+        use crate::net::NetEvent;
+
         let peer = [7; 32];
         let mut app = AppState::new([1; 32], vec!["general".into()], "general");
         app.record_peer_seen("general", peer, 1_000);
+        app.handle_net_event(NetEvent::Version(
+            "general".into(),
+            VersionAnnounce {
+                sender: peer,
+                // Older than this build, so no "consider updating" notice
+                // lands in the transcript to confuse the check below.
+                version: "0.0.1".into(),
+                git_hash: "abc1234".into(),
+            },
+        ));
         let area = Rect::new(0, 0, 100, 40);
         let inner = peers_inner(area, &app);
 
-        app.set_peer_hover(peer_at(area, &app, inner.x, inner.y));
+        // Row 0 is our own (online) row; the offline peer follows it.
+        app.set_peer_hover(peer_at(area, &app, inner.x, inner.y + 1));
         let rows = screen_rows(&render_to_buffer(&app, area.width, area.height));
 
         assert!(!rows.iter().any(|row| row.contains("Alias:")));
-        // The panel row reads "○ 07070707 · last seen ..."; only the popup
-        // puts the short id straight after its border.
+        // The panel row reads "○ 07070707"; only the popup puts the short
+        // id straight after its border, in place of a nickname.
         let nickname = rows
             .iter()
             .position(|row| row.contains(&format!("│ {} ", hex_prefix(&peer))))
             .expect("the popup shows the short id in place of a nickname");
+        assert!(
+            !rows[nickname].contains('('),
+            "no parentheses without a nickname"
+        );
         assert!(!rows.iter().any(|row| row.contains(&hex_id(&peer))));
-        assert!(rows[nickname + 1].contains(&format!("Offline: last seen {}", format_time(1_000))));
-        assert!(rows[nickname + 2].contains("version unknown"));
+        assert!(
+            rows[nickname + 1].contains(&format!("Offline: last seen {}", format_date_time(1_000)))
+        );
+        assert!(!rows.iter().any(|row| row.contains("v0.0.1")));
+        assert!(!rows.iter().any(|row| row.contains("version unknown")));
+    }
+
+    #[test]
+    fn format_date_time_puts_the_local_date_after_format_times_time() {
+        let ts = 1_760_000_000_000;
+        let formatted = format_date_time(ts);
+        let date = Local
+            .timestamp_millis_opt(ts as i64)
+            .unwrap()
+            .format("%Y-%m-%d");
+        assert_eq!(formatted, format!("{} {date}", format_time(ts)));
     }
 
     #[test]
