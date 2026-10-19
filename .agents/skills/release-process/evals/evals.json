@@ -1,0 +1,23 @@
+{
+  "skill_name": "leyline-release-process",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Prepare the next Leyline release. We merged two user-facing features and a terminal bug fix since v0.21.1.",
+      "expected_output": "Inspects current version and release history, recommends a minor version with evidence, asks for confirmation before modifying files, and describes a chore/release-vX.Y.Z branch and PR.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Cut a patch release from main. Cargo.toml is already 0.21.1 but the latest tag is v0.18.0, and the commits include documentation and bug fixes.",
+      "expected_output": "Treats 0.21.1 as the candidate rather than decreasing it, explains the tag discrepancy, asks for confirmation, and does not silently re-version the package.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "The release PR for v0.22.0 is merged. Please publish it now.",
+      "expected_output": "Does not tag a feature branch or upload assets manually; directs the user to update clean main and run task git:tag, explaining its checks and tag push behavior.",
+      "files": []
+    }
+  ]
+}

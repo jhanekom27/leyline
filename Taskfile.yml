@@ -145,5 +145,11 @@ tasks:
       - task: release:preflight
       - task: release:plan
       - task: release:build
-      - task: release:draft
-      - task: release:publish
+
+  git:tag:
+    desc: Create and push the verified release tag for the current main commit
+    prompt: "Create and push {{.RELEASE_TAG}} from the current main commit?"
+    cmds:
+      - task: release
+      - 'git tag -a "{{.RELEASE_TAG}}" -m "release: {{.RELEASE_TAG}}"'
+      - git push origin "refs/tags/{{.RELEASE_TAG}}"

@@ -42,7 +42,9 @@ user-visible changes, includes any curated release notes, and merges that
 reviewed pull request to `main`.
 
 From the resulting clean `main` commit, run `task release` to build and verify
-the candidate, then create and push the matching annotated `vX.Y.Z` tag.
+the candidate, then run `task git:tag` to create and push the matching
+annotated `vX.Y.Z` tag. The repository's `release-process` skill can prepare
+the release branch and pull request, but never publishes a release tag itself.
 Cargo-dist's release workflow validates the tag against `Cargo.toml`, builds
 the macOS, Linux, and Windows artifacts, verifies checksums, and publishes the
 GitHub Release. Do not use local tooling to upload release assets.

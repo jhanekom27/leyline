@@ -18,6 +18,7 @@ Read only the skill relevant to the requested change:
 - `.agents/skills/files-and-storage/SKILL.md` — attachments, destinations, persistence, and file safety.
 - `.agents/skills/runtime-event-loop/SKILL.md` — startup, `tokio::select!`, and side-effect routing.
 - `.agents/skills/testing/SKILL.md` — inline tests and validation selection.
+- `.agents/skills/release-process/SKILL.md` — release version selection, preparation pull requests, and post-merge tagging.
 ## Behavioral scope discovery
 Before adding a refusal, capability guard, or user-facing claim that narrows supported behavior:
 - Read the relevant Backlog task, its parent, and completed sibling or child tasks; search Backlog for the affected command, channel kind, or capability.
