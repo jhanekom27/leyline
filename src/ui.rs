@@ -16,8 +16,8 @@ use ratatui::widgets::{
 use textwrap::wrap;
 
 use crate::app::{
-    AppState, Channel, CommandDefinition, FileOffer, FilesEntry, FilesNotice, PeerPresence,
-    TranscriptLine, command_catalog, hex_id, hex_prefix,
+    AppState, Channel, CommandDefinition, FileOffer, FilesEntry, FilesNotice, PeerDetails,
+    PeerPresence, TranscriptLine, command_catalog, hex_id, hex_prefix,
 };
 use crate::files::{StagedAttachment, human_size};
 use crate::hyperlink;
@@ -89,6 +89,8 @@ const PICKER_TIME_WIDTH: usize = 12;
 const FILES_WIDTH: u16 = 92;
 /// Rows of files the overlay lists at once before it scrolls.
 const FILES_ROWS: usize = 14;
+/// Width of the `/who` peer-details overlay, borders included.
+const PEERS_OVERLAY_WIDTH: u16 = 104;
 
 /// Curated, dark-background-friendly colors used to visually separate
 /// senders -- see `user_color`.
@@ -217,6 +219,7 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     render_command_picker(frame, app);
     render_picker(frame, app);
     render_files(frame, app);
+    render_peers_overlay(frame, app);
 }
 
 /// Height (in terminal rows, including the 2 border rows) the input box
@@ -653,6 +656,132 @@ fn render_command_picker(frame: &mut Frame, app: &AppState) {
     render_scroll_indicator(frame, track, start, matches.len(), visible_rows);
 }
 
+fn peers_overlay_area(screen: Rect, peers: usize) -> Rect {
+    overlay_area(screen, PEERS_OVERLAY_WIDTH, peers.max(1) + 1)
+}
+
+fn peers_overlay_columns(width: usize) -> (usize, usize, usize) {
+    let content_width = width.saturating_sub(1);
+    let details_width = content_width.saturating_sub(70).min(28);
+    let endpoint_width = content_width.saturating_sub(details_width);
+    let alias_width = details_width / 2;
+    let nickname_width = details_width.saturating_sub(alias_width);
+    (endpoint_width, alias_width, nickname_width)
+}
+
+fn peers_overlay_header(width: usize) -> Line<'static> {
+    let (endpoint_width, alias_width, nickname_width) = peers_overlay_columns(width);
+    Line::from(vec![
+        Span::styled(
+            format!(
+                " {:<endpoint_width$}",
+                truncate_chars("      endpoint id", endpoint_width)
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:<alias_width$}", truncate_chars("alias", alias_width)),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            truncate_chars("nickname", nickname_width),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn peers_overlay_row(peer: &PeerDetails, self_id: [u8; 32], width: usize) -> ListItem<'static> {
+    let (endpoint_width, alias_width, nickname_width) = peers_overlay_columns(width);
+    let endpoint_id_width = endpoint_width.saturating_sub(6);
+    let alias = peer.alias.as_deref().unwrap_or("—");
+    let nickname = peer.nickname.as_deref().unwrap_or("—");
+    let (presence, presence_style, identity_style) = if peer.id == self_id {
+        (
+            "● you ",
+            Style::default().fg(Color::Green),
+            Style::default().fg(user_color(&peer.id)),
+        )
+    } else {
+        match peer.last_seen_unix_ms {
+            None => (
+                "●     ",
+                Style::default().fg(user_color(&peer.id)),
+                Style::default().fg(user_color(&peer.id)),
+            ),
+            Some(_) => (
+                "○     ",
+                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::DarkGray),
+            ),
+        }
+    };
+    ListItem::new(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(presence, presence_style),
+        Span::styled(
+            format!(
+                "{:<endpoint_id_width$}",
+                truncate_chars(&hex_id(&peer.id), endpoint_id_width)
+            ),
+            identity_style,
+        ),
+        Span::styled(
+            format!("{:<alias_width$}", truncate_chars(alias, alias_width)),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(
+            truncate_chars(nickname, nickname_width),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]))
+}
+
+/// Renders the `/who` snapshot as a cleared, top-anchored table. The state
+/// lives in `AppState`, so this renderer only reads it and leaves dismissal
+/// to `AppState::handle_peers_overlay_key`.
+fn render_peers_overlay(frame: &mut Frame, app: &AppState) {
+    let Some(overlay) = &app.viewing_peers else {
+        return;
+    };
+    let area = peers_overlay_area(frame.area(), overlay.peers.len());
+    let block = Block::bordered()
+        .title(format!(" peers in {} ", overlay.heading))
+        .title_bottom(" Esc close ")
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let [header_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(peers_overlay_header(header_area.width as usize)),
+        header_area,
+    );
+    if overlay.peers.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                " no peers currently in this channel",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )),
+            list_area,
+        );
+        return;
+    }
+    let rows = overlay
+        .peers
+        .iter()
+        .map(|peer| peers_overlay_row(peer, app.self_id, list_area.width as usize))
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(rows), list_area);
+}
 /// Where an overlay `width` wide, with room for `list_rows` rows under its
 /// borders and its filter row, goes on a `screen`-sized frame: centered, and
 /// anchored near the top so the box doesn't jump around as typing changes
@@ -3002,6 +3131,10 @@ mod tests {
     fn open_command_picker(app: &mut AppState) {
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
     }
+    fn open_peers_overlay(app: &mut AppState) {
+        type_text(app, "/who");
+        press(app, KeyCode::Enter);
+    }
 
     fn type_text(app: &mut AppState, text: &str) {
         for c in text.chars() {
@@ -3124,6 +3257,89 @@ mod tests {
         let selected_syntax = &buffer[(area.x + 2, area.y + 3)];
         assert_eq!(selected_syntax.fg, Color::Black);
         assert_eq!(selected_syntax.bg, Color::Cyan);
+    }
+
+    #[test]
+    fn who_overlay_shows_endpoint_alias_and_nickname_in_aligned_columns() {
+        use crate::message::IdentityAnnounce;
+        use crate::net::NetEvent;
+
+        let alice = [7; 32];
+        let unnamed = [8; 32];
+        let mut app = app_with_every_kind();
+        app.active_mut().peers = vec![alice];
+        app.record_peer_seen("general", unnamed, 100);
+        app.load_settings(true, Some("me".to_string()));
+        app.load_contacts(HashMap::from([(alice, "Alice".to_string())]));
+        app.handle_net_event(NetEvent::Identity(
+            "general".to_string(),
+            IdentityAnnounce {
+                sender: alice,
+                nickname: "ally".to_string(),
+            },
+        ));
+        open_peers_overlay(&mut app);
+
+        let screen = Rect::new(0, 0, 120, 30);
+        let buffer = render_to_buffer(&app, screen.width, screen.height);
+        let area = peers_overlay_area(screen, 3);
+        let rows = box_rows(&buffer, area);
+        let header = rows.iter().find(|row| row.contains("endpoint id")).unwrap();
+        let alice_row = rows
+            .iter()
+            .find(|row| row.contains(&hex_id(&alice)))
+            .unwrap();
+        let unnamed_row = rows
+            .iter()
+            .find(|row| row.contains(&hex_id(&unnamed)))
+            .unwrap();
+        let self_row = rows
+            .iter()
+            .find(|row| row.contains(&hex_id(&app.self_id)))
+            .unwrap();
+        let column = |row: &str, needle: &str| row[..row.find(needle).unwrap()].chars().count();
+
+        assert!(rows.iter().any(|row| row.contains("peers in #general")));
+        assert!(rows.iter().any(|row| row.contains("Esc close")));
+        assert_eq!(
+            column(header, "endpoint id"),
+            column(alice_row, &hex_id(&alice))
+        );
+        assert_eq!(column(header, "alias"), column(alice_row, "Alice"));
+        assert_eq!(column(header, "nickname"), column(alice_row, "ally"));
+        assert!(alice_row.contains("● "), "online row: {alice_row}");
+        assert!(self_row.contains("● you "), "local row: {self_row}");
+        assert!(self_row.contains("me"), "local nickname: {self_row}");
+        assert!(unnamed_row.contains("○ "), "offline row: {unnamed_row}");
+        assert!(
+            rows.iter().position(|row| row == alice_row)
+                < rows.iter().position(|row| row == self_row)
+                && rows.iter().position(|row| row == self_row)
+                    < rows.iter().position(|row| row == unnamed_row),
+            "online peers, this device, then remembered offline peers"
+        );
+        assert!(
+            unnamed_row.matches('—').count() >= 2,
+            "missing values use explicit table cells: {unnamed_row}"
+        );
+    }
+
+    #[test]
+    fn who_overlay_includes_this_device_and_survives_tiny_terminals() {
+        let mut app = app_with_every_kind();
+        open_peers_overlay(&mut app);
+
+        let screen = Rect::new(0, 0, 100, 20);
+        let buffer = render_to_buffer(&app, screen.width, screen.height);
+        let text = box_rows(&buffer, peers_overlay_area(screen, 1)).join("\n");
+        assert!(text.contains(&hex_id(&app.self_id)), "got: {text}");
+        assert!(text.contains("● you "), "got: {text}");
+
+        for width in 1..=30 {
+            for height in 1..=8 {
+                render_to_buffer(&app, width, height);
+            }
+        }
     }
 
     #[test]
