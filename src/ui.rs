@@ -144,12 +144,17 @@ fn hints_areas(area: Rect, app: &AppState) -> (Rect, Rect) {
 }
 
 /// The peers panel and its inner (borderless) area, laid out exactly as
-/// `render_sidebar` draws them while the hints panel is shown -- the only
-/// time mouse hover is reported at all.
+/// `render_sidebar` draws them: the whole sidebar while the hints panel
+/// is hidden, otherwise the room above it.
 fn peers_areas(area: Rect, app: &AppState) -> (Rect, Rect) {
     let [_, body, _, _] = frame_areas(area, app);
     let [_, _, sidebar] = body_areas(body);
-    let [peers, _] = sidebar_areas(sidebar);
+    let peers = if app.show_hints {
+        let [peers, _] = sidebar_areas(sidebar);
+        peers
+    } else {
+        sidebar
+    };
     (peers, Block::bordered().inner(peers))
 }
 
@@ -157,7 +162,7 @@ fn peers_areas(area: Rect, app: &AppState) -> (Rect, Rect) {
 /// and modal views. Returns the id of the peers-panel peer under
 /// `(column, row)`.
 pub fn peer_at(area: Rect, app: &AppState, column: u16, row: u16) -> Option<[u8; 32]> {
-    if !app.can_hover_hints() {
+    if !app.can_hover() {
         return None;
     }
     let (_, inner) = peers_areas(area, app);
@@ -3348,7 +3353,7 @@ mod tests {
         let mut app = app_with_every_kind();
         app.active_mut().peers = vec![alice];
         app.record_peer_seen("general", unnamed, 100);
-        app.load_settings(true, Some("me".to_string()));
+        app.load_settings(true, true, Some("me".to_string()));
         app.load_contacts(HashMap::from([(alice, "Alice".to_string())]));
         app.handle_net_event(NetEvent::Identity(
             "general".to_string(),
@@ -4758,7 +4763,8 @@ mod tests {
                 git_hash: "abc1234".into(),
             },
         ));
-        let area = Rect::new(0, 0, 100, 40);
+        // Tall enough that the peers panel fits two rows above the hints.
+        let area = Rect::new(0, 0, 100, 50);
         let inner = peers_inner(area, &app);
 
         // Row 0 is our own (online) row; the offline peer follows it.
@@ -4918,6 +4924,44 @@ mod tests {
                 .iter()
                 .any(|command| command.syntax.starts_with("/conflicts"))
         );
+    }
+
+    #[test]
+    fn the_mouse_command_is_among_the_hints() {
+        assert!(
+            command_catalog()
+                .iter()
+                .any(|command| command.syntax == "/mouse")
+        );
+    }
+
+    #[test]
+    fn peer_hover_works_with_hints_hidden_and_stops_without_the_mouse() {
+        let peer = [7; 32];
+        let mut app = AppState::new([1; 32], vec!["general".into()], "general");
+        app.active_mut().peers.push(peer);
+        app.show_hints = false;
+        let area = Rect::new(0, 0, 100, 40);
+        let inner = peers_inner(area, &app);
+        let [_, body, _, _] = frame_areas(area, &app);
+        let [_, _, sidebar] = body_areas(body);
+        assert_eq!(
+            inner.bottom() + 1,
+            sidebar.bottom(),
+            "the peers panel fills the sidebar"
+        );
+
+        assert_eq!(peer_at(area, &app, inner.x, inner.y), Some(peer));
+        app.set_peer_hover(Some(peer));
+        let buffer = render_to_buffer(&app, area.width, area.height);
+        assert!(
+            screen_rows(&buffer)
+                .iter()
+                .any(|row| row.contains("Online"))
+        );
+
+        app.mouse_enabled = false;
+        assert_eq!(peer_at(area, &app, inner.x, inner.y), None);
     }
 
     #[test]
