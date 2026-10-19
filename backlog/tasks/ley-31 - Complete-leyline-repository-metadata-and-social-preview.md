@@ -1,11 +1,11 @@
 ---
 id: LEY-31
 title: Complete leyline repository metadata and social preview
-status: In Progress
+status: Done
 assignee:
   - '@Jurgen'
 created_date: '2026-10-15 01:43'
-updated_date: '2026-10-19 08:01'
+updated_date: '2026-10-19 08:10'
 labels: []
 dependencies: []
 type: chore
@@ -21,7 +21,7 @@ Make leyline recognizable and discoverable on GitHub by configuring repository m
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [x] #1 Repository About information has a concise public description and relevant discovery topics
-- [ ] #2 The repository includes a clear license suitable for public distribution
+- [x] #2 The repository includes a clear license suitable for public distribution
 - [x] #3 A social preview image is configured and renders appropriately for shared repository links
 <!-- AC:END -->
 
@@ -46,4 +46,12 @@ Validated the live metadata with `gh repo view`, confirmed GitHub is still using
 Verified the uploaded social preview through GitHub GraphQL: `usesCustomOpenGraphImage` is true and GitHub returned the repository Open Graph image URL.
 
 Acceptance criterion 2 remains in progress until the MIT LICENSE is merged to main.
+
+After PR #8 merged to main, GitHub recognizes the MIT license on the repository. Reverified the live description, homepage, topics, and custom social preview through GitHub CLI and GraphQL.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Configured the public GitHub description, guide homepage, and discovery topics; added an MIT license; and activated a terminal-themed social preview. Verified after merge through GitHub repository metadata and GraphQL Open Graph image status.
+<!-- SECTION:FINAL_SUMMARY:END -->
