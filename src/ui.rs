@@ -16,8 +16,8 @@ use ratatui::widgets::{
 use textwrap::wrap;
 
 use crate::app::{
-    AppState, Channel, CommandDefinition, FileOffer, FilesEntry, FilesNotice, PeerDetails,
-    PeerPresence, TranscriptLine, command_catalog, hex_id, hex_prefix,
+    AppState, Channel, CommandDefinition, CommandPickerAction, FileOffer, FilesEntry, FilesNotice,
+    PeerDetails, PeerPresence, TranscriptLine, command_catalog, hex_id, hex_prefix,
 };
 use crate::files::{StagedAttachment, human_size};
 use crate::hyperlink;
@@ -71,6 +71,8 @@ const COMMAND_PICKER_WIDTH: u16 = 78;
 const COMMAND_PICKER_ROWS: usize = 18;
 /// Width reserved for shortcut labels in command-picker rows.
 const COMMAND_PICKER_SHORTCUT_WIDTH: usize = 8;
+/// Width reserved for the icon and label that explain what Enter will do.
+const COMMAND_PICKER_ACTION_WIDTH: usize = 7;
 
 /// Width of the file picker overlay (`render_picker`), borders included.
 const PICKER_WIDTH: u16 = 78;
@@ -477,26 +479,39 @@ fn render_switcher(frame: &mut Frame, app: &AppState) {
     );
     render_scroll_indicator(frame, track, start, matches.len(), visible_rows);
 }
-/// Splits a command-picker row into command, shortcut, and description
-/// columns. The shortcut column stays fixed where space permits so empty
-/// cells clearly mean that no shortcut exists, rather than hiding it in
-/// surrounding text.
-fn command_picker_columns(width: usize) -> (usize, usize, usize) {
+/// Splits a command-picker row into command, action, shortcut, and
+/// description columns. Action and shortcut columns stay fixed where space
+/// permits so their empty or abbreviated states cannot be mistaken for text
+/// from a neighbouring cell.
+fn command_picker_columns(width: usize) -> (usize, usize, usize, usize) {
     let content_width = width.saturating_sub(1);
+    let action_width = content_width.min(COMMAND_PICKER_ACTION_WIDTH);
     let shortcut_width = content_width.min(COMMAND_PICKER_SHORTCUT_WIDTH);
-    let remaining = content_width.saturating_sub(shortcut_width);
+    let remaining = content_width.saturating_sub(action_width + shortcut_width);
     let syntax_width = remaining / 2;
     let description_width = remaining.saturating_sub(syntax_width);
-    (syntax_width, shortcut_width, description_width)
+    (
+        syntax_width,
+        action_width,
+        shortcut_width,
+        description_width,
+    )
 }
 
 fn command_picker_header(width: usize) -> Line<'static> {
-    let (syntax_width, shortcut_width, description_width) = command_picker_columns(width);
+    let (syntax_width, action_width, shortcut_width, description_width) =
+        command_picker_columns(width);
     Line::from(vec![
         Span::styled(
             format!(" {:<syntax_width$}", "command"),
             Style::default()
                 .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:<action_width$}", "action"),
+            Style::default()
+                .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -521,7 +536,8 @@ fn command_picker_row(
     width: usize,
     highlighted: bool,
 ) -> ListItem<'static> {
-    let (syntax_width, shortcut_width, description_width) = command_picker_columns(width);
+    let (syntax_width, action_width, shortcut_width, description_width) =
+        command_picker_columns(width);
     let syntax_style = if highlighted {
         Style::default().fg(Color::Black)
     } else {
@@ -539,6 +555,22 @@ fn command_picker_row(
     } else {
         Style::default().fg(Color::DarkGray)
     };
+    let action_style = if highlighted {
+        Style::default().fg(Color::Black)
+    } else {
+        match command.picker_action {
+            CommandPickerAction::Execute => Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+            CommandPickerAction::Insert => Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        }
+    };
+    let action = match command.picker_action {
+        CommandPickerAction::Execute => "▶ run",
+        CommandPickerAction::Insert => "✎ edit",
+    };
     let mut spans = vec![Span::styled(
         format!(
             " {:<syntax_width$}",
@@ -546,6 +578,10 @@ fn command_picker_row(
         ),
         syntax_style,
     )];
+    spans.push(Span::styled(
+        format!("{:<action_width$}", truncate_chars(action, action_width)),
+        action_style,
+    ));
     spans.push(Span::styled(
         format!(
             "{:<shortcut_width$}",
@@ -587,8 +623,8 @@ fn switcher_area(screen: Rect, matches: usize) -> Rect {
     overlay_area(screen, SWITCHER_WIDTH, matches.clamp(1, SWITCHER_MAX_ROWS))
 }
 /// The slash-command picker opened with `Ctrl+K`. It mirrors the switcher's
-/// modal behavior, but rows show each command's syntax, shortcut, if any,
-/// and description in dedicated columns.
+/// modal behavior, but rows show each command's syntax, action, shortcut, if
+/// any, and description in dedicated columns.
 fn render_command_picker(frame: &mut Frame, app: &AppState) {
     let Some(picker) = &app.command_picker else {
         return;
@@ -596,9 +632,17 @@ fn render_command_picker(frame: &mut Frame, app: &AppState) {
     let matches = app.command_picker_matches();
     let highlighted = app.command_picker_highlight();
     let area = command_picker_area(frame.area(), matches.len());
+    let instruction = highlighted
+        .map(|index| match command_catalog()[index].picker_action {
+            CommandPickerAction::Execute => "Enter run · draft kept",
+            CommandPickerAction::Insert => "Enter insert · replaces draft",
+        })
+        .unwrap_or("Enter select");
     let block = Block::bordered()
         .title("commands · Ctrl+K")
-        .title_bottom("↑/↓ move · Enter run · Ctrl+P channels · Esc cancel")
+        .title_bottom(format!(
+            "↑/↓ move · {instruction} · Ctrl+P channels · Esc cancel"
+        ))
         .border_type(BorderType::Rounded);
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
@@ -3198,9 +3242,14 @@ mod tests {
         assert!(text.contains("Share the clipboard"), "got: {text}");
         let header = rows.iter().find(|row| row.contains("shortcut")).unwrap();
         let paste = rows.iter().find(|row| row.contains("Ctrl+V")).unwrap();
+        let column = |row: &str, needle: &str| {
+            row.find(needle)
+                .map(|index| row[..index].chars().count())
+                .unwrap()
+        };
         assert_eq!(
-            header.find("shortcut"),
-            paste.find("Ctrl+V"),
+            column(header, "shortcut"),
+            column(paste, "Ctrl+V"),
             "shortcut labels must align under their dedicated header"
         );
 
@@ -3210,6 +3259,35 @@ mod tests {
         let text = render_to_rows(&app).join("\n");
         assert!(text.contains("/invite"), "got: {text}");
         assert!(!text.contains("[Ctrl+V]"), "got: {text}");
+    }
+
+    #[test]
+    fn command_picker_shows_each_selection_outcome_before_enter() {
+        let mut app = app_with_every_kind();
+        open_command_picker(&mut app);
+        type_text(&mut app, "files");
+        let rows = render_to_rows(&app);
+        let text = rows.join("\n");
+
+        assert!(text.contains("Enter run · draft kept"), "got: {text}");
+        let header = rows.iter().find(|row| row.contains("action")).unwrap();
+        let files = rows.iter().find(|row| row.contains("/files")).unwrap();
+        assert!(files.contains("▶ run"), "got: {files}");
+        assert_eq!(
+            header.find("action"),
+            files.find("▶ run"),
+            "action labels must align under their dedicated header"
+        );
+
+        press(&mut app, KeyCode::Esc);
+        open_command_picker(&mut app);
+        type_text(&mut app, "search");
+        let text = render_to_rows(&app).join("\n");
+        assert!(text.contains("✎ edit"), "got: {text}");
+        assert!(
+            text.contains("Enter insert · replaces draft"),
+            "got: {text}"
+        );
     }
 
     #[test]
@@ -3243,6 +3321,7 @@ mod tests {
         let area = command_picker_area(Rect::new(0, 0, 24, 8), 1);
         let text = box_rows(&buffer, area).join("\n");
         assert!(text.contains("Ctrl+V"), "got: {text}");
+        assert!(text.contains("▶ run"), "got: {text}");
     }
     #[test]
     fn command_picker_uses_more_rows_and_keeps_selected_text_readable() {
