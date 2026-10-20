@@ -24,6 +24,15 @@ device; peers who were offline automatically catch up when they return.
   channels, and local history, then backfills missed messages for channels
   you are already allowed to join.
 
+## File sharing
+
+Share a local file with `/send <path>`; a peer in the same channel retrieves
+the newest shared file with `/save`. The file lands in that channel's own
+folder, so unrelated conversations never mix their received files. The
+[file-sharing guide](guide/src/file-sharing.md) covers the full workflow.
+
+![Alice sends demo-note.txt to a shared channel. Bob's received-files pane shows the fixture is absent before /save and lists the saved copy after the transfer.](guide/src/assets/leyline-file-demo.gif)
+
 ## Documentation
 
 The user guide covers setup and safe folder synchronization:
