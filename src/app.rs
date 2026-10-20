@@ -57,6 +57,12 @@ pub struct PeerDetails {
     pub version: Option<String>,
 }
 
+/// How long a valid full-channel device certificate keeps a non-neighbor
+/// device online. The runtime refreshes these observations every
+/// `HISTORY_ANNOUNCE_INTERVAL`, so three missed announcements are tolerated
+/// before the sidebar falls back to the persisted offline row.
+const PEER_ACTIVITY_TTL_MS: u64 = 90_000;
+
 /// Cap on in-memory scrollback per channel, per concept.md's guidance on
 /// bounding render/memory cost in a long-lived session.
 const MAX_SCROLLBACK: usize = 500;
@@ -606,7 +612,14 @@ pub struct FilesListing {
 pub struct Channel {
     pub name: String,
     pub messages: VecDeque<TranscriptLine>,
+    /// Direct iroh-gossip neighbors, updated immediately by
+    /// `NeighborUp`/`NeighborDown`.
     pub peers: Vec<[u8; 32]>,
+    /// Valid device certificates received from elsewhere in the gossip mesh,
+    /// keyed by the certified endpoint id and held only until their bounded
+    /// activity window expires. This is deliberately transient: `last_seen`
+    /// supplies the durable offline history instead.
+    recent_peers: HashMap<[u8; 32], u64>,
     last_seen: HashMap<[u8; 32], u64>,
     pub scroll: usize,
     /// Number of newly received live messages not yet viewed. This is
@@ -679,6 +692,7 @@ impl Channel {
             name,
             messages: VecDeque::new(),
             peers: Vec::new(),
+            recent_peers: HashMap::new(),
             last_seen: HashMap::new(),
             scroll: 0,
             unread_count: 0,

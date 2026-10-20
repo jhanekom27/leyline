@@ -1354,6 +1354,14 @@ async fn run(
                         warn!(%channel, "failed to persist peer last-seen time: {err}");
                     }
                 }
+                if let NetEvent::Device(channel, cert) = &net_event {
+                    let seen_unix_ms = message::now_unix_ms();
+                    app.record_peer_activity(channel, cert.device_id, seen_unix_ms);
+                    app.record_peer_seen(channel, cert.device_id, seen_unix_ms);
+                    if let Err(err) = last_seen.record(channel, cert.device_id, seen_unix_ms) {
+                        warn!(%channel, "failed to persist peer last-seen time: {err}");
+                    }
+                }
 
                 // Also peek for a channel finishing a runtime `/join`, so
                 // it's persisted to the channel registry -- see
@@ -1977,6 +1985,7 @@ async fn run(
             }
             _ = tick.tick() => {
                 replay_paused_sync_events(&mut paused_sync_events, &app, &replay_tx);
+                dirty |= app.expire_peer_activity(message::now_unix_ms());
             }
             _ = history_heartbeat.tick() => {
                 // Re-announce every joined channel's history root
@@ -1987,6 +1996,7 @@ async fn run(
                 // history backfill" section).
                 for channel in &app.channels {
                     announce_history(&net, &backfill, &channel.name);
+                    net.announce_device(&channel.name);
                     net.announce_docs(&channel.name);
                 }
             }

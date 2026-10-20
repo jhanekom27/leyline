@@ -663,6 +663,63 @@ fn peer_presence_prefers_live_presence_and_deduplicates_certified_devices() {
 }
 
 #[test]
+fn peer_presence_keeps_a_remote_device_online_until_its_activity_expires() {
+    let mut app = app();
+    let user_key = SecretKey::generate();
+    app.handle_net_event(NetEvent::Device(
+        "general".to_string(),
+        device_cert(&user_key, PEER_ID),
+    ));
+    app.record_peer_seen("general", PEER_ID, 1_000);
+    app.record_peer_activity("general", PEER_ID, 1_000);
+
+    assert_eq!(
+        app.peer_presence(),
+        vec![PeerPresence {
+            id: PEER_ID,
+            last_seen_unix_ms: None,
+        }],
+        "a full-channel device certificate is current presence even without PeerJoined"
+    );
+
+    assert!(app.expire_peer_activity(91_000));
+    assert_eq!(
+        app.peer_presence(),
+        vec![PeerPresence {
+            id: PEER_ID,
+            last_seen_unix_ms: Some(1_000),
+        }],
+        "once the heartbeat window expires the durable observation remains offline"
+    );
+}
+
+#[test]
+fn peer_presence_keeps_one_certified_user_online_when_any_device_is_active() {
+    let mut app = app();
+    let user_key = SecretKey::generate();
+    app.handle_net_event(NetEvent::Device(
+        "general".to_string(),
+        device_cert(&user_key, PEER_ID),
+    ));
+    app.handle_net_event(NetEvent::Device(
+        "general".to_string(),
+        device_cert(&user_key, PEER_ID_2),
+    ));
+    app.record_peer_seen("general", PEER_ID, 1_000);
+    app.record_peer_seen("general", PEER_ID_2, 2_000);
+    app.record_peer_activity("general", PEER_ID_2, 2_000);
+
+    assert_eq!(
+        app.peer_presence(),
+        vec![PeerPresence {
+            id: PEER_ID_2,
+            last_seen_unix_ms: None,
+        }],
+        "one remote sibling keeps the canonical user online"
+    );
+}
+
+#[test]
 fn device_event_migrates_a_nickname_seen_before_the_certificate() {
     let mut app = app();
     let user_key = SecretKey::generate();
@@ -2417,7 +2474,31 @@ fn slash_who_lists_online_peers_before_remembered_offline_peers() {
 }
 
 #[test]
-fn slash_who_deduplicates_certified_devices_like_the_peer_sidebar() {
+fn slash_who_lists_a_device_known_only_from_recent_certificate_activity() {
+    let mut app = app();
+    let user_key = SecretKey::generate();
+    app.handle_net_event(NetEvent::Device(
+        "general".to_string(),
+        device_cert(&user_key, PEER_ID),
+    ));
+    app.record_peer_activity("general", PEER_ID, 1_000);
+
+    submit(&mut app, "/who");
+
+    assert_eq!(
+        app.viewing_peers
+            .as_ref()
+            .unwrap()
+            .peers
+            .iter()
+            .map(|peer| (peer.id, peer.last_seen_unix_ms))
+            .collect::<Vec<_>>(),
+        vec![(PEER_ID, None), (SELF_ID, None)]
+    );
+}
+
+#[test]
+fn slash_who_keeps_certified_devices_as_separate_diagnostic_rows() {
     let mut app = app();
     let user_key = SecretKey::generate();
     app.handle_net_event(NetEvent::PeerJoined("general".to_string(), PEER_ID));
@@ -2440,7 +2521,7 @@ fn slash_who_deduplicates_certified_devices_like_the_peer_sidebar() {
     let overlay = app.viewing_peers.as_ref().unwrap();
     assert_eq!(
         overlay.peers.iter().map(|peer| peer.id).collect::<Vec<_>>(),
-        vec![PEER_ID, SELF_ID]
+        vec![PEER_ID, PEER_ID_2, SELF_ID]
     );
     assert!(
         overlay

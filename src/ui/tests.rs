@@ -46,7 +46,9 @@ fn find_highlights_matches_a_term_at_the_very_end() {
     );
 }
 
-use crate::message::FileAttachment;
+use crate::message::{DeviceCert, FileAttachment};
+use crate::net::NetEvent;
+use iroh::SecretKey;
 
 fn file_message(sender: [u8; 32], filename: &str, size: u64) -> ChatMessage {
     ChatMessage {
@@ -1033,6 +1035,30 @@ fn peers_sidebar_only_shows_active_channels_last_seen_peers() {
     let project = screen_rows(&render_to_buffer(&app, 100, 50)).join("\n");
     assert!(project.contains("○ Bob"), "got: {project}");
     assert!(!project.contains("○ Alice"), "got: {project}");
+}
+#[test]
+fn peers_sidebar_collapses_recently_active_certified_devices_into_one_user() {
+    let mut app = app_with_every_kind();
+    let user_key = SecretKey::generate();
+    let user_id = *user_key.public().as_bytes();
+    let first = [1; 32];
+    let second = [2; 32];
+    app.load_contacts(HashMap::from([(user_id, "Alice".to_string())]));
+    for id in [first, second] {
+        app.handle_net_event(NetEvent::Device(
+            "general".to_string(),
+            DeviceCert::new(id, &user_key, 1_000),
+        ));
+        app.record_peer_activity("general", id, 1_000);
+    }
+
+    let text = screen_rows(&render_to_buffer(&app, 100, 50)).join("\n");
+
+    assert_eq!(
+        text.matches("● Alice").count(),
+        1,
+        "both active devices must collapse to one online sidebar row:\n{text}"
+    );
 }
 
 /// The screen every switcher render test draws on.

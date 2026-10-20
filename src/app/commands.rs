@@ -650,14 +650,14 @@ impl AppState {
     }
 
     /// Handles `/who`: opens a local, dismissible table for the active
-    /// channel's online and remembered peers. Presence comes from the same
-    /// `peer_presence` view as the sidebar, while alias and nickname follow
-    /// `peer_details`' canonical identity lookup. The table is a snapshot,
-    /// so a focus change or network event cannot replace its data while it is
-    /// open.
+    /// channel's online and remembered device endpoints. Unlike the sidebar,
+    /// this keeps separate rows for a person's devices; alias and nickname
+    /// still follow `peer_details`' canonical identity lookup. The table is
+    /// a snapshot, so a focus change or network event cannot replace its data
+    /// while it is open.
     pub(super) fn run_who(&mut self) -> Option<InputAction> {
         let heading = self.channel_heading(&self.active().name);
-        let presence = self.peer_presence();
+        let presence = self.who_presence();
         let first_offline = presence
             .iter()
             .position(|peer| peer.last_seen_unix_ms.is_some())
