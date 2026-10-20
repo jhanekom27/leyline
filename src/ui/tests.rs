@@ -1300,6 +1300,37 @@ fn who_overlay_shows_endpoint_alias_and_nickname_in_aligned_columns() {
 }
 
 #[test]
+fn who_overlay_identifies_a_paired_sibling_endpoint_as_mine() {
+    let mut app = app_with_every_kind();
+    let user_key = SecretKey::generate();
+    let sibling = [8; 32];
+    app.load_self_user_id(*user_key.public().as_bytes());
+    app.handle_net_event(NetEvent::Device(
+        "general".to_string(),
+        DeviceCert::new(sibling, &user_key, 1_000),
+    ));
+    app.handle_net_event(NetEvent::PeerJoined("general".to_string(), sibling));
+    open_peers_overlay(&mut app);
+
+    let screen = Rect::new(0, 0, 120, 30);
+    let rows = box_rows(
+        &render_to_buffer(&app, screen.width, screen.height),
+        peers_overlay_area(screen, 2),
+    );
+    let sibling_row = rows
+        .iter()
+        .find(|row| row.contains(&hex_id(&sibling)))
+        .unwrap();
+    let self_row = rows
+        .iter()
+        .find(|row| row.contains(&hex_id(&app.self_id)))
+        .unwrap();
+
+    assert!(sibling_row.contains("● mine"), "got: {sibling_row}");
+    assert!(self_row.contains("● you "), "got: {self_row}");
+}
+
+#[test]
 fn who_overlay_includes_this_device_and_survives_tiny_terminals() {
     let mut app = app_with_every_kind();
     open_peers_overlay(&mut app);

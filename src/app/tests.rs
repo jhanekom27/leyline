@@ -541,6 +541,7 @@ fn hovered_peer_reports_alias_nickname_presence_and_version() {
         app.hovered_peer(),
         Some(PeerDetails {
             id: PEER_ID,
+            is_ours: false,
             alias: None,
             nickname: None,
             last_seen_unix_ms: None,
@@ -571,6 +572,7 @@ fn hovered_peer_reports_alias_nickname_presence_and_version() {
         app.hovered_peer(),
         Some(PeerDetails {
             id: PEER_ID,
+            is_ours: false,
             alias: Some("Alice".to_string()),
             nickname: Some("ally".to_string()),
             last_seen_unix_ms: Some(100),
