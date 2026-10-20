@@ -3,7 +3,7 @@ name: leyline-testing
 description: Use for selecting or adding leyline tests, validating a refactor, interpreting Rust test failures, or deciding which build, format, and lint commands a change requires.
 ---
 # Testing leyline
-Tests live inline with their module under `#[cfg(test)]`; move them with code when extracting a responsibility. Preserve behavior during refactors: do not rewrite assertions merely to accommodate structural changes.
+App-state and UI regression tests live in `src/app/tests.rs` and `src/ui/tests.rs`, beside their facades; other modules keep tests with the code they cover. Preserve behavior during refactors: do not rewrite assertions merely to accommodate structural changes.
 
 Validation levels:
 - Focused refactor: `cargo test`
