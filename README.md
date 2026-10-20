@@ -118,7 +118,7 @@ HOME=/tmp/leyline-b CARGO_HOME="$REAL_CARGO_HOME" cargo run
 | `End` / `Ctrl+E` | Jump to the end of the current line; while `/files` is open, `Ctrl+E` opens the highlighted local file in the platform text editor |
 | `Backspace` / `Delete` | Delete the character before / at the cursor (on an empty input, `Backspace` instead takes the most recently staged attachment back out -- see `Ctrl+V`) |
 | `Ctrl+U` | Delete from the start of the current line to the cursor |
-| `Ctrl+K` | Open the command picker: type to filter slash commands by syntax, alias, or description (syntax and aliases rank first); `Up` / `Down` choose one, `Enter` runs it without changing the current draft, and `Esc` cancels |
+| `Ctrl+K` | Open the command picker: type to filter slash commands by syntax, alias, or description (syntax and aliases rank first). Each row marks whether `Enter` will run it (`▶ run`, keeping the current draft) or insert it for editing (`✎ edit`, replacing the draft); `Up` / `Down` choose one and `Esc` cancels |
 | `Ctrl+W` | Delete the word before the cursor |
 | `Alt+Enter` / `Ctrl+J` | Insert a newline in the message box without sending, for a longer, spaced-out message -- the box grows to fit (and scrolls, past a handful of lines) |
 | `Enter` | Send the composed message, or run a `/` command. With attachments staged (see `Ctrl+V`) it sends them all instead, the typed text becoming the caption of the first -- but a `/` command still runs as a command and leaves them staged |

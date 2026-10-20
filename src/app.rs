@@ -62,23 +62,34 @@ pub struct PeerDetails {
 const MAX_SCROLLBACK: usize = 500;
 
 /// One user-facing slash command. This catalog is the shared source for the
-/// command picker and sidebar hints; `input` is what selecting it places in
-/// the compose draft.
+/// command picker and sidebar hints; `input` is the canonical compose text
+/// when the picker inserts the command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandDefinition {
     pub syntax: &'static str,
     pub input: &'static str,
+    pub picker_action: CommandPickerAction,
     /// A global keybinding for this command or its more specific picker, if
     /// one exists.
     pub shortcut: Option<&'static str>,
     pub aliases: &'static [&'static str],
     pub description: &'static str,
 }
+/// What selecting a command from Ctrl+K does. This is explicit catalog
+/// metadata rather than an inference from optional or required syntax: some
+/// optional commands have useful safe defaults, while others need deliberate
+/// user input before their bare behavior should be invoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandPickerAction {
+    Execute,
+    Insert,
+}
 
 const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/join <name|ticket>",
         input: "/join ",
+        picker_action: CommandPickerAction::Insert,
         shortcut: None,
         aliases: &[],
         description: "Join or create a channel",
@@ -86,6 +97,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/invite",
         input: "/invite",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "Show an invite for this channel",
@@ -93,6 +105,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/pair [ticket]",
         input: "/pair ",
+        picker_action: CommandPickerAction::Insert,
         shortcut: None,
         aliases: &[],
         description: "Pair a device or show a pairing ticket",
@@ -100,6 +113,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/forget-device <hex-prefix>",
         input: "/forget-device ",
+        picker_action: CommandPickerAction::Insert,
         shortcut: None,
         aliases: &[],
         description: "Forget a paired device",
@@ -107,6 +121,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/msg <peer> [text]",
         input: "/msg ",
+        picker_action: CommandPickerAction::Insert,
         shortcut: None,
         aliases: &[],
         description: "Start a private channel message",
@@ -114,6 +129,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/dm <peer> [text]",
         input: "/dm ",
+        picker_action: CommandPickerAction::Insert,
         shortcut: None,
         aliases: &[],
         description: "Start a direct peer conversation",
@@ -121,6 +137,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/alias <hex-prefix> <name>",
         input: "/alias ",
+        picker_action: CommandPickerAction::Insert,
         shortcut: None,
         aliases: &[],
         description: "Set a local name for a peer",
@@ -128,6 +145,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/nick <name>",
         input: "/nick ",
+        picker_action: CommandPickerAction::Insert,
         shortcut: None,
         aliases: &[],
         description: "Set your broadcast display name",
@@ -135,6 +153,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/leave [channel]",
         input: "/leave",
+        picker_action: CommandPickerAction::Insert,
         shortcut: None,
         aliases: &[],
         description: "Leave a channel",
@@ -142,6 +161,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/rename [name]",
         input: "/rename ",
+        picker_action: CommandPickerAction::Insert,
         shortcut: None,
         aliases: &[],
         description: "Set this channel's local display name",
@@ -149,6 +169,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/who",
         input: "/who",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "View this device and active peer details",
@@ -156,6 +177,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/send [path]",
         input: "/send",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "Pick or share a file",
@@ -163,6 +185,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/save [hash-prefix]",
         input: "/save",
+        picker_action: CommandPickerAction::Insert,
         shortcut: None,
         aliases: &[],
         description: "Download a shared file",
@@ -170,6 +193,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/folder [path]",
         input: "/folder",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "Show or set the files folder",
@@ -177,6 +201,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/maxsize [size|off|default]",
         input: "/maxsize",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "Show or set the file size limit",
@@ -184,6 +209,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/autosave [on|off|limit]",
         input: "/autosave",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "Configure automatic file saving",
@@ -191,6 +217,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/outbox [on|off]",
         input: "/outbox",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "Configure the watched send folder",
@@ -198,6 +225,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/sync [options]",
         input: "/sync",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "Configure folder synchronization",
@@ -205,6 +233,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/activity",
         input: "/activity",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "Show recent sync activity",
@@ -212,6 +241,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/conflicts [resolution]",
         input: "/conflicts",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "List or resolve sync conflicts",
@@ -219,6 +249,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/trash [restore|purge]",
         input: "/trash",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "Manage recoverable sync deletes",
@@ -226,6 +257,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/files",
         input: "/files",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "Browse shared and synced channel files",
@@ -233,6 +265,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/paste",
         input: "/paste",
+        picker_action: CommandPickerAction::Execute,
         shortcut: Some("Ctrl+V"),
         aliases: &[],
         description: "Share the clipboard",
@@ -240,6 +273,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/search <term>",
         input: "/search ",
+        picker_action: CommandPickerAction::Insert,
         shortcut: None,
         aliases: &["/s"],
         description: "Search channel messages",
@@ -247,6 +281,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/reply [text]",
         input: "/reply",
+        picker_action: CommandPickerAction::Execute,
         shortcut: Some("Ctrl+R"),
         aliases: &[],
         description: "Reply to the latest message",
@@ -254,6 +289,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/thread",
         input: "/thread",
+        picker_action: CommandPickerAction::Execute,
         shortcut: Some("Ctrl+T"),
         aliases: &[],
         description: "View the latest reply thread",
@@ -261,6 +297,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/hints",
         input: "/hints",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "Toggle command hints and hover reporting",
@@ -268,6 +305,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/bell",
         input: "/bell",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "Toggle the message bell",
@@ -275,6 +313,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/version",
         input: "/version",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "Show this build's version",
@@ -282,6 +321,7 @@ const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         syntax: "/help",
         input: "/help",
+        picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
         description: "Show command and keybinding help",
@@ -2378,15 +2418,20 @@ impl AppState {
     }
 
     fn confirm_command_picker(&mut self) -> Option<InputAction> {
-        let Some(index) = self.command_picker_highlight() else {
-            return None;
-        };
-        let command = command_catalog()[index]
-            .input
-            .trim_start_matches('/')
-            .trim();
+        let index = self.command_picker_highlight()?;
+        let command = command_catalog()[index];
         self.command_picker = None;
-        self.run_command(command)
+        match command.picker_action {
+            CommandPickerAction::Execute => {
+                self.run_command(command.input.trim_start_matches('/').trim())
+            }
+            CommandPickerAction::Insert => {
+                let channel = self.active_mut();
+                channel.input = command.input.to_string();
+                channel.cursor = channel.input.chars().count();
+                None
+            }
+        }
     }
 
     /// Opens the file picker -- a bare `/send` -- for the channel that is
@@ -3009,7 +3054,7 @@ impl AppState {
         let keys = [
             "Tab/Shift+Tab -- switch channels",
             "Ctrl+P -- jump to a channel (type to filter, \u{2191}/\u{2193} pick, Enter confirm)",
-            "Ctrl+K -- browse slash commands (type to filter, \u{2191}/\u{2193} pick, Enter run)",
+            "Ctrl+K -- browse slash commands (type to filter; ↑/↓ pick; each row says whether Enter runs it, keeping your draft, or inserts it, replacing your draft)",
             "/send file picker -- type to filter, \u{2191}/\u{2193} pick, Space mark, Enter open a folder or stage the marked files, Backspace up a level, Esc cancel",
             "Alt+Enter/Ctrl+J -- newline",
             "Ctrl+V -- share the clipboard (a file or image is staged first: Enter sends it, Backspace on an empty input unstages, Esc clears)",
@@ -5835,6 +5880,70 @@ mod tests {
         assert!(app.command_picker.is_none());
         assert_eq!(app.active().input, "old draft");
         assert_eq!(app.active().cursor, 9);
+    }
+
+    #[test]
+    fn command_picker_executes_files_and_safe_optional_commands_without_changing_the_draft() {
+        for query in ["files", "send"] {
+            let mut app = app();
+            type_text(&mut app, "old draft");
+            app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+            type_text(&mut app, query);
+
+            let action = app.handle_key(key(KeyCode::Enter));
+
+            match action.expect("the selected command returns its action") {
+                InputAction::ReadFiles { channel, .. } if query == "files" => {
+                    assert_eq!(channel, "general");
+                    assert!(app.viewing_files.is_some());
+                }
+                InputAction::ReadFolder { .. } if query == "send" => {
+                    assert!(app.picking_file.is_some());
+                }
+                _ => panic!("expected the action for /{query}"),
+            }
+            assert!(app.command_picker.is_none());
+            assert_eq!(app.active().input, "old draft");
+            assert_eq!(app.active().cursor, 9);
+        }
+    }
+
+    #[test]
+    fn command_picker_inserts_required_commands_and_replaces_the_draft() {
+        let mut app = app();
+        type_text(&mut app, "old draft");
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        type_text(&mut app, "search");
+
+        let action = app.handle_key(key(KeyCode::Enter));
+
+        assert!(action.is_none());
+        assert!(app.command_picker.is_none());
+        assert_eq!(app.active().input, "/search ");
+        assert_eq!(app.active().cursor, "/search ".chars().count());
+        assert!(app.active().search.is_none());
+    }
+
+    #[test]
+    fn command_picker_inserts_deliberate_optional_commands() {
+        for (query, input) in [
+            ("pair", "/pair "),
+            ("save", "/save"),
+            ("leave", "/leave"),
+            ("rename", "/rename "),
+        ] {
+            let mut app = app();
+            type_text(&mut app, "old draft");
+            app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+            type_text(&mut app, query);
+
+            let action = app.handle_key(key(KeyCode::Enter));
+
+            assert!(action.is_none(), "/{query} must not run from the picker");
+            assert!(app.command_picker.is_none());
+            assert_eq!(app.active().input, input);
+            assert_eq!(app.active().cursor, input.chars().count());
+        }
     }
 
     #[test]
