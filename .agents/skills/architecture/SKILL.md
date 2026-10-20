@@ -7,6 +7,6 @@ Read `concept.md` before changing boundaries. Preserve its core direction:
 
 `main` owns the async event loop and I/O → `app` owns pure UI state → `ui` renders read-only state.
 
-Keep slow filesystem and network work off the render path. Prefer extending an existing focused module over adding a cross-layer shortcut. Relevant module roots are `src/app.rs`, `src/ui.rs`, `src/files.rs`, `src/net.rs`, and `src/runtime.rs`.
+Keep slow filesystem and network work off the render path. Prefer extending an existing focused module over adding a cross-layer shortcut. `src/app.rs` and `src/ui.rs` are facades: follow their private child modules for a focused responsibility before editing either root. Relevant module roots are `src/app.rs`, `src/ui.rs`, `src/files.rs`, `src/net.rs`, and `src/runtime.rs`.
 
 Run `cargo test` after moving code across module boundaries, then run the full validation set for integrated changes.
