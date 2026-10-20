@@ -340,6 +340,7 @@ impl AppState {
         let id = self.canonical_id(&peer.id);
         PeerDetails {
             id: peer.id,
+            is_ours: peer.id == self.self_id || id == self.self_user_id,
             alias: self.petnames.get(&id).cloned(),
             nickname: self.nicknames.get(&id).cloned(),
             last_seen_unix_ms: peer.last_seen_unix_ms,
@@ -353,6 +354,7 @@ impl AppState {
     pub(super) fn self_peer_details(&self) -> PeerDetails {
         PeerDetails {
             id: self.self_id,
+            is_ours: true,
             alias: None,
             nickname: self.local_nickname.clone(),
             last_seen_unix_ms: None,

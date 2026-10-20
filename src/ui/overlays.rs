@@ -276,6 +276,19 @@ pub(super) fn peers_overlay_row(
             Style::default().fg(Color::Green),
             Style::default().fg(user_color(&peer.id)),
         )
+    } else if peer.is_ours {
+        match peer.last_seen_unix_ms {
+            None => (
+                "● mine",
+                Style::default().fg(Color::Green),
+                Style::default().fg(user_color(&peer.id)),
+            ),
+            Some(_) => (
+                "○ mine",
+                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::DarkGray),
+            ),
+        }
     } else {
         match peer.last_seen_unix_ms {
             None => (

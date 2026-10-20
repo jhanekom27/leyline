@@ -47,6 +47,9 @@ pub struct PeerPresence {
 pub struct PeerDetails {
     /// The hovered device's id, for its identity colour.
     pub id: [u8; 32],
+    /// Whether this endpoint belongs to the local user: either this device
+    /// itself or a paired sibling certified under `self_user_id`.
+    pub is_ours: bool,
     /// Our local `/alias` for them, if any.
     pub alias: Option<String>,
     /// Their self-chosen `/nick`, if they've announced one.
