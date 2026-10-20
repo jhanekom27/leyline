@@ -253,7 +253,7 @@ where
     }
     Ok(drained)
 }
-/// Mouse reporting follows the hints panel and is restored on every
+/// Mouse reporting follows `/mouse` and is restored on every
 /// return path (including draw or event-stream errors).
 struct MouseReporting<W: Write> {
     writer: W,
@@ -657,7 +657,11 @@ async fn run(
     app.load_autosave_limit(autosave_limit);
     app.load_outbox(outbox.channels());
     app.load_sync(sync_settings.configs());
-    app.load_settings(settings.bell_enabled(), settings.nickname());
+    app.load_settings(
+        settings.bell_enabled(),
+        settings.mouse_enabled(),
+        settings.nickname(),
+    );
     app.load_dm_registry(dm_registry.all());
     app.load_forgotten_devices(forgotten_devices.all());
     app.load_browse_dir(start_folder(&data_dir));
@@ -786,7 +790,7 @@ async fn run(
     let mut mouse_position = None;
 
     while !app.should_quit {
-        mouse_reporting.update(app.show_hints)?;
+        mouse_reporting.update(app.mouse_enabled)?;
         if dirty {
             let size = terminal.size()?;
             let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
@@ -1224,6 +1228,11 @@ async fn run(
                             Some(InputAction::Bell(enabled)) => {
                                 if let Err(err) = settings.set_bell_enabled(enabled) {
                                     warn!("failed to persist bell setting: {err}");
+                                }
+                            }
+                            Some(InputAction::Mouse(enabled)) => {
+                                if let Err(err) = settings.set_mouse_enabled(enabled) {
+                                    warn!("failed to persist mouse setting: {err}");
                                 }
                             }
                             // The file picker wants a folder listed. A huge or

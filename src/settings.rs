@@ -1,5 +1,6 @@
 //! Persisted local preferences: whether incoming messages ring the
-//! terminal bell (`/bell`, see `app::AppState::run_bell`), and the last
+//! terminal bell (`/bell`, see `app::AppState::run_bell`), whether the
+//! mouse is reported (`/mouse`, see `app::AppState::run_mouse`), and the last
 //! broadcast nickname set via `/nick` (see `net::Net::set_nickname`, which
 //! is what actually sends it to peers -- this module only remembers it
 //! locally, so it doesn't need to be retyped every session). Local only,
@@ -33,6 +34,10 @@ struct SettingsData {
     /// it already does mid-session. `None` until `/nick` is run for the
     /// first time.
     nickname: Option<String>,
+    /// Whether the terminal reports the mouse to us (`/mouse`, see
+    /// `app::AppState::run_mouse`) -- on by default so hover popups work
+    /// out of the box.
+    mouse_enabled: bool,
 }
 
 impl Default for SettingsData {
@@ -40,8 +45,17 @@ impl Default for SettingsData {
         Self {
             bell_enabled: true,
             nickname: None,
+            mouse_enabled: true,
         }
     }
+}
+
+/// The settings file's shape before `/mouse` existed, so upgrading keeps
+/// the saved bell preference and nickname -- see `decode`.
+#[derive(Deserialize)]
+struct SettingsDataV1 {
+    bell_enabled: bool,
+    nickname: Option<String>,
 }
 
 /// Local, whole-file-rewrite-on-change store of user preferences.
@@ -88,6 +102,18 @@ impl Settings {
         self.save()
     }
 
+    /// Whether mouse reporting is on -- seeded into `AppState` once at
+    /// startup (see `AppState::load_settings`).
+    pub fn mouse_enabled(&self) -> bool {
+        self.data.mouse_enabled
+    }
+
+    /// Persists a new mouse-reporting preference, like `set_bell_enabled`.
+    pub fn set_mouse_enabled(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.data.mouse_enabled = enabled;
+        self.save()
+    }
+
     /// Our last broadcast nickname, if `/nick` has ever been run -- seeded
     /// into `net::Net` once at startup (see `net::Net::start`) so it can
     /// re-announce it once a channel gains a neighbor, without needing it
@@ -118,10 +144,20 @@ impl Settings {
 /// Decodes the settings file's contents, tolerating corruption by logging
 /// and falling back to defaults -- see `Settings::load`.
 fn decode(bytes: &[u8]) -> SettingsData {
-    postcard::from_bytes(bytes).unwrap_or_else(|err| {
-        warn!("dropping corrupt settings file: {err}");
-        SettingsData::default()
-    })
+    if let Ok(data) = postcard::from_bytes(bytes) {
+        return data;
+    }
+    match postcard::from_bytes::<SettingsDataV1>(bytes) {
+        Ok(old) => SettingsData {
+            bell_enabled: old.bell_enabled,
+            nickname: old.nickname,
+            ..SettingsData::default()
+        },
+        Err(err) => {
+            warn!("dropping corrupt settings file: {err}");
+            SettingsData::default()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -219,5 +255,48 @@ mod tests {
         settings.set_nickname("Alice".to_string()).unwrap();
         assert!(!settings.bell_enabled());
         assert_eq!(settings.nickname(), Some("Alice".to_string()));
+    }
+
+    #[test]
+    fn missing_file_defaults_mouse_to_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(settings_at(&dir).mouse_enabled());
+    }
+
+    #[test]
+    fn mouse_persists_across_reloads_independently_of_the_bell() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings");
+
+        let mut settings = Settings::load(path.clone()).unwrap();
+        settings.set_mouse_enabled(false).unwrap();
+
+        let reloaded = Settings::load(path).unwrap();
+        assert!(!reloaded.mouse_enabled());
+        assert!(reloaded.bell_enabled());
+    }
+
+    #[test]
+    fn a_file_saved_before_mouse_existed_keeps_its_settings() {
+        #[derive(Serialize)]
+        struct OldSettings {
+            bell_enabled: bool,
+            nickname: Option<String>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let old = OldSettings {
+            bell_enabled: false,
+            nickname: Some("Alice".to_string()),
+        };
+        fs::write(
+            dir.path().join("settings"),
+            postcard::to_stdvec(&old).unwrap(),
+        )
+        .unwrap();
+
+        let settings = settings_at(&dir);
+        assert!(!settings.bell_enabled());
+        assert_eq!(settings.nickname(), Some("Alice".to_string()));
+        assert!(settings.mouse_enabled());
     }
 }

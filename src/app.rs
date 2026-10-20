@@ -300,7 +300,15 @@ const COMMANDS: &[CommandDefinition] = &[
         picker_action: CommandPickerAction::Execute,
         shortcut: None,
         aliases: &[],
-        description: "Toggle command hints and hover reporting",
+        description: "Toggle the command hints panel",
+    },
+    CommandDefinition {
+        syntax: "/mouse",
+        input: "/mouse",
+        picker_action: CommandPickerAction::Execute,
+        shortcut: None,
+        aliases: &[],
+        description: "Toggle mouse hover popups",
     },
     CommandDefinition {
         syntax: "/bell",
@@ -1121,6 +1129,11 @@ pub enum InputAction {
     /// immediately to `bell_enabled` for instant feedback; the caller only
     /// needs to persist it to disk.
     Bell(bool),
+    /// Persist a new mouse-reporting preference, toggled via `/mouse` (see
+    /// `run_mouse`). Like `Bell`, `mouse_enabled` is already updated; the
+    /// caller only persists it, while the main loop's `MouseReporting`
+    /// follows `mouse_enabled` on its own.
+    Mouse(bool),
     /// Read `dir` for the file picker (`picker::read_folder`, off the event
     /// loop) and report it back as a `picker::FolderListing` for `request`,
     /// which `AppState::apply_folder_listing` matches to the read it was
@@ -1166,6 +1179,12 @@ pub struct AppState {
     /// teaches new users; in-memory only, like `scroll`, not persisted
     /// across restarts.
     pub show_hints: bool,
+    /// Whether the terminal reports the mouse to us, which hover popups
+    /// over command hints and peers need -- toggled via `/mouse`
+    /// (`run_mouse`). On by default and persisted like `bell_enabled`;
+    /// while it's on, native text selection needs a modifier (Shift, or
+    /// Option in iTerm2).
+    pub mouse_enabled: bool,
     /// The command-hints row under the mouse, if any -- `ui::render`
     /// shows that command's popup while it's set.
     hint_hover: Option<usize>,
@@ -1384,6 +1403,7 @@ impl AppState {
             active,
             should_quit: false,
             show_hints: true,
+            mouse_enabled: true,
             hint_hover: None,
             peer_hover: None,
             bell_enabled: true,
@@ -1483,8 +1503,14 @@ impl AppState {
     /// settings.rs). Intended to be called once, right after
     /// `AppState::new`, before the event loop starts -- mirrors
     /// `load_contacts`.
-    pub fn load_settings(&mut self, bell_enabled: bool, nickname: Option<String>) {
+    pub fn load_settings(
+        &mut self,
+        bell_enabled: bool,
+        mouse_enabled: bool,
+        nickname: Option<String>,
+    ) {
         self.bell_enabled = bell_enabled;
+        self.mouse_enabled = mouse_enabled;
         self.local_nickname = nickname;
     }
 
@@ -2987,6 +3013,7 @@ impl AppState {
             "reply" => self.run_reply(arg.trim()),
             "thread" => self.run_thread(),
             "hints" => self.run_hints(),
+            "mouse" => self.run_mouse(),
             "bell" => self.run_bell(),
             "version" => self.run_version(),
             "help" => self.run_help(),
@@ -3046,7 +3073,8 @@ impl AppState {
             "/search <term> (or /s) -- search channel messages".to_string(),
             "/reply [text] -- reply to the latest message".to_string(),
             "/thread -- view the latest reply thread".to_string(),
-            "/hints -- toggle command hints; also toggles mouse reporting (hold Shift, or Option in iTerm2, to select text); hover a command hint to see its description and full usage".to_string(),
+            "/hints -- toggle the command hints panel".to_string(),
+            "/mouse -- toggle mouse reporting (on by default, remembered across restarts); hover a command hint or a peer to see a popup; while on, hold Shift (or Option in iTerm2) to select text".to_string(),
             "/bell -- toggle the message bell".to_string(),
             "/version -- show this build's version".to_string(),
             "/help -- show this help".to_string(),
@@ -3072,9 +3100,10 @@ impl AppState {
         None
     }
 
-    /// Mouse hover is suppressed while another view owns input.
-    pub fn can_hover_hints(&self) -> bool {
-        self.show_hints
+    /// Mouse hover needs mouse reporting (`/mouse`) and is suppressed
+    /// while another view owns input.
+    pub fn can_hover(&self) -> bool {
+        self.mouse_enabled
             && self.command_picker.is_none()
             && self.viewing_peers.is_none()
             && self.switching.is_none()
@@ -3083,6 +3112,12 @@ impl AppState {
             && self.pending_redeem.is_none()
             && self.picking_reply.is_none()
             && self.picking_thread.is_none()
+    }
+
+    /// Like `can_hover`, but also needs the command hints panel shown
+    /// (`/hints`).
+    pub fn can_hover_hints(&self) -> bool {
+        self.show_hints && self.can_hover()
     }
 
     /// Records the command-hints row measured under the mouse by the
@@ -3106,10 +3141,10 @@ impl AppState {
 
     /// Records the peers-panel peer measured under the mouse by the
     /// read-only UI layout (`ui::peer_at`); returns whether the frame
-    /// changed. Gated like `set_hint_hover`, since mouse reporting itself
-    /// is only on while the hints panel is shown.
+    /// changed. Unlike `set_hint_hover`, works whether or not the hints
+    /// panel is shown.
     pub fn set_peer_hover(&mut self, peer: Option<[u8; 32]>) -> bool {
-        let peer = peer.filter(|_| self.can_hover_hints());
+        let peer = peer.filter(|_| self.can_hover());
         if self.peer_hover == peer {
             return false;
         }
@@ -3121,7 +3156,7 @@ impl AppState {
     /// input, nor once that peer has left the active channel's list, even
     /// before the next mouse event clears the hover.
     pub fn hovered_peer(&self) -> Option<PeerDetails> {
-        let id = self.peer_hover.filter(|_| self.can_hover_hints())?;
+        let id = self.peer_hover.filter(|_| self.can_hover())?;
         let peer = self
             .peer_presence()
             .into_iter()
@@ -3163,10 +3198,24 @@ impl AppState {
     fn run_hints(&mut self) -> Option<InputAction> {
         self.show_hints = !self.show_hints;
         self.set_hint_hover(None);
+        // The peers panel grows or shrinks with the hints panel, so the
+        // row under the mouse may now be someone else.
         self.set_peer_hover(None);
         let state = if self.show_hints { "shown" } else { "hidden" };
         self.push_system(format!("command hints {state}"));
         None
+    }
+
+    /// Handles `/mouse`: toggles mouse reporting, which hover popups need,
+    /// and reports the new state as a system notice. Persisted like
+    /// `/bell`, so an `InputAction` is returned for the caller to save it.
+    fn run_mouse(&mut self) -> Option<InputAction> {
+        self.mouse_enabled = !self.mouse_enabled;
+        self.set_hint_hover(None);
+        self.set_peer_hover(None);
+        let state = if self.mouse_enabled { "on" } else { "off" };
+        self.push_system(format!("mouse reporting {state}"));
+        Some(InputAction::Mouse(self.mouse_enabled))
     }
 
     /// Handles `/bell`: toggles whether an incoming message rings the
@@ -5301,6 +5350,13 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         submit(&mut app, "/hints");
+        assert!(app.peer_hover.is_none(), "the peers panel was resized");
+        assert!(
+            app.set_peer_hover(Some(PEER_ID)),
+            "peer hover doesn't need the hints panel"
+        );
+
+        submit(&mut app, "/mouse");
         assert!(app.peer_hover.is_none());
         assert!(!app.set_peer_hover(Some(PEER_ID)));
     }
@@ -6275,6 +6331,19 @@ mod tests {
     }
 
     #[test]
+    fn disabling_the_mouse_cancels_hint_hover_but_keeps_the_hints_panel() {
+        let mut app = app();
+        app.set_hint_hover(Some(12));
+        submit(&mut app, "/mouse");
+        assert!(app.show_hints);
+        assert!(!app.can_hover());
+        assert!(app.hint_hover.is_none());
+        assert!(!app.set_hint_hover(Some(12)));
+        submit(&mut app, "/mouse");
+        assert!(app.set_hint_hover(Some(12)));
+    }
+
+    #[test]
     fn opening_the_command_picker_cancels_hint_hover() {
         let mut app = app();
         app.set_hint_hover(Some(12));
@@ -6333,10 +6402,46 @@ mod tests {
     }
 
     #[test]
-    fn load_settings_seeds_bell_enabled_and_local_nickname() {
+    fn mouse_is_enabled_by_default() {
+        assert!(app().mouse_enabled);
+    }
+
+    #[test]
+    fn slash_mouse_toggles_and_reports_state_and_returns_an_action() {
         let mut app = app();
-        app.load_settings(false, Some("me".to_string()));
+
+        let action = submit(&mut app, "/mouse");
+        assert!(!app.mouse_enabled);
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "mouse reporting off");
+        match action.expect("/mouse returns an action") {
+            InputAction::Mouse(enabled) => assert!(!enabled),
+            _ => panic!("expected InputAction::Mouse"),
+        }
+
+        let action = submit(&mut app, "/mouse");
+        assert!(app.mouse_enabled);
+        let last = as_system(app.active().messages.back().unwrap());
+        assert_eq!(last, "mouse reporting on");
+        match action.expect("/mouse returns an action") {
+            InputAction::Mouse(enabled) => assert!(enabled),
+            _ => panic!("expected InputAction::Mouse"),
+        }
+    }
+
+    #[test]
+    fn slash_hints_leaves_the_mouse_alone() {
+        let mut app = app();
+        submit(&mut app, "/hints");
+        assert!(app.mouse_enabled);
+    }
+
+    #[test]
+    fn load_settings_seeds_bell_and_mouse_enabled() {
+        let mut app = app();
+        app.load_settings(false, false, Some("me".to_string()));
         assert!(!app.bell_enabled);
+        assert!(!app.mouse_enabled);
         assert_eq!(app.local_nickname.as_deref(), Some("me"));
     }
 
