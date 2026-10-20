@@ -2,8 +2,8 @@
 authors = ["leyline contributors"]
 language = "en"
 src = "src"
-title = "leyline guide"
-description = "A practical guide to private peer-to-peer chat and safe folder sync."
+title = "Leyline documentation"
+description = "Documentation for private peer-to-peer terminal chat, file sharing, and safe folder sync."
 
 [build]
 build-dir = "book"

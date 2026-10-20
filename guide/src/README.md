@@ -1,4 +1,4 @@
-# leyline guide
+# Leyline documentation
 
 **Private, peer-to-peer chat for the terminal.** leyline has no accounts,
 central message server, or shared public channel directory. A channel invite is
@@ -32,7 +32,7 @@ has its one peer, so each person only needs to enable sync in that conversation.
 
 ## Find your way around
 
-- `/help` lists commands and keybindings in the terminal.
+- [Command & keyboard reference](reference.md) is the complete reference; `/help` shows it inside leyline.
 - `/folder` shows where a channel's local files live. `/folder <path>` changes
   the shared files root for every channel on this device.
 - `/files` shows files shared in the active conversation and lets you save
