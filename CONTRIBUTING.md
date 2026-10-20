@@ -69,9 +69,9 @@ board and `backlog task list --plain` lists current `LEY-` tasks. Capture
 uncommitted ideas in [`features.md`](./features.md) before promoting them to a
 task, then follow the workflow in `AGENTS.md`.
 
-## Documentation demo
+## Documentation demos
 
-Regenerate the README's two-peer terminal recording with:
+Regenerate the README's connection-and-chat recording with:
 
 ```sh
 task docs:demo
@@ -80,6 +80,16 @@ task docs:demo
 The task builds the release binary, uses tmux to run isolated Alice and Bob
 instances, and renders `docs/assets/leyline-demo.gif` through VHS. It requires
 `vhs`, `tmux`, `ttyd`, and `ffmpeg` on your `PATH`.
+Regenerate the guide's file-sharing recording with:
+
+```sh
+task docs:file-demo
+```
+
+This second task uses the same isolated-peer setup and renders
+`guide/src/assets/leyline-file-demo.gif`. Its observer pane shows that Bob's
+channel folder lacks the fixture before `/save`, then lists the saved copy
+after the verified transfer.
 
 ## Manual folder-sync verification
 

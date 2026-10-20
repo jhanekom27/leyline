@@ -50,6 +50,16 @@ tasks:
     cmds:
       - cargo build --release
       - bash docs/demo.sh render
+  docs:file-demo:
+    desc: Render the reproducible two-peer file-sharing GIF
+    preconditions:
+      - sh: command -v vhs >/dev/null
+        msg: "Install VHS first: brew install vhs"
+      - sh: command -v tmux >/dev/null
+        msg: "Install tmux first: brew install tmux"
+    cmds:
+      - cargo build --release
+      - bash docs/file-demo.sh render
 
 
   release:preflight:
