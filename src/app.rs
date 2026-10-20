@@ -2029,12 +2029,14 @@ impl AppState {
         match key.code {
             // Backs out one level at a time: cancel an armed reply first
             // (mirroring `handle_picking_key`'s own Esc, which cancels a
-            // pick-in-progress instead of confirming it), then drop any
-            // staged attachments, then leave an open thread view, only
-            // quitting once none of those is active.
+            // pick-in-progress instead of confirming it), then clear an
+            // active search, drop any staged attachments, leave an open
+            // thread view, only quitting once none of those is active.
             KeyCode::Esc => {
                 if self.replying_to.take().is_some() {
                     // cancelled the armed reply, nothing further to do
+                } else if self.clear_active_search() {
+                    // left the filtered transcript, nothing further to do
                 } else if self.clear_staged() {
                     // dropped the staged attachments, nothing further to do
                 } else if !self.close_thread() {
@@ -2881,6 +2883,17 @@ impl AppState {
         had_any
     }
 
+    /// Clears the active channel's search filter and records the result.
+    /// Returns whether a filter was active, so callers such as `Esc` know
+    /// whether they consumed the key.
+    fn clear_active_search(&mut self) -> bool {
+        let had_search = self.active_mut().search.take().is_some();
+        if had_search {
+            self.push_system("search cleared");
+        }
+        had_search
+    }
+
     /// Parses a `/command [args]` line (the text after the leading `/`,
     /// already trimmed). Recognized commands may still return `None` after
     /// pushing a system notice (e.g. usage errors) -- only `/join`,
@@ -3003,7 +3016,7 @@ impl AppState {
             "Ctrl+R -- reply (\u{2191}/\u{2193} pick, Enter confirm)",
             "Ctrl+T -- thread (\u{2191}/\u{2193} pick, Enter confirm)",
             "Up/Down -- scroll",
-            "Esc -- close /who peer details, the Ctrl+P jump-to list, or the Ctrl+K command picker; cancel an in-progress reply or thread pick, or an armed reply; otherwise clear staged attachments, leave an open thread, or quit",
+            "Esc -- close /who peer details, the Ctrl+P jump-to list, or the Ctrl+K command picker; cancel an in-progress reply or thread pick, or an armed reply; otherwise clear an active search, clear staged attachments, leave an open thread, or quit",
             "Ctrl+C -- quit",
         ];
         self.push_system(format!(
@@ -3436,9 +3449,7 @@ impl AppState {
     /// this system notice will otherwise scroll out of view.
     fn run_search(&mut self, arg: &str) -> Option<InputAction> {
         if arg.is_empty() {
-            if self.active_mut().search.take().is_some() {
-                self.push_system("search cleared");
-            } else {
+            if !self.clear_active_search() {
                 self.push_system("usage: /search <term> (or /s <term>)");
             }
             return None;
@@ -4874,6 +4885,34 @@ mod tests {
         let mut app = app();
         app.handle_key(key(KeyCode::Esc));
         assert!(app.should_quit);
+    }
+    #[test]
+    fn esc_clears_an_active_search_before_other_normal_escape_actions() {
+        let mut app = app();
+        let matching = compose_message(PEER_ID, "find me", None);
+        let matching_id = matching.id;
+        let non_matching = compose_message(PEER_ID, "leave me", None);
+        let non_matching_id = non_matching.id;
+        app.handle_net_event(NetEvent::Received("general".to_string(), matching));
+        app.handle_net_event(NetEvent::Received("general".to_string(), non_matching));
+        app.stage_attachment("general", staged("map.png"));
+        submit(&mut app, "/search find");
+        assert_eq!(app.active().visible_chat_ids(), vec![matching_id]);
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.active().search.is_none());
+        assert_eq!(
+            app.active().visible_chat_ids(),
+            vec![matching_id, non_matching_id],
+            "clearing the filter restores the unfiltered transcript"
+        );
+        assert_eq!(app.active().staged, vec![staged("map.png")]);
+        assert!(!app.should_quit);
+        assert_eq!(
+            as_system(app.active().messages.back().unwrap()),
+            "search cleared"
+        );
     }
 
     #[test]
