@@ -113,9 +113,8 @@ impl AppState {
 
     /// Deduplicates `ids` by `canonical_id`, keeping the first device seen
     /// for each distinct person and preserving their original relative
-    /// order -- the same grouping `grouped_who_lines` applies for `/who`,
-    /// just without that command's "(N devices)" breakdown text, which
-    /// stays exclusively `/who`'s. Also excludes any peer certified under
+    /// order. The sidebar uses this grouping, while `/who` deliberately
+    /// keeps its device rows separate. Also excludes any peer certified under
     /// our own `self_user_id` entirely, rather than merging it into some
     /// other group: one of our own other devices is already represented
     /// by the sidebar's separate "you" row (`ui::render_peers`), so
@@ -132,27 +131,67 @@ impl AppState {
             .collect()
     }
 
-    /// The active channel's peers, with currently-online people first and
-    /// remembered offline people after them. Multiple endpoint ids certified
-    /// for one person collapse to one row; live presence wins over a
-    /// remembered sibling device, and otherwise the newest observation wins.
+    /// Records a current observation of `id` carried by a valid device
+    /// certificate. Unlike direct-neighbor presence, this can arrive from a
+    /// remote channel member relayed through the gossip mesh, so it expires
+    /// after `PEER_ACTIVITY_TTL_MS` rather than waiting for `NeighborDown`.
+    /// The runtime owns the clock and supplies one observation timestamp.
+    pub fn record_peer_activity(&mut self, channel: &str, id: [u8; 32], observed_unix_ms: u64) {
+        if let Some(channel) = self.channel_mut(channel) {
+            channel.recent_peers.insert(id, observed_unix_ms);
+        }
+    }
+
+    /// Drops remote-device observations that have missed three certificate
+    /// heartbeats. Returns whether any channel changed so the runtime can
+    /// redraw the sidebar and `/who` without waiting for a network event.
+    pub fn expire_peer_activity(&mut self, now_unix_ms: u64) -> bool {
+        let mut changed = false;
+        for channel in &mut self.channels {
+            let before = channel.recent_peers.len();
+            channel.recent_peers.retain(|_, seen_unix_ms| {
+                now_unix_ms.saturating_sub(*seen_unix_ms) < PEER_ACTIVITY_TTL_MS
+            });
+            changed |= channel.recent_peers.len() != before;
+        }
+        changed
+    }
+
+    /// The active channel's online endpoint ids. Direct neighbors retain
+    /// their event-driven status; recently observed remote devices follow in
+    /// a deterministic order so their derived user row stays stable.
+    fn active_peer_ids(&self) -> Vec<[u8; 32]> {
+        let channel = self.active();
+        let mut ids = channel.peers.clone();
+        let mut remote: Vec<_> = channel.recent_peers.keys().copied().collect();
+        remote.sort_unstable();
+        for id in remote {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// The active channel's peers for the sidebar: currently-online people
+    /// first and remembered offline people after them. Multiple endpoint ids
+    /// certified for one person collapse to one row; any active sibling
+    /// keeps that person online, and otherwise the newest observation wins.
     pub fn peer_presence(&self) -> Vec<PeerPresence> {
         let channel = self.active();
         let mut peers = Vec::new();
 
-        for id in &channel.peers {
-            let canonical = self.canonical_id(id);
-            if canonical == self.self_user_id {
-                continue;
-            }
-            if peers
-                .iter()
-                .any(|peer: &PeerPresence| self.canonical_id(&peer.id) == canonical)
+        for id in self.active_peer_ids() {
+            let canonical = self.canonical_id(&id);
+            if canonical == self.self_user_id
+                || peers
+                    .iter()
+                    .any(|peer: &PeerPresence| self.canonical_id(&peer.id) == canonical)
             {
                 continue;
             }
             peers.push(PeerPresence {
-                id: *id,
+                id,
                 last_seen_unix_ms: None,
             });
         }
@@ -183,6 +222,34 @@ impl AppState {
             }
         }
 
+        peers
+    }
+
+    /// The active channel's raw device records for `/who`. This deliberate
+    /// diagnostic view neither collapses canonical identities nor excludes a
+    /// paired sibling device; callers add this device's own row separately.
+    pub fn who_presence(&self) -> Vec<PeerPresence> {
+        let channel = self.active();
+        let active = self.active_peer_ids();
+        let mut seen: HashSet<_> = active.iter().copied().collect();
+        let mut peers: Vec<_> = active
+            .into_iter()
+            .map(|id| PeerPresence {
+                id,
+                last_seen_unix_ms: None,
+            })
+            .collect();
+
+        let mut offline: Vec<_> = channel.last_seen.iter().collect();
+        offline.sort_by_key(|(id, seen_unix_ms)| (std::cmp::Reverse(**seen_unix_ms), **id));
+        for (id, seen_unix_ms) in offline {
+            if seen.insert(*id) {
+                peers.push(PeerPresence {
+                    id: *id,
+                    last_seen_unix_ms: Some(*seen_unix_ms),
+                });
+            }
+        }
         peers
     }
 

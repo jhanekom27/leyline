@@ -1280,12 +1280,13 @@ impl Net {
         });
     }
 
-    /// Announces our device certificate (see `crate::message::DeviceCert`)
-    /// to `channel`'s direct gossip neighbors -- called whenever a channel
-    /// gains one, the same way `announce_nickname`/`announce_version` do.
+    /// Broadcasts our device certificate (see `crate::message::DeviceCert`)
+    /// to every member of `channel`. Called both when a direct neighbor joins
+    /// and from main.rs's periodic heartbeat, so a remote member learns the
+    /// signed device-to-user binding and can treat receipt as fresh presence
+    /// even when HyParView never makes the two devices direct neighbors.
     /// Every device always has `our_cert` from the moment `Net::start`
-    /// finishes, so -- like `announce_version` -- there's no "nothing to
-    /// announce yet" case here. Fire-and-forget, like `announce_version`.
+    /// finishes, so there is no "nothing to announce yet" case.
     pub fn announce_device(&self, channel: &str) {
         let Some(sender) = self
             .channels
@@ -1305,7 +1306,7 @@ impl Net {
                     return;
                 }
             };
-            if let Err(err) = sender.broadcast_neighbors(bytes.into()).await {
+            if let Err(err) = sender.broadcast(bytes.into()).await {
                 warn!("failed to broadcast device cert announce: {err}");
             }
         });

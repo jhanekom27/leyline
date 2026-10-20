@@ -1,9 +1,9 @@
 //! Persisted last-seen timestamps for peers, scoped to individual channels.
 //!
-//! This is local display state, not network membership: gossip still decides
-//! whether a peer is online for the current session. The small store mirrors
-//! `contacts.rs` by rewriting one postcard file whenever an observation
-//! changes.
+//! This is local display state, not network membership: direct gossip events
+//! and fresh signed device-certificate heartbeats decide whether a peer is
+//! online for the current session. The small store mirrors `contacts.rs` by
+//! rewriting one postcard file whenever an observation changes.
 
 use std::collections::HashMap;
 use std::fs;

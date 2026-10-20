@@ -230,14 +230,15 @@ pub struct VersionAnnounce {
 /// Binds a device's own `EndpointId` to a longer-lived user key, so a peer
 /// who sees certificates for two different device ids signed by the same
 /// user key can treat them as the same person -- see concept.md's
-/// "Identity & channels". Broadcast as `GossipPayload::Device`, re-sent on
-/// `NeighborUp` the same way `IdentityAnnounce`/`VersionAnnounce` are (see
-/// `net::Net::announce_device`). Every device has one from first run
-/// onward (see `identity.rs`), so there's no "no cert" state for *our own*
-/// device to handle -- only a peer we haven't heard from yet, or one on a
-/// build that predates this, lacks one (`AppState::canonical_id` falls
-/// back to treating such a peer's device id as its own identity,
-/// unchanged).
+/// \"Identity & channels\". Broadcast as `GossipPayload::Device` both on a
+/// direct `NeighborUp` and periodically to the full channel (see
+/// `net::Net::announce_device`), so it supplies both a canonical identity
+/// binding and a bounded remote-presence heartbeat. Every device has one
+/// from first run onward (see `identity.rs`), so there's no \"no cert\" state
+/// for *our own* device to handle -- only a peer we haven't heard from yet,
+/// or one on a build that predates this, lacks one
+/// (`AppState::canonical_id` falls back to treating such a peer's device id
+/// as its own identity, unchanged).
 ///
 /// Never expires and is never revoked over the network: removing a device
 /// is a local, best-effort decision, and real removal is the same

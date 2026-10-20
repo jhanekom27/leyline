@@ -298,11 +298,21 @@ applying backpressure to that one task rather than to the render loop.
 ## Presence
 
 `iroh-gossip` emits `NeighborUp`/`NeighborDown` events as peers join/leave
-a channel's mesh — `net.rs` forwards these as `NetEvent::PeerJoined/Left`,
-and `app.rs` uses them to drive the "online now" sidebar, scoped to
-whichever channel is active. This is inherently eventually consistent
-(gossip, not a membership protocol), so treat it as "who I can currently
-see," not a source of truth.
+this device's direct active view — `net.rs` forwards these as
+`NetEvent::PeerJoined/Left`. That is only a small part of a larger gossip
+mesh, so it cannot by itself answer whether every channel member is active.
+
+Each device also broadcasts its signed `DeviceCert` to the full channel when
+a direct neighbor connects and every 30 seconds thereafter. Receipt both
+authenticates the endpoint-to-user-key binding and counts as a fresh activity
+observation for that endpoint. `app.rs` retains remote observations for three
+missed heartbeats (90 seconds), while direct neighbors remain online until
+their immediate `NeighborDown`. The sidebar groups direct and fresh remote
+devices by canonical user identity, so one active device keeps that person's
+single row online; the durable per-device last-seen store supplies the offline
+tail after activity expires. `/who` deliberately exposes the ungrouped device
+rows for diagnostics. This is inherently eventually consistent, so "online"
+means recently reachable through the channel, not a global membership truth.
 
 ## Persistence & history backfill
 
